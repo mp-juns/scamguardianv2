@@ -31,9 +31,14 @@ class ScamGuardianPipeline:
         print(report.summary())
     """
 
-    def __init__(self, whisper_model: str = "medium"):
+    def __init__(self, whisper_model: str = "medium", debug: bool = False):
         self.whisper_model = whisper_model
+        self.debug = debug
         self.steps: list[StepLog] = []
+
+    def _debug(self, message: str):
+        if self.debug:
+            print(f"[DEBUG] {message}")
 
     def _log_step(self, name: str, start: float, detail: Any = None):
         elapsed = (time.time() - start) * 1000
@@ -45,27 +50,42 @@ class ScamGuardianPipeline:
 
     def transcribe(self, source: str) -> stt.TranscriptResult:
         t0 = time.time()
-        result = stt.transcribe(source, model_size=self.whisper_model)
+        self._debug(f"transcribe() 시작: model={self.whisper_model}, source={source[:80]}")
+        result = stt.transcribe(
+            source,
+            model_size=self.whisper_model,
+            debug=self.debug,
+            logger=self._debug,
+        )
         self._log_step("STT", t0, {"source_type": result.source_type, "text_length": len(result.text)})
         return result
 
     def classify(self, text: str) -> classifier.ClassificationResult:
         t0 = time.time()
+        self._debug(f"classify() 시작: text_length={len(text)}")
         result = classifier.classify(text)
         self._log_step("분류", t0, {"scam_type": result.scam_type, "confidence": result.confidence})
+        self._debug(
+            f"classify() 완료: scam_type={result.scam_type}, confidence={result.confidence:.3f}, "
+            f"scores={result.all_scores}"
+        )
         return result
 
     def extract(self, text: str, scam_type: str) -> list[extractor.Entity]:
         t0 = time.time()
+        self._debug(f"extract() 시작: scam_type={scam_type}")
         entities = extractor.extract(text, scam_type)
         self._log_step("추출", t0, {"entity_count": len(entities)})
+        self._debug(f"extract() 완료: entity_count={len(entities)}")
         return entities
 
     def verify(self, entities: list[extractor.Entity], scam_type: str) -> list[verifier.VerificationResult]:
         t0 = time.time()
+        self._debug(f"verify() 시작: entities={len(entities)}, scam_type={scam_type}")
         results = verifier.verify(entities, scam_type)
         triggered = sum(1 for r in results if r.triggered)
         self._log_step("검증", t0, {"total_checks": len(results), "triggered": triggered})
+        self._debug(f"verify() 완료: total_checks={len(results)}, triggered={triggered}")
         return results
 
     # ──────────────────────────────────
@@ -85,6 +105,7 @@ class ScamGuardianPipeline:
         """
         self.steps = []
         pipeline_start = time.time()
+        self._debug(f"analyze() 시작: skip_verification={skip_verification}")
 
         # 1단계: STT
         print("[1/5] STT 처리 중...")

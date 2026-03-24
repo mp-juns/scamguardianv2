@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import whisper
 
@@ -36,7 +38,12 @@ def _is_file(source: str) -> bool:
     return p.exists() and p.is_file()
 
 
-def _download_youtube_audio(url: str, output_dir: str) -> str:
+def _download_youtube_audio(
+    url: str,
+    output_dir: str,
+    debug: bool = False,
+    logger: Callable[[str], None] | None = None,
+) -> str:
     """yt-dlp로 YouTube 오디오를 추출하여 임시 wav 파일 경로를 반환한다."""
     import yt_dlp
 
@@ -51,12 +58,17 @@ def _download_youtube_audio(url: str, output_dir: str) -> str:
                 "preferredquality": "192",
             }
         ],
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": not debug,
+        "no_warnings": not debug,
     }
 
+    if logger:
+        logger(f"[STT] YouTube 오디오 다운로드 시작: {url}")
+    t0 = time.time()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+    if logger:
+        logger(f"[STT] YouTube 오디오 다운로드 완료 ({time.time() - t0:.1f}s)")
 
     wav_path = str(Path(output_dir) / "audio.wav")
     if not Path(wav_path).exists():
@@ -66,11 +78,18 @@ def _download_youtube_audio(url: str, output_dir: str) -> str:
 
 def _get_whisper_model(model_size: str) -> whisper.Whisper:
     if model_size not in _whisper_model_cache:
+        t0 = time.time()
         _whisper_model_cache[model_size] = whisper.load_model(model_size)
+        print(f"[STT] Whisper 모델 로드 완료: {model_size} ({time.time() - t0:.1f}s)")
     return _whisper_model_cache[model_size]
 
 
-def transcribe(source: str, model_size: str = "medium") -> TranscriptResult:
+def transcribe(
+    source: str,
+    model_size: str = "medium",
+    debug: bool = False,
+    logger: Callable[[str], None] | None = None,
+) -> TranscriptResult:
     """
     입력 소스를 텍스트로 변환한다.
 
@@ -91,9 +110,24 @@ def transcribe(source: str, model_size: str = "medium") -> TranscriptResult:
     # 2) YouTube URL
     if _is_youtube_url(source):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            audio_path = _download_youtube_audio(source, tmp_dir)
+            audio_path = _download_youtube_audio(
+                source,
+                tmp_dir,
+                debug=debug,
+                logger=logger,
+            )
+            if logger:
+                logger(f"[STT] 오디오 파일 준비 완료: {audio_path}")
             model = _get_whisper_model(model_size)
-            result = model.transcribe(audio_path, language="ko")
+            if logger:
+                logger(f"[STT] Whisper 추론 시작 (model={model_size}, language=ko)")
+            t0 = time.time()
+            result = model.transcribe(audio_path, language="ko", verbose=debug)
+            if logger:
+                logger(
+                    f"[STT] Whisper 추론 완료 ({time.time() - t0:.1f}s), "
+                    f"segments={len(result.get('segments', []))}"
+                )
         return TranscriptResult(
             text=result["text"],
             language=result.get("language", "ko"),
@@ -103,7 +137,15 @@ def transcribe(source: str, model_size: str = "medium") -> TranscriptResult:
 
     # 3) 로컬 파일
     model = _get_whisper_model(model_size)
-    result = model.transcribe(source, language="ko")
+    if logger:
+        logger(f"[STT] 로컬 파일 Whisper 추론 시작: {source}")
+    t0 = time.time()
+    result = model.transcribe(source, language="ko", verbose=debug)
+    if logger:
+        logger(
+            f"[STT] 로컬 파일 Whisper 추론 완료 ({time.time() - t0:.1f}s), "
+            f"segments={len(result.get('segments', []))}"
+        )
     return TranscriptResult(
         text=result["text"],
         language=result.get("language", "ko"),

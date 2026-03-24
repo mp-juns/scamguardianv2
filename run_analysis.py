@@ -57,6 +57,11 @@ def main():
         dest="json_output",
         help="결과를 JSON 형식으로 출력",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="전체 디버그 로그 출력",
+    )
 
     args = parser.parse_args()
 
@@ -65,7 +70,10 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    pipe = ScamGuardianPipeline(whisper_model=args.whisper_model)
+    pipe = ScamGuardianPipeline(
+        whisper_model=args.whisper_model,
+        debug=args.debug,
+    )
     report = pipe.analyze(source, skip_verification=args.skip_verify)
 
     if args.json_output:
