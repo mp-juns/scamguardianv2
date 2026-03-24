@@ -1,0 +1,8 @@
+openai-whisper
+gliner>=0.2.20
+transformers>=5.0.0
+sentence-transformers>=5.0.0
+torch>=2.0.0
+yt-dlp
+python-dotenv
+requests
