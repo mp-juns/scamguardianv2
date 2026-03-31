@@ -5,4 +5,9 @@ sentence-transformers>=5.0.0
 torch>=2.0.0
 yt-dlp
 python-dotenv
+python-multipart
 requests
+fastapi
+uvicorn[standard]
+psycopg[binary]
+pgvector

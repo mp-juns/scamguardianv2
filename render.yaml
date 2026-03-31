@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: scamguardian-api
+    runtime: python
+    plan: starter
+    rootDir: .
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python -m uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: SCAMGUARDIAN_CORS_ORIGINS
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false

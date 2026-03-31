@@ -8,6 +8,7 @@ ScamGuardian v2 — 통합 테스트
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -178,6 +179,147 @@ def test_full_pipeline():
     return True
 
 
+def test_llm_merge_and_score():
+    """LLM 보조 엔티티 병합 및 점수 반영 테스트"""
+    from pipeline import llm_assessor, scorer
+    from pipeline.extractor import Entity
+
+    @dataclass
+    class DummyClassification:
+        scam_type: str
+        confidence: float
+        is_uncertain: bool
+
+    print("=" * 60)
+    print("  테스트 4: LLM 보조 병합/점수 반영")
+    print("=" * 60)
+
+    base_entities = [
+        Entity(text="300만원", label="금액", score=1.0, start=0, end=4),
+    ]
+    assessment = llm_assessor.LLMAssessment(
+        model="test-model",
+        summary="추가 근거가 보입니다.",
+        suggested_entities=[
+            llm_assessor.SuggestedEntity(
+                text="오늘만",
+                label="날짜 또는 기간",
+                reason="긴박감을 조성합니다.",
+                confidence=0.91,
+            )
+        ],
+        suggested_flags=[
+            llm_assessor.SuggestedFlag(
+                flag="abnormal_return_rate",
+                reason="과도한 수익 보장 문구입니다.",
+                evidence="연 30% 수익 보장",
+                confidence=0.92,
+            )
+        ],
+    )
+
+    merged_entities = llm_assessor.merge_suggested_entities(base_entities, assessment)
+    report = scorer.score(
+        verification_results=[],
+        classification=DummyClassification("투자 사기", 0.8, False),
+        entities=merged_entities,
+        source="dummy",
+        transcript="오늘만 300만원 넣으면 연 30% 수익 보장",
+        llm_assessment=assessment,
+    )
+
+    assert len(merged_entities) == 2, "LLM 엔티티 병합 실패"
+    assert any(e.source == "llm" for e in merged_entities), "LLM 엔티티 source 누락"
+    assert any(f.source == "llm" for f in report.triggered_flags), "LLM 플래그 점수 반영 실패"
+    print("\n  [PASS] LLM 보조 병합/점수 반영 정상 동작\n")
+    return True
+
+
+def test_eval_metrics():
+    """사람 라벨 기반 메트릭 집계 테스트"""
+    from pipeline import eval as pipeline_eval
+
+    print("=" * 60)
+    print("  테스트 5: 저장 라벨 메트릭 집계")
+    print("=" * 60)
+
+    records = [
+        {
+            "run_id": "run-1",
+            "classification_scanner": {"scam_type": "투자 사기"},
+            "scam_type_gt": "투자 사기",
+            "entities_predicted": [
+                {"label": "금액", "text": "300만원"},
+                {"label": "수익 퍼센트", "text": "연 30%"},
+            ],
+            "entities_gt": [
+                {"label": "금액", "text": "300만원"},
+                {"label": "수익 퍼센트", "text": "연 30%"},
+            ],
+            "triggered_flags_predicted": [
+                {"flag": "abnormal_return_rate"},
+            ],
+            "triggered_flags_gt": [
+                {"flag": "abnormal_return_rate"},
+            ],
+        },
+        {
+            "run_id": "run-2",
+            "classification_scanner": {"scam_type": "기관 사칭"},
+            "scam_type_gt": "기관 사칭",
+            "entities_predicted": [
+                {"label": "사칭 기관명", "text": "금융감독원"},
+            ],
+            "entities_gt": [
+                {"label": "사칭 기관명", "text": "금융감독원"},
+                {"label": "개인정보 항목", "text": "주민번호"},
+            ],
+            "triggered_flags_predicted": [],
+            "triggered_flags_gt": [
+                {"flag": "personal_info_request"},
+            ],
+        },
+    ]
+
+    metrics = pipeline_eval.evaluate_annotated_runs(records)
+    assert metrics["sample_count"] == 2, "샘플 수 집계 오류"
+    assert metrics["classification_accuracy"] == 1.0, "분류 정확도 집계 오류"
+    assert metrics["entity_micro"]["tp"] == 3, "엔티티 TP 집계 오류"
+    assert metrics["entity_micro"]["fn"] == 1, "엔티티 FN 집계 오류"
+    assert metrics["flag_micro"]["tp"] == 1, "플래그 TP 집계 오류"
+    assert metrics["flag_micro"]["fn"] == 1, "플래그 FN 집계 오류"
+    print("\n  [PASS] 저장 라벨 메트릭 집계 정상 동작\n")
+    return True
+
+
+def test_scam_type_taxonomy_merge():
+    """사용자 추가 스캠 유형이 런타임 taxonomy에 합쳐지는지 테스트"""
+    from pipeline.config import BASE_LABELS, build_scam_taxonomy
+
+    print("=" * 60)
+    print("  테스트 6: 사용자 스캠 유형 taxonomy 병합")
+    print("=" * 60)
+
+    taxonomy = build_scam_taxonomy(
+        [
+            {
+                "name": "대출 사기",
+                "description": "급전 대출 승인과 선입금 수수료를 요구",
+                "labels": ["대출 기관명", "수수료 금액"],
+            }
+        ]
+    )
+
+    assert "대출 사기" in taxonomy["scam_types"], "사용자 스캠 유형 추가 실패"
+    assert taxonomy["descriptions"]["급전 대출 승인과 선입금 수수료를 요구"] == "대출 사기"
+    assert taxonomy["label_sets"]["대출 사기"] == ["대출 기관명", "수수료 금액"]
+
+    fallback_taxonomy = build_scam_taxonomy([{"name": "로맨스 스캠"}])
+    assert fallback_taxonomy["label_sets"]["로맨스 스캠"] == BASE_LABELS, "기본 라벨셋 fallback 오류"
+    print("\n  [PASS] 사용자 스캠 유형 taxonomy 병합 정상 동작\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  ScamGuardian v2 — 통합 테스트")
@@ -188,6 +330,9 @@ if __name__ == "__main__":
     results["분류"] = test_classification()
     results["추출"] = test_extraction()
     results["파이프라인"] = test_full_pipeline()
+    results["LLM 보조"] = test_llm_merge_and_score()
+    results["메트릭"] = test_eval_metrics()
+    results["유형 카탈로그"] = test_scam_type_taxonomy_merge()
 
     print("\n" + "=" * 60)
     print("  최종 결과")

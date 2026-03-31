@@ -9,9 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from pipeline.config import SCORING_RULES, get_risk_level
+from pipeline.config import LLM_FLAG_SCORE_RATIO, LLM_FLAG_SCORE_THRESHOLD, SCORING_RULES, get_risk_level
 from pipeline.classifier import ClassificationResult
 from pipeline.extractor import Entity
+from pipeline.llm_assessor import LLMAssessment
 from pipeline.verifier import VerificationResult
 
 
@@ -21,6 +22,7 @@ class FlagDetail:
     description: str
     score_delta: int
     evidence: list[str] = field(default_factory=list)
+    source: str = "rule"
 
 
 @dataclass
@@ -45,6 +47,8 @@ class ScamReport:
 
     # 검증 상세 (디버깅/감사용)
     all_verifications: list[dict[str, Any]] = field(default_factory=list)
+    llm_assessment: dict[str, Any] | None = None
+    rag_context: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,10 +67,13 @@ class ScamReport:
                     "description": f.description,
                     "score_delta": f.score_delta,
                     "evidence": f.evidence,
+                    "source": f.source,
                 }
                 for f in self.triggered_flags
             ],
             "verification_count": len(self.all_verifications),
+            "llm_assessment": self.llm_assessment,
+            "rag_context": self.rag_context,
         }
 
     def summary(self) -> str:
@@ -95,14 +102,43 @@ class ScamReport:
         if self.triggered_flags:
             lines.append(f"  발동된 플래그 ({len(self.triggered_flags)}개):")
             for f in self.triggered_flags:
-                lines.append(f"    [{f.flag}] +{f.score_delta}점 — {f.description}")
+                source_prefix = "[LLM] " if f.source == "llm" else ""
+                lines.append(f"    {source_prefix}[{f.flag}] +{f.score_delta}점 — {f.description}")
                 for ev in f.evidence[:2]:
                     lines.append(f"      근거: {ev[:100]}")
         else:
             lines.append("  발동된 플래그 없음")
 
+        if self.llm_assessment:
+            lines.append("")
+            lines.append("  LLM 보조 판정:")
+            if self.llm_assessment.get("error"):
+                lines.append(f"    실패: {self.llm_assessment['error']}")
+            else:
+                if self.llm_assessment.get("summary"):
+                    lines.append(f"    요약: {self.llm_assessment['summary']}")
+                lines.append(
+                    f"    추가 엔티티 제안: {len(self.llm_assessment.get('suggested_entities', []))}개"
+                )
+                lines.append(
+                    f"    추가 플래그 제안: {len(self.llm_assessment.get('suggested_flags', []))}개"
+                )
+
+        if self.rag_context and self.rag_context.get("enabled"):
+            lines.append("")
+            lines.append(
+                f"  RAG 참고 사례: {len(self.rag_context.get('similar_cases', []))}개"
+            )
+
         lines.extend(["", "=" * 60])
         return "\n".join(lines)
+
+
+def _scale_llm_flag_delta(delta: int) -> int:
+    scaled = int(round(delta * LLM_FLAG_SCORE_RATIO))
+    if delta != 0 and scaled == 0:
+        return 1 if delta > 0 else -1
+    return scaled
 
 
 def score(
@@ -111,6 +147,8 @@ def score(
     entities: list[Entity],
     source: str = "",
     transcript: str = "",
+    llm_assessment: LLMAssessment | None = None,
+    rag_context: dict[str, Any] | None = None,
 ) -> ScamReport:
     """
     검증 결과를 종합하여 최종 스캠 리포트를 생성한다.
@@ -146,7 +184,27 @@ def score(
             description=vr.flag_description,
             score_delta=delta,
             evidence=vr.evidence_snippets,
+            source="rule",
         ))
+
+    if llm_assessment is not None and not llm_assessment.error:
+        for suggested in llm_assessment.suggested_flags:
+            if suggested.confidence < LLM_FLAG_SCORE_THRESHOLD:
+                continue
+            if suggested.flag in seen_flags:
+                continue
+            seen_flags.add(suggested.flag)
+
+            base_delta = SCORING_RULES.get(suggested.flag, 0)
+            delta = _scale_llm_flag_delta(base_delta)
+            total += delta
+            triggered.append(FlagDetail(
+                flag=suggested.flag,
+                description=f"[LLM 보조] {suggested.reason}",
+                score_delta=delta,
+                evidence=[suggested.evidence] if suggested.evidence else [],
+                source="llm",
+            ))
 
     risk_level, risk_description = get_risk_level(total)
 
@@ -162,4 +220,6 @@ def score(
         risk_description=risk_description,
         triggered_flags=triggered,
         all_verifications=[vr.to_dict() for vr in verification_results],
+        llm_assessment=llm_assessment.to_dict() if llm_assessment is not None else None,
+        rag_context=rag_context,
     )

@@ -6,8 +6,13 @@ mDeBERTa zero-shot classification + 키워드 부스팅으로 스캠 유형을 �
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from transformers import pipeline as hf_pipeline
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    pipeline as hf_pipeline,
+)
 
 from pipeline.config import (
     CLASSIFICATION_THRESHOLD,
@@ -15,10 +20,22 @@ from pipeline.config import (
     KEYWORD_BOOST_WEIGHT,
     KEYWORD_NO_MATCH_PENALTY,
     MODELS,
-    SCAM_TYPE_DESCRIPTIONS,
+    get_runtime_scam_taxonomy,
 )
 
 _classifier = None
+
+
+def _resolve_local_hf_snapshot(model_id: str) -> str | None:
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+    model_dir = cache_root / f"models--{model_id.replace('/', '--')}"
+    refs_main = model_dir / "refs" / "main"
+    if not refs_main.exists():
+        return None
+
+    revision = refs_main.read_text().strip()
+    snapshot_dir = model_dir / "snapshots" / revision
+    return str(snapshot_dir) if snapshot_dir.exists() else None
 
 
 @dataclass
@@ -32,9 +49,16 @@ class ClassificationResult:
 def _get_classifier():
     global _classifier
     if _classifier is None:
+        model_source = _resolve_local_hf_snapshot(MODELS["classifier"]) or MODELS["classifier"]
+        tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=model_source != MODELS["classifier"])
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_source,
+            local_files_only=model_source != MODELS["classifier"],
+        )
         _classifier = hf_pipeline(
             "zero-shot-classification",
-            model=MODELS["classifier"],
+            model=model,
+            tokenizer=tokenizer,
             device="cpu",
         )
     return _classifier
@@ -60,9 +84,10 @@ def classify(text: str) -> ClassificationResult:
     NLI 스코어 + 키워드 부스팅을 결합하여 최종 판정한다.
     """
     clf = _get_classifier()
+    taxonomy = get_runtime_scam_taxonomy()
 
     truncated = text[:2000]
-    descriptive_labels = list(SCAM_TYPE_DESCRIPTIONS.keys())
+    descriptive_labels = list(taxonomy["descriptions"].keys())
 
     result = clf(
         truncated,
@@ -74,7 +99,7 @@ def classify(text: str) -> ClassificationResult:
     # NLI 스코어를 짧은 이름으로 매핑
     nli_scores: dict[str, float] = {}
     for label, score in zip(result["labels"], result["scores"]):
-        short_name = SCAM_TYPE_DESCRIPTIONS[label]
+        short_name = taxonomy["descriptions"][label]
         nli_scores[short_name] = score
 
     # 키워드 부스팅 적용

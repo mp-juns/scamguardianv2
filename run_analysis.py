@@ -9,6 +9,8 @@ YouTube URL, 로컬 파일, 또는 텍스트를 분석한다.
     python run_analysis.py --text "일론 머스크가 화성 이민 프로젝트에..."
     python run_analysis.py --text "..." --skip-verify    # 검증 단계 생략
     python run_analysis.py --text "..." --json           # JSON 출력
+    python run_analysis.py --text "..." --use-llm        # Ollama 보조 판정 추가
+    python run_analysis.py --text "..." --use-llm --use-rag  # 사람 라벨 사례도 참고
 """
 
 from __future__ import annotations
@@ -58,6 +60,16 @@ def main():
         help="결과를 JSON 형식으로 출력",
     )
     parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Ollama 기반 LLM 보조 판정을 추가 수행",
+    )
+    parser.add_argument(
+        "--use-rag",
+        action="store_true",
+        help="DB의 사람 라벨 사례를 RAG로 검색해 LLM 보조 판정에 참고",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="전체 디버그 로그 출력",
@@ -74,7 +86,12 @@ def main():
         whisper_model=args.whisper_model,
         debug=args.debug,
     )
-    report = pipe.analyze(source, skip_verification=args.skip_verify)
+    report = pipe.analyze(
+        source,
+        skip_verification=args.skip_verify,
+        use_llm=args.use_llm,
+        use_rag=args.use_rag,
+    )
 
     if args.json_output:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))

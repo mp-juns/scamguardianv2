@@ -10,12 +10,16 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
+import torch
 from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer, util
 
-from pipeline.config import SERPER_API_URL, SERPER_DELAY
+from pipeline.config import MODELS, SERPER_API_URL, SERPER_DELAY, TRUSTED_QUERY_A_DOMAINS
 from pipeline.extractor import Entity
 
 load_dotenv()
@@ -75,7 +79,23 @@ def _extract_snippets(result: dict, max_snippets: int = 3) -> list[str]:
 
 def _has_scam_keywords(snippets: list[str]) -> bool:
     """스니펫에 스캠/사기 관련 키워드가 포함되어 있는지 확인한다."""
-    keywords = ["사기", "스캠", "피싱", "신고", "피해", "주의보", "경고", "불법", "미등록", "무허가"]
+    keywords = [
+        "사기",
+        "스캠",
+        "피싱",
+        "phishing",
+        "fraud",
+        "fake",
+        "scam",
+        "deepfake",
+        "신고",
+        "피해",
+        "주의보",
+        "경고",
+        "불법",
+        "미등록",
+        "무허가",
+    ]
     text = " ".join(snippets).lower()
     return any(kw in text for kw in keywords)
 
@@ -88,6 +108,167 @@ def _parse_return_rate(text: str) -> float | None:
     return None
 
 
+# ──────────────────────────────────────────────
+# 노션 다음 단계(임베딩/쿼리) 헬퍼
+# ──────────────────────────────────────────────
+
+_BERT_SIM_MODEL_NAME = MODELS["sbert_similarity"]
+_BERT_SIM_THRESHOLD_UNCERTAIN = 0.6
+_BERT_SIM_THRESHOLD_MISMATCH = 0.3
+
+_speaker_profile_model: SentenceTransformer | None = None
+
+
+def _project_hf_cache_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / ".cache" / "huggingface"
+
+
+def _resolve_local_hf_snapshot(model_id: str) -> str | None:
+    candidate_roots = [
+        _project_hf_cache_dir() / "hub",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ]
+    for cache_root in candidate_roots:
+        model_dir = cache_root / f"models--{model_id.replace('/', '--')}"
+        refs_main = model_dir / "refs" / "main"
+        if not refs_main.exists():
+            continue
+
+        revision = refs_main.read_text().strip()
+        snapshot_dir = model_dir / "snapshots" / revision
+        if snapshot_dir.exists():
+            return str(snapshot_dir)
+    return None
+
+
+def _get_sbert_model() -> SentenceTransformer:
+    global _speaker_profile_model
+    if _speaker_profile_model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_source = _resolve_local_hf_snapshot(f"sentence-transformers/{_BERT_SIM_MODEL_NAME}")
+        if model_source:
+            _speaker_profile_model = SentenceTransformer(model_source, device=device, local_files_only=True)
+        else:
+            _speaker_profile_model = SentenceTransformer(
+                _BERT_SIM_MODEL_NAME,
+                device=device,
+                cache_folder=str(_project_hf_cache_dir()),
+            )
+    return _speaker_profile_model
+
+
+def _choose_speaker(entities: list[Entity]) -> Entity | None:
+    """노션 단계에서 필요한 '화자명' 후보를 뽑는다."""
+    # 1순위: 사람 이름
+    for e in entities:
+        if e.label == "사람 이름":
+            return e
+    # 2순위: 회사/기관명(현재 extractor에서 머스크가 여기로 잡히는 케이스 대응)
+    for e in entities:
+        if e.label == "회사명 또는 기관명":
+            return e
+    return None
+
+
+def _extract_claim_keyword(entities: list[Entity]) -> str:
+    """쿼리 템플릿의 핵심 '주장 키워드'를 뽑는다."""
+    preferred_order = [
+        "수익 퍼센트",
+        "투자 상품명",
+        "치료 효능 주장",
+        "제품명",
+        "금액",
+    ]
+    for label in preferred_order:
+        for e in entities:
+            if e.label == label:
+                # 금액 라벨 중 '%'가 섞인 케이스는 claim으로는 덜 유용하므로 제외
+                if label == "금액" and "%" in e.text:
+                    continue
+                return e.text
+    return ""
+
+
+def _extract_investment_amount(entities: list[Entity]) -> str:
+    """Query C에 쓰기 위한 송금/투자 금액을 최대한 '진짜 금액' 형태로 선택한다."""
+    # 예: 300만원 같은 형태 우선. (전화번호나 30% 오인을 줄이기 위함)
+    for e in entities:
+        if e.label == "금액" and any(unit in e.text for unit in ["만원", "원"]):
+            return e.text
+    # fallback
+    for e in entities:
+        if e.label == "금액" and "%" not in e.text:
+            return e.text
+    return ""
+
+
+def _extract_year(transcript: str) -> str | None:
+    m = re.search(r"(20\d{2})", transcript)
+    return m.group(1) if m else None
+
+
+def _domain_of_link(link: str) -> str:
+    try:
+        parsed = urlparse(link)
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _build_query_a(speaker_name: str, claim_keyword: str) -> str:
+    # 노션 문서의 S 도메인 우선(confirmed/unconfirmed 판단에 사용)
+    site_clause = " OR ".join([f"site:{d}" for d in TRUSTED_QUERY_A_DOMAINS])
+    return f'"{speaker_name}" "{claim_keyword}" {site_clause}'
+
+
+def _build_query_b(claim_keyword: str, year: str | None) -> str:
+    if year:
+        return f'"{claim_keyword}" "{year}" fact check OR confirmed OR denied'
+    return f'"{claim_keyword}" fact check OR confirmed OR denied'
+
+
+def _build_query_c(speaker_name: str, amount_or_investment: str, claim_keyword: str) -> str:
+    seed = amount_or_investment or claim_keyword
+    return f'"{speaker_name}" "{seed}" scam OR fraud OR fake OR deepfake'
+
+
+def _sbert_cosine_similarity(speaker_profile_text: str, speech_content_text: str) -> float:
+    model = _get_sbert_model()
+    # normalize_embeddings=True면 cos 유사도 범위가 -1~1 대신 0~1 근처로 안정적
+    emb1 = model.encode(speaker_profile_text, convert_to_tensor=True, normalize_embeddings=True)
+    emb2 = model.encode(speech_content_text, convert_to_tensor=True, normalize_embeddings=True)
+    return float(util.cos_sim(emb1, emb2).item())
+
+
+def _has_factcheck_confirmed(snippets: list[str]) -> bool:
+    text = " ".join(snippets).lower()
+    confirmed_markers = [
+        "confirmed",
+        "verified",
+        "fact check",
+        "denied",
+        "사실무근",
+        "오보",
+        "부인",
+        "확인",
+        "검증",
+        "not true",
+    ]
+    return any(m in text for m in confirmed_markers)
+
+
+def _hit_in_sa_domains(organic_items: list[dict[str, Any]]) -> bool:
+    for it in organic_items:
+        link = it.get("link", "") or ""
+        if _domain_of_link(link) in TRUSTED_QUERY_A_DOMAINS:
+            return True
+    return False
+
+
+# ──────────────────────────────────────────────
 # ──────────────────────────────────────────────
 # 엔티티 유형별 검증 전략
 # ──────────────────────────────────────────────
@@ -302,7 +483,7 @@ _VERIFY_DISPATCH: dict[str, Any] = {
 _COMPANY_LABELS = {"회사명 또는 기관명"}
 
 
-def verify(entities: list[Entity], scam_type: str) -> list[VerificationResult]:
+def verify(entities: list[Entity], scam_type: str, transcript: str) -> list[VerificationResult]:
     """
     추출된 엔티티 리스트를 교차 검증한다.
 
@@ -329,5 +510,127 @@ def verify(entities: list[Entity], scam_type: str) -> list[VerificationResult]:
         if verify_fn is not None:
             results.extend(verify_fn(entity))
             time.sleep(SERPER_DELAY)
+
+    # ──────────────────────────────────────────────
+    # 노션 다음 단계: BERT 유사도 + 화자 프로파일 + 쿼리 A/B/C
+    # ──────────────────────────────────────────────
+    # (기존 Serper 교차 검증과는 별도로, "근거를 어디서 찾았는지"를 플래그 evidence로 남긴다.)
+    if transcript and entities:
+        speaker_entity = _choose_speaker(entities)
+        claim_keyword = _extract_claim_keyword(entities)
+        amount_or_investment = _extract_investment_amount(entities)
+        year = _extract_year(transcript)
+
+        if speaker_entity and claim_keyword:
+            speaker_name = speaker_entity.text
+
+            # 1) 화자 프로파일(Serper snippets) 수집 → BERT 유사도 계산
+            q_profile = f'"{speaker_name}" 직업 분야 최근 활동'
+            sr_profile = _serper_search(q_profile, num_results=5)
+            profile_snippets = _extract_snippets(sr_profile, max_snippets=5)
+
+            speech_content_text = transcript[:2000]
+            speaker_profile_text = " ".join(profile_snippets)[:4000]
+
+            if profile_snippets and speech_content_text.strip():
+                sim = _sbert_cosine_similarity(speaker_profile_text, speech_content_text)
+
+                if sim < _BERT_SIM_THRESHOLD_MISMATCH:
+                    results.append(VerificationResult(
+                        entity=speaker_entity,
+                        query=q_profile,
+                        flag="authority_context_mismatch",
+                        flag_description=f"화자 프로파일 vs 발화 맥락 의미가 불일치 (cos={sim:.3f})",
+                        triggered=True,
+                        search_hits=_count_hits(sr_profile),
+                        evidence_snippets=[
+                            f"[cosine_similarity] {sim:.3f}",
+                            *profile_snippets[:3],
+                        ],
+                    ))
+                elif sim < _BERT_SIM_THRESHOLD_UNCERTAIN:
+                    results.append(VerificationResult(
+                        entity=speaker_entity,
+                        query=q_profile,
+                        flag="authority_context_uncertain",
+                        flag_description=f"화자 프로파일 vs 발화 맥락 의미가 애매 (cos={sim:.3f})",
+                        triggered=True,
+                        search_hits=_count_hits(sr_profile),
+                        evidence_snippets=[
+                            f"[cosine_similarity] {sim:.3f}",
+                            *profile_snippets[:3],
+                        ],
+                    ))
+
+            time.sleep(SERPER_DELAY)
+
+            # 2) Query A: 신뢰 언론에서 화자+발언 동시 히트 여부
+            q_a = _build_query_a(speaker_name, claim_keyword)
+            sr_a = _serper_search(q_a, num_results=10)
+            organic_a = sr_a.get("organic", []) or []
+            hit_in_sa = _hit_in_sa_domains(organic_a)
+            snippets_a = _extract_snippets(sr_a, max_snippets=5)
+
+            results.append(VerificationResult(
+                entity=speaker_entity,
+                query=q_a,
+                flag="query_a_confirmed" if hit_in_sa else "query_a_unconfirmed",
+                flag_description=(
+                    f"신뢰 도메인(S/A)에서 화자+발언 동시 히트 확인 ({'있음' if hit_in_sa else '없음'})"
+                ),
+                triggered=True,
+                search_hits=_count_hits(sr_a),
+                evidence_snippets=snippets_a,
+            ))
+
+            time.sleep(SERPER_DELAY)
+
+            # 3) Query B: 팩트체크/확인/부인 이력
+            q_b = _build_query_b(claim_keyword, year)
+            sr_b = _serper_search(q_b, num_results=10)
+            snippets_b = _extract_snippets(sr_b, max_snippets=5)
+            b_has_scam_keywords = _has_scam_keywords(snippets_b)
+            b_has_confirmed = _has_factcheck_confirmed(snippets_b)
+
+            if b_has_scam_keywords:
+                results.append(VerificationResult(
+                    entity=speaker_entity,
+                    query=q_b,
+                    flag="query_b_factcheck_found",
+                    flag_description="팩트체크/검증 결과 스캠/사기 관련 단서 포함",
+                    triggered=True,
+                    search_hits=_count_hits(sr_b),
+                    evidence_snippets=snippets_b,
+                ))
+
+            if b_has_confirmed:
+                results.append(VerificationResult(
+                    entity=speaker_entity,
+                    query=q_b,
+                    flag="query_b_confirmed",
+                    flag_description="팩트체크에서 확인/부인(denied) 등 검증 단서 발견",
+                    triggered=True,
+                    search_hits=_count_hits(sr_b),
+                    evidence_snippets=snippets_b,
+                ))
+
+            time.sleep(SERPER_DELAY)
+
+            # 4) Query C: 스캠 패턴(사기/사칭/피싱 등) 정합성
+            q_c = _build_query_c(speaker_name, amount_or_investment, claim_keyword)
+            sr_c = _serper_search(q_c, num_results=10)
+            snippets_c = _extract_snippets(sr_c, max_snippets=5)
+            c_has_scam_keywords = _has_scam_keywords(snippets_c)
+
+            if c_has_scam_keywords:
+                results.append(VerificationResult(
+                    entity=speaker_entity,
+                    query=q_c,
+                    flag="query_c_scam_pattern_found",
+                    flag_description="스캠/사기 패턴 관련 단서가 검색 결과에서 확인됨",
+                    triggered=True,
+                    search_hits=_count_hits(sr_c),
+                    evidence_snippets=snippets_c,
+                ))
 
     return results

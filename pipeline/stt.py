@@ -84,6 +84,18 @@ def _get_whisper_model(model_size: str) -> whisper.Whisper:
     return _whisper_model_cache[model_size]
 
 
+def _ensure_audio_nonempty(path: str) -> None:
+    """
+    Whisper/ffmpeg 디코더가 오디오를 읽었을 때 길이가 0이면
+    (오디오 트랙 없음/깨진 파일/디코딩 실패 등) 명확한 에러로 중단한다.
+    """
+    audio = whisper.load_audio(path)
+    if getattr(audio, "size", 0) == 0:
+        raise ValueError(
+            "오디오를 읽지 못했습니다. 오디오 트랙이 없는 영상이거나 파일이 손상됐을 수 있습니다."
+        )
+
+
 def transcribe(
     source: str,
     model_size: str = "medium",
@@ -118,6 +130,7 @@ def transcribe(
             )
             if logger:
                 logger(f"[STT] 오디오 파일 준비 완료: {audio_path}")
+            _ensure_audio_nonempty(audio_path)
             model = _get_whisper_model(model_size)
             if logger:
                 logger(f"[STT] Whisper 추론 시작 (model={model_size}, language=ko)")
@@ -136,6 +149,7 @@ def transcribe(
         )
 
     # 3) 로컬 파일
+    _ensure_audio_nonempty(source)
     model = _get_whisper_model(model_size)
     if logger:
         logger(f"[STT] 로컬 파일 Whisper 추론 시작: {source}")

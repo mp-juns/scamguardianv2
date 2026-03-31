@@ -17,18 +17,19 @@ from pipeline.config import (
     GLINER_CHUNK_OVERLAP,
     GLINER_CHUNK_SIZE,
     GLINER_THRESHOLD,
-    LABEL_SETS,
     MODELS,
+    get_runtime_scam_taxonomy,
 )
 
 _gliner_model: GLiNER | None = None
+_gliner_load_error: Exception | None = None
 
 # 규칙 기반으로 추출할 레이블 (GLiNER에서 제외)
 RULE_BASED_LABELS: set[str] = {
     "전화번호", "이메일 주소", "웹사이트 주소",
-    "수익 퍼센트", "사업자 등록번호",
+    "수익 퍼센트", "사업자 등록번호", "금액",
     "개인정보 항목", "사건번호 또는 공문번호",
-    "전문가 직함", "직함 또는 직책",
+    "전문가 직함", "직함 또는 직책", "사칭 기관명",
     "치료 효능 주장",
 }
 
@@ -43,6 +44,9 @@ _REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
     )),
     ("웹사이트 주소", re.compile(
         r"(?:https?://)?(?:www\.)?[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?"
+    )),
+    ("금액", re.compile(
+        r"\d[\d,]*(?:\.\d+)?\s*(?:원|만원|천원|억원|달러|usd|USDT)"
     )),
     ("수익 퍼센트", re.compile(
         r"(?:연|월|일|주)\s*\d+(?:\.\d+)?\s*%"
@@ -71,6 +75,10 @@ _KEYWORD_PATTERNS: dict[str, list[str]] = {
         "수사관", "수사팀", "팀장", "검사", "과장", "부장",
         "담당자", "경감", "경위", "계장", "주임", "대리",
     ],
+    "사칭 기관명": [
+        "금융감독원", "금감원", "검찰", "검찰청", "경찰", "경찰청",
+        "국세청", "법원", "국정원",
+    ],
     "치료 효능 주장": [
         "완치", "치료", "효과가 있", "효능", "낫게",
         "고친", "개선", "치유", "회복",
@@ -97,6 +105,7 @@ class Entity:
     score: float
     start: int
     end: int
+    source: str = "extractor"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,13 +114,23 @@ class Entity:
             "score": self.score,
             "start": self.start,
             "end": self.end,
+            "source": self.source,
         }
 
 
-def _get_model() -> GLiNER:
-    global _gliner_model
+def _get_model() -> GLiNER | None:
+    global _gliner_model, _gliner_load_error
+    if _gliner_model is not None:
+        return _gliner_model
+    if _gliner_load_error is not None:
+        return None
     if _gliner_model is None:
-        _gliner_model = GLiNER.from_pretrained(MODELS["gliner"])
+        try:
+            _gliner_model = GLiNER.from_pretrained(MODELS["gliner"])
+        except Exception as exc:
+            _gliner_load_error = exc
+            print(f"[추출] GLiNER 로드 실패, 규칙 기반 추출로 계속 진행합니다: {exc}")
+            return None
     return _gliner_model
 
 
@@ -232,6 +251,8 @@ def _extract_by_gliner(
         return []
 
     model = _get_model()
+    if model is None:
+        return []
 
     if len(text) <= GLINER_CHUNK_SIZE:
         raw = model.predict_entities(text, gliner_labels, threshold=threshold)
@@ -328,7 +349,8 @@ def extract(
         추출된 Entity 리스트 (위치 순 정렬)
     """
     if labels is None:
-        labels = LABEL_SETS.get(scam_type, LABEL_SETS["투자 사기"])
+        runtime_label_sets = get_runtime_scam_taxonomy()["label_sets"]
+        labels = runtime_label_sets.get(scam_type, runtime_label_sets.get("투자 사기", []))
     if threshold is None:
         threshold = GLINER_THRESHOLD
 
