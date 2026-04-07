@@ -15,6 +15,7 @@ import requests
 
 from pipeline.config import (
     LLM_ENTITY_MERGE_THRESHOLD,
+  LLM_SCAM_TYPE_OVERRIDE_THRESHOLD,
     OLLAMA_BASE_URL,
     OLLAMA_KEEP_ALIVE,
     OLLAMA_MAX_ENTITY_COUNT,
@@ -78,6 +79,20 @@ class LLMAssessment:
             "suggested_entities": [entity.to_dict() for entity in self.suggested_entities],
             "suggested_flags": [flag.to_dict() for flag in self.suggested_flags],
             "error": self.error,
+        }
+
+
+@dataclass
+class ScamTypeSuggestion:
+    scam_type: str
+    confidence: float
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scam_type": self.scam_type,
+            "confidence": round(self.confidence, 4),
+            "reason": self.reason,
         }
 
 
@@ -179,6 +194,64 @@ def _build_prompt(
   ]
 }}
 """.strip()
+
+
+def _build_scam_type_prompt(transcript: str) -> str:
+    taxonomy = get_runtime_scam_taxonomy()
+    scam_types = taxonomy["scam_types"]
+    label_map = taxonomy["descriptions"]
+    # 설명적 레이블(문장)도 함께 줘서 문맥 판단을 돕는다.
+    description_lines = [{"description": k, "scam_type": v} for k, v in label_map.items()]
+
+    return f"""
+역할: 한국어 스캠 유형 분류기 (문맥 기반)
+출력: JSON만
+
+해야 할 일:
+- 전사 텍스트를 읽고 가장 적절한 스캠 유형 1개를 고른다.
+- 확신도를 0~1로 반환한다.
+- 근거를 전사에서 짧게 1~2문장으로 요약한다.
+
+규칙:
+- scam_type 은 허용 목록 중 하나만
+- confidence 는 0~1 숫자
+- JSON 외 텍스트 금지
+
+허용 스캠 유형:
+{json.dumps(scam_types, ensure_ascii=False)}
+
+유형 설명(참고):
+{json.dumps(description_lines, ensure_ascii=False)}
+
+전사 텍스트:
+{transcript[:OLLAMA_MAX_TRANSCRIPT_CHARS]}
+
+반환 JSON 스키마:
+{{
+  "scam_type": "허용 목록 중 하나",
+  "confidence": 0.0,
+  "reason": "근거 요약"
+}}
+""".strip()
+
+
+def suggest_scam_type(transcript: str) -> ScamTypeSuggestion | None:
+    """
+    LLM이 전사 문맥을 보고 스캠 유형을 제안한다.
+    confidence가 낮으면 None을 반환한다(기존 분류기 폴백용).
+    """
+    prompt = _build_scam_type_prompt(transcript)
+    result = _call_ollama(prompt)
+    scam_type = str(result.get("scam_type", "")).strip()
+    confidence = _clamp_confidence(result.get("confidence"), default=0.55)
+    reason = str(result.get("reason", "")).strip()
+
+    taxonomy = get_runtime_scam_taxonomy()
+    if not scam_type or scam_type not in taxonomy["scam_types"]:
+        return None
+    if confidence < LLM_SCAM_TYPE_OVERRIDE_THRESHOLD:
+        return None
+    return ScamTypeSuggestion(scam_type=scam_type, confidence=confidence, reason=reason)
 
 
 def _call_ollama(prompt: str) -> dict[str, Any]:

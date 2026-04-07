@@ -35,6 +35,10 @@ class ScamReport:
     scam_type: str = ""
     classification_confidence: float = 0.0
     is_uncertain: bool = False
+    scam_type_source: str = "classifier"  # classifier | llm
+    scam_type_reason: str = ""
+    scam_type_classifier: str = ""
+    scam_type_classifier_confidence: float = 0.0
 
     # 추출 결과
     entities: list[dict[str, Any]] = field(default_factory=list)
@@ -57,6 +61,10 @@ class ScamReport:
             "scam_type": self.scam_type,
             "classification_confidence": round(self.classification_confidence, 4),
             "is_uncertain": self.is_uncertain,
+            "scam_type_source": self.scam_type_source,
+            "scam_type_reason": self.scam_type_reason,
+            "scam_type_classifier": self.scam_type_classifier,
+            "scam_type_classifier_confidence": round(self.scam_type_classifier_confidence, 4),
             "entities": self.entities,
             "total_score": self.total_score,
             "risk_level": self.risk_level,
@@ -149,6 +157,9 @@ def score(
     transcript: str = "",
     llm_assessment: LLMAssessment | None = None,
     rag_context: dict[str, Any] | None = None,
+    scam_type_source: str = "classifier",
+    scam_type_reason: str = "",
+    classifier_original: ClassificationResult | None = None,
 ) -> ScamReport:
     """
     검증 결과를 종합하여 최종 스캠 리포트를 생성한다.
@@ -214,6 +225,12 @@ def score(
         scam_type=classification.scam_type,
         classification_confidence=classification.confidence,
         is_uncertain=classification.is_uncertain,
+        scam_type_source=scam_type_source,
+        scam_type_reason=scam_type_reason,
+        scam_type_classifier=(classifier_original.scam_type if classifier_original else classification.scam_type),
+        scam_type_classifier_confidence=(
+            classifier_original.confidence if classifier_original else classification.confidence
+        ),
         entities=[e.to_dict() for e in entities],
         total_score=total,
         risk_level=risk_level,

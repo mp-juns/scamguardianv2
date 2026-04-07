@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,7 +23,7 @@ load_dotenv()
 
 from db import repository
 from pipeline import eval as pipeline_eval
-from pipeline import rag
+from pipeline import kakao_formatter, rag
 from pipeline.config import DEFAULT_SCAM_TYPES, SCORING_RULES, get_runtime_scam_taxonomy
 from pipeline.runner import ScamGuardianPipeline
 
@@ -212,6 +212,65 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/webhook/kakao")
+async def kakao_webhook(request: Request) -> dict:
+    """
+    카카오 오픈빌더 Skill Webhook 엔드포인트.
+
+    카카오 서버가 사용자 발화를 POST로 전달하면
+    ScamGuardian 파이프라인을 실행하고 카카오 응답 포맷으로 반환한다.
+
+    타임아웃: 카카오는 5초 이내 응답을 요구하므로
+    skip_verification=True, use_llm=False로 고정해 빠르게 처리한다.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return kakao_formatter.format_error("요청을 파싱할 수 없습니다.")
+
+    # 카카오 오픈빌더 v2: userRequest.utterance에 사용자 발화가 담긴다
+    user_request = body.get("userRequest", {})
+    utterance: str = (user_request.get("utterance") or "").strip()
+
+    # 빈 발화 또는 시작/도움말 명령
+    if not utterance or utterance in ("새로 분석하기", "시작", "처음"):
+        return kakao_formatter.format_help()
+
+    # 파이프라인 실행 (빠른 모드: 검색검증·LLM 생략)
+    def _run() -> dict:
+        pipeline = ScamGuardianPipeline()
+        report = pipeline.analyze(
+            utterance,
+            skip_verification=True,
+            use_llm=False,
+            use_rag=False,
+        )
+        report_dict = report.to_dict()
+        report_dict["transcript_text"] = (
+            pipeline.last_transcript_result.text
+            if pipeline.last_transcript_result is not None
+            else utterance
+        )
+        _persist_run(
+            pipeline,
+            AnalyzeRequest(
+                source=utterance,
+                skip_verification=True,
+                use_llm=False,
+                use_rag=False,
+            ),
+            utterance,
+            report_dict,
+        )
+        return report_dict
+
+    try:
+        report_dict = await asyncio.to_thread(_run)
+        return kakao_formatter.format_result(report_dict)
+    except Exception as exc:
+        return kakao_formatter.format_error(str(exc))
+
+
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest) -> dict:
     try:
@@ -375,6 +434,42 @@ async def admin_metrics(scam_type: str | None = None) -> dict[str, Any]:
         metrics = pipeline_eval.evaluate_annotated_runs(records)
         metrics["filters"] = {"scam_type": scam_type}
         return metrics
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/runs/{run_id}/ai-draft")
+async def admin_ai_draft(run_id: str) -> dict[str, Any]:
+    """
+    Claude API로 라벨링 초안을 자동 생성한다.
+    검수자는 초안을 확인 후 수정/승인만 하면 된다.
+    """
+    try:
+        _require_db()
+        detail = await asyncio.to_thread(repository.get_run_detail, run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="해당 run을 찾을 수 없습니다.")
+
+        from pipeline import claude_labeler
+
+        run = detail["run"]
+        transcript = run.get("transcript_text", "")
+        predicted_scam_type = (run.get("classification_scanner") or {}).get("scam_type", "")
+        predicted_entities = run.get("entities_predicted") or []
+        predicted_flags = run.get("triggered_flags_predicted") or []
+
+        draft = await asyncio.to_thread(
+            claude_labeler.generate_draft,
+            transcript,
+            predicted_scam_type,
+            predicted_entities,
+            predicted_flags,
+        )
+        return {"ok": True, "draft": draft}
+    except HTTPException:
+        raise
     except EnvironmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

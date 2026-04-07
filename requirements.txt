@@ -1,3 +1,4 @@
+anthropic
 openai-whisper
 gliner>=0.2.20
 transformers>=5.0.0

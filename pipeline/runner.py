@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pipeline import classifier, extractor, llm_assessor, rag, scorer, stt, verifier
+from pipeline.config import CLASSIFICATION_THRESHOLD
 from pipeline.config import RAG_TOP_K
 from pipeline.scorer import ScamReport
 
@@ -205,7 +206,31 @@ class ScamGuardianPipeline:
         # 2단계: 스캠 유형 분류
         print(f"[2/{total_steps}] 스캠 유형 분류 중...")
         classification = self.classify(text)
+        classifier_original = classification
+        scam_type_source = "classifier"
+        scam_type_reason = ""
         print(f"      → {classification.scam_type} (신뢰도: {classification.confidence:.1%})")
+
+        # (옵션) LLM이 문맥으로 스캠 유형을 재판정하여 이후 추출/검증을 그 유형으로 수행
+        if use_llm:
+            try:
+                suggestion = llm_assessor.suggest_scam_type(text)
+                if suggestion is not None and suggestion.scam_type != classification.scam_type:
+                    classification = classifier.ClassificationResult(
+                        scam_type=suggestion.scam_type,
+                        confidence=suggestion.confidence,
+                        all_scores=classifier_original.all_scores,
+                        is_uncertain=suggestion.confidence < CLASSIFICATION_THRESHOLD,
+                    )
+                    scam_type_source = "llm"
+                    scam_type_reason = suggestion.reason
+                    print(
+                        f"      → [LLM 재판정] {classification.scam_type} (신뢰도: {classification.confidence:.1%})"
+                    )
+            except Exception as exc:
+                # 실패하면 기존 분류기로 계속 진행
+                self._log_step("LLM-유형재판정", time.time(), {"error": str(exc)})
+                self._debug(f"suggest_scam_type() 실패: {exc}")
 
         # 3단계: 엔티티 추출
         print(f"[3/{total_steps}] 엔티티 추출 중...")
@@ -284,6 +309,9 @@ class ScamGuardianPipeline:
             }
             if effective_use_rag
             else None,
+            scam_type_source=scam_type_source,
+            scam_type_reason=scam_type_reason,
+            classifier_original=classifier_original,
         )
 
         total_ms = (time.time() - pipeline_start) * 1000
