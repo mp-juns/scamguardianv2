@@ -107,6 +107,12 @@ def init_db() -> None:
     with _connect() as conn:
         for statement in statements:
             conn.execute(statement)
+        # 마이그레이션: claim 컬럼 추가 (이미 있으면 무시)
+        for col, col_type in [("claimed_by", "TEXT"), ("claimed_at", "TEXT")]:
+            try:
+                conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 
@@ -274,6 +280,111 @@ def save_transcript_embedding(run_id: str, embedding: list[float], model_name: s
             (run_id, _now_iso(), model_name, _dump_json(embedding)),
         )
         conn.commit()
+
+
+_CLAIM_TTL_SECONDS = 30 * 60  # 30분
+
+
+def _run_status(row: sqlite3.Row, now_iso: str) -> str:
+    """row에서 라벨링 상태를 계산한다."""
+    if row["annotated"]:
+        return "완료"
+    claimed_at = row["claimed_at"]
+    if claimed_at and claimed_at > _expire_iso(now_iso):
+        return "진행중"
+    return "미완료"
+
+
+def _expire_iso(now_iso: str) -> str:
+    from datetime import timedelta
+    now = datetime.fromisoformat(now_iso)
+    return (now - timedelta(seconds=_CLAIM_TTL_SECONDS)).isoformat()
+
+
+def list_runs_for_labeling(
+    limit: int = 50,
+    offset: int = 0,
+    status_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    라벨링 큐용 run 목록을 반환한다.
+
+    status_filter: '미완료' | '진행중' | '완료' | None(전체)
+    """
+    init_db()
+    now = _now_iso()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                ar.id,
+                ar.created_at,
+                ar.classification_scanner,
+                ar.total_score_predicted,
+                ar.risk_level_predicted,
+                ar.transcript_text,
+                ar.claimed_by,
+                ar.claimed_at,
+                ha.labeler,
+                (ha.run_id IS NOT NULL) AS annotated
+            FROM analysis_runs ar
+            LEFT JOIN human_annotations ha ON ha.run_id = ar.id
+            ORDER BY ar.created_at ASC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        status = _run_status(row, now)
+        if status_filter and status != status_filter:
+            continue
+        transcript = row["transcript_text"] or ""
+        classification = _load_json(row["classification_scanner"], {})
+        result.append({
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "transcript_preview": transcript[:120] + ("..." if len(transcript) > 120 else ""),
+            "predicted_scam_type": classification.get("scam_type", ""),
+            "predicted_confidence": classification.get("confidence", 0.0),
+            "total_score_predicted": row["total_score_predicted"],
+            "risk_level_predicted": row["risk_level_predicted"],
+            "status": status,
+            "claimed_by": row["claimed_by"] if status == "진행중" else None,
+            "labeler": row["labeler"],
+        })
+    return result
+
+
+def claim_run(run_id: str, labeler: str) -> bool:
+    """
+    run을 특정 라벨러가 클레임한다.
+    이미 다른 사람이 클레임 중이면 False 반환.
+    """
+    init_db()
+    now = _now_iso()
+    expire_threshold = _expire_iso(now)
+    with _connect() as conn:
+        # 이미 완료된 run은 클레임 불가
+        annotated = conn.execute(
+            "SELECT 1 FROM human_annotations WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if annotated:
+            return False
+
+        # 본인이거나 만료된 클레임이면 덮어쓰기 가능
+        result = conn.execute(
+            """
+            UPDATE analysis_runs
+            SET claimed_by = ?, claimed_at = ?
+            WHERE id = ?
+              AND (claimed_by IS NULL OR claimed_by = ? OR claimed_at <= ?)
+            """,
+            (labeler, now, run_id, labeler, expire_threshold),
+        )
+        conn.commit()
+        return result.rowcount > 0
 
 
 def get_next_unannotated_run() -> dict[str, Any] | None:
@@ -449,6 +560,7 @@ def fetch_annotated_pairs(scam_type: str | None = None) -> list[dict[str, Any]]:
             ha.scam_type_gt,
             ha.entities_gt,
             ha.triggered_flags_gt,
+            ha.labeler,
             ha.transcript_corrected_text,
             ha.stt_quality
         FROM analysis_runs ar
@@ -470,6 +582,7 @@ def fetch_annotated_pairs(scam_type: str | None = None) -> list[dict[str, Any]]:
             "scam_type_gt": row["scam_type_gt"],
             "entities_gt": _load_json(row["entities_gt"], []),
             "triggered_flags_gt": _load_json(row["triggered_flags_gt"], []),
+            "labeler": row["labeler"],
             "transcript_corrected_text": row["transcript_corrected_text"],
             "stt_quality": row["stt_quality"],
         }

@@ -1,10 +1,15 @@
 """
 ScamGuardian v2 — STT 모듈
 YouTube URL / 로컬 파일 / 텍스트 입력을 처리하여 텍스트를 반환한다.
+
+STT 백엔드:
+- OPENAI_API_KEY 환경변수가 있으면 OpenAI Whisper API 사용 (빠름, 유료)
+- 없으면 로컬 openai-whisper 사용 (느림, 무료)
 """
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 import time
@@ -34,8 +39,11 @@ def _is_youtube_url(source: str) -> bool:
 
 
 def _is_file(source: str) -> bool:
-    p = Path(source)
-    return p.exists() and p.is_file()
+    try:
+        p = Path(source)
+        return p.exists() and p.is_file()
+    except OSError:
+        return False
 
 
 def _download_youtube_audio(
@@ -54,10 +62,12 @@ def _download_youtube_audio(
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "192",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",
             }
         ],
+        # 앞 5분만 추출 (카카오 콜백 1분 제한 + OpenAI API 25MB 제한 대응)
+        "postprocessor_args": {"ExtractAudio": ["-t", "300"]},
         "quiet": not debug,
         "no_warnings": not debug,
     }
@@ -70,10 +80,10 @@ def _download_youtube_audio(
     if logger:
         logger(f"[STT] YouTube 오디오 다운로드 완료 ({time.time() - t0:.1f}s)")
 
-    wav_path = str(Path(output_dir) / "audio.wav")
-    if not Path(wav_path).exists():
+    mp3_path = str(Path(output_dir) / "audio.mp3")
+    if not Path(mp3_path).exists():
         raise FileNotFoundError(f"YouTube 오디오 다운로드 실패: {url}")
-    return wav_path
+    return mp3_path
 
 
 def _get_whisper_model(model_size: str) -> whisper.Whisper:
@@ -82,6 +92,28 @@ def _get_whisper_model(model_size: str) -> whisper.Whisper:
         _whisper_model_cache[model_size] = whisper.load_model(model_size)
         print(f"[STT] Whisper 모델 로드 완료: {model_size} ({time.time() - t0:.1f}s)")
     return _whisper_model_cache[model_size]
+
+
+def _transcribe_with_openai_api(
+    audio_path: str,
+    logger: Callable[[str], None] | None = None,
+) -> dict:
+    """OpenAI Whisper API로 음성 파일을 텍스트로 변환한다."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    if logger:
+        logger("[STT] OpenAI Whisper API 호출 시작")
+    t0 = time.time()
+    with open(audio_path, "rb") as f:
+        response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            language="ko",
+        )
+    if logger:
+        logger(f"[STT] OpenAI Whisper API 완료 ({time.time() - t0:.1f}s)")
+    return {"text": response.text, "language": "ko", "segments": []}
 
 
 def _ensure_audio_nonempty(path: str) -> None:
@@ -119,6 +151,8 @@ def transcribe(
             source_type="text",
         )
 
+    use_api = bool(os.environ.get("OPENAI_API_KEY"))
+
     # 2) YouTube URL
     if _is_youtube_url(source):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -131,16 +165,19 @@ def transcribe(
             if logger:
                 logger(f"[STT] 오디오 파일 준비 완료: {audio_path}")
             _ensure_audio_nonempty(audio_path)
-            model = _get_whisper_model(model_size)
-            if logger:
-                logger(f"[STT] Whisper 추론 시작 (model={model_size}, language=ko)")
-            t0 = time.time()
-            result = model.transcribe(audio_path, language="ko", verbose=debug)
-            if logger:
-                logger(
-                    f"[STT] Whisper 추론 완료 ({time.time() - t0:.1f}s), "
-                    f"segments={len(result.get('segments', []))}"
-                )
+            if use_api:
+                result = _transcribe_with_openai_api(audio_path, logger=logger)
+            else:
+                model = _get_whisper_model(model_size)
+                if logger:
+                    logger(f"[STT] Whisper 추론 시작 (model={model_size}, language=ko)")
+                t0 = time.time()
+                result = model.transcribe(audio_path, language="ko", verbose=debug)
+                if logger:
+                    logger(
+                        f"[STT] Whisper 추론 완료 ({time.time() - t0:.1f}s), "
+                        f"segments={len(result.get('segments', []))}"
+                    )
         return TranscriptResult(
             text=result["text"],
             language=result.get("language", "ko"),
@@ -150,16 +187,19 @@ def transcribe(
 
     # 3) 로컬 파일
     _ensure_audio_nonempty(source)
-    model = _get_whisper_model(model_size)
-    if logger:
-        logger(f"[STT] 로컬 파일 Whisper 추론 시작: {source}")
-    t0 = time.time()
-    result = model.transcribe(source, language="ko", verbose=debug)
-    if logger:
-        logger(
-            f"[STT] 로컬 파일 Whisper 추론 완료 ({time.time() - t0:.1f}s), "
-            f"segments={len(result.get('segments', []))}"
-        )
+    if use_api:
+        result = _transcribe_with_openai_api(source, logger=logger)
+    else:
+        model = _get_whisper_model(model_size)
+        if logger:
+            logger(f"[STT] 로컬 파일 Whisper 추론 시작: {source}")
+        t0 = time.time()
+        result = model.transcribe(source, language="ko", verbose=debug)
+        if logger:
+            logger(
+                f"[STT] 로컬 파일 Whisper 추론 완료 ({time.time() - t0:.1f}s), "
+                f"segments={len(result.get('segments', []))}"
+            )
     return TranscriptResult(
         text=result["text"],
         language=result.get("language", "ko"),

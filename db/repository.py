@@ -326,6 +326,23 @@ def save_transcript_embedding(run_id: str, embedding: list[float], model_name: s
         conn.execute(query, (run_id, model_name, embedding))
 
 
+def list_runs_for_labeling(
+    limit: int = 50,
+    offset: int = 0,
+    status_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    if get_db_backend() == "sqlite":
+        return sqlite_repository.list_runs_for_labeling(limit=limit, offset=offset, status_filter=status_filter)
+    # Postgres 미구현 — SQLite와 동일한 인터페이스 제공 예정
+    raise NotImplementedError("Postgres list_runs_for_labeling 미구현")
+
+
+def claim_run(run_id: str, labeler: str) -> bool:
+    if get_db_backend() == "sqlite":
+        return sqlite_repository.claim_run(run_id, labeler)
+    raise NotImplementedError("Postgres claim_run 미구현")
+
+
 def get_next_unannotated_run() -> dict[str, Any] | None:
     if get_db_backend() == "sqlite":
         return sqlite_repository.get_next_unannotated_run()

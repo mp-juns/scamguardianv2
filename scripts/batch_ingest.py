@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+ScamGuardian v2 — 배치 인제스트 스크립트
+
+텍스트 샘플 목록을 분석하여 DB에 run을 쌓는다.
+라벨링할 데이터가 없을 때 시드 데이터를 생성하는 용도.
+
+사용법:
+    python scripts/batch_ingest.py                        # 내장 샘플 전체
+    python scripts/batch_ingest.py --file samples.txt    # 텍스트 파일 (줄마다 1개)
+    python scripts/batch_ingest.py --skip-verify         # Serper 검증 생략 (빠름)
+    python scripts/batch_ingest.py --dry-run             # DB 저장 없이 결과만 출력
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# fmt: off
+SEED_SAMPLES = [
+    # ── 투자 사기 ──────────────────────────────────────────────────────────
+    "안녕하세요. 저는 KB증권 VIP 고객 담당 팀장 박정훈입니다. 저희가 내부적으로 검토한 종목인데요, 단기간에 연 40% 이상 수익이 가능하고 원금 보장까지 됩니다. 지금 바로 500만 원 이상 입금하시면 특별 우대 혜택을 드립니다.",
+    "지금 비트코인 다음으로 뜨는 코인이에요. 일론 머스크도 투자했고 이번 달 안에 10배는 기본입니다. 지금 들어오시면 사전 물량 받으실 수 있어요. 코인 지갑 주소 알려드릴게요.",
+    "저희 투자 리딩방에 가입하시면 매달 월 8% 수익 보장해드립니다. 이미 3천 명 회원이 수익 인증하고 있어요. 오늘 딱 10명만 더 받아요. 카카오페이로 보내주시면 돼요.",
+    "안녕하세요 삼성자산운용입니다. 저희 신규 펀드 출시 기념으로 초기 투자자 한정 연 25% 확정 수익 상품을 제공합니다. 오늘까지만 가입 가능하니 지금 바로 계좌번호 알려주세요.",
+
+    # ── 보이스피싱 (기관사칭) ──────────────────────────────────────────────
+    "저는 서울중앙지검 수사관 이민수입니다. 고객님 명의 계좌가 범죄에 사용되어 현재 수사 중입니다. 자산 보호를 위해 안전 계좌로 즉시 이체가 필요하며 이 내용은 절대 타인에게 누설하면 안 됩니다.",
+    "금융감독원입니다. 고객님 개인정보가 유출되어 피해를 입으실 수 있습니다. 현재 보유하신 금융 자산을 저희 보호 계좌로 옮겨야 합니다. 지금 바로 통장 비밀번호와 공인인증서 번호를 알려주세요.",
+    "경찰청 사이버수사대입니다. 고객님 명의로 개설된 대포통장이 발견되었습니다. 협조하지 않으시면 즉시 체포영장이 발부됩니다. 지금 당장 현금 인출하셔서 직원에게 전달해주세요.",
+
+    # ── 대출 사기 ──────────────────────────────────────────────────────────
+    "저금리 정부지원 대출 상품 안내드립니다. 신용등급 상관없이 연 2.9%로 5천만 원까지 가능합니다. 단 선납 보험료 30만 원 먼저 입금 주셔야 대출 진행됩니다.",
+    "안녕하세요. 서민금융진흥원 제휴 대출 상담사입니다. 현재 고객님 신용점수로 최대 1억까지 대출 가능한데요. 오늘 바로 처리해드릴 수 있어요. 계좌번호랑 주민번호 뒷자리 알려주세요.",
+    "지금 급하게 돈 필요하신 분 계세요? 저희는 무담보 무보증으로 당일 입금 가능합니다. 단 먼저 공증 비용 20만 원 보내주셔야 해요. 카카오뱅크 계좌로 보내시면 바로 처리해드릴게요.",
+
+    # ── 취업/알바 사기 ──────────────────────────────────────────────────────
+    "재택 부업 알바 구하세요? 하루 2시간 스마트폰으로 하는 일인데 일당 15만 원 드립니다. 단 시작 전에 교육 자료비 5만 원 먼저 내셔야 해요. 입금 확인되면 바로 카톡으로 알려드릴게요.",
+    "해외 연수 포함 연봉 6천 신입 채용입니다. 서류 합격 축하드립니다. 건강검진 예약금 10만 원 먼저 보내주시면 일정 안내드리겠습니다. 불합격 시 전액 환불 보장합니다.",
+
+    # ── 로맨스 스캠 ─────────────────────────────────────────────────────────
+    "안녕하세요 저 미국에서 한국으로 파견된 UN 소속 의사예요. 한국 문화가 좋아서 한국 분이랑 친해지고 싶어요. 저 지금 좀 급하게 돈이 필요한데 도와주실 수 있어요? 다음 달에 귀국하면 꼭 갚을게요.",
+
+    # ── 정상 (비사기) ───────────────────────────────────────────────────────
+    "오늘 점심 뭐 먹을까요? 삼겹살이 땡기는데 같이 가실 분 계세요?",
+    "내일 팀 회의 10시에 있습니다. 3분기 실적 자료 미리 검토해 오시기 바랍니다.",
+    "안녕하세요. 국민은행 고객센터입니다. 보안 강화로 인해 OTP 앱 업데이트가 필요합니다. 은행 공식 앱스토어에서 업데이트 해주세요.",
+]
+# fmt: on
+
+
+def run_batch(
+    samples: list[str],
+    skip_verify: bool,
+    dry_run: bool,
+    delay: float,
+) -> None:
+    if dry_run:
+        os.environ["SCAMGUARDIAN_PERSIST_RUNS"] = "false"
+    else:
+        os.environ["SCAMGUARDIAN_PERSIST_RUNS"] = "true"
+
+    from db import repository
+    from pipeline.runner import ScamGuardianPipeline
+
+    if not dry_run:
+        repository.init_db()
+
+    pipe = ScamGuardianPipeline(whisper_model="medium")
+
+    total = len(samples)
+    ok = 0
+    failed = 0
+
+    for i, text in enumerate(samples, 1):
+        preview = text[:60].replace("\n", " ")
+        print(f"[{i}/{total}] {preview}...")
+
+        try:
+            report = pipe.analyze(
+                text,
+                skip_verification=skip_verify,
+                use_llm=False,
+                use_rag=False,
+            )
+            d = report.to_dict()
+
+            run_id = None
+            if not dry_run:
+                transcript_text = (
+                    pipe.last_transcript_result.text
+                    if pipe.last_transcript_result is not None
+                    else text
+                )
+                run_id = repository.save_analysis_run(
+                    input_source=text[:200],
+                    whisper_model="medium",
+                    skip_verification=skip_verify,
+                    use_llm=False,
+                    use_rag=False,
+                    transcript_text=transcript_text,
+                    classification_scanner={
+                        "scam_type": d["scam_type"],
+                        "confidence": d["classification_confidence"],
+                        "is_uncertain": d["is_uncertain"],
+                    },
+                    entities_predicted=d["entities"],
+                    verification_results=d.get("all_verifications", []),
+                    triggered_flags_predicted=d["triggered_flags"],
+                    total_score_predicted=d["total_score"],
+                    risk_level_predicted=d["risk_level"],
+                    llm_assessment=d.get("llm_assessment"),
+                    metadata={"source": "batch_ingest"},
+                )
+
+            print(
+                f"  → {d['scam_type']} | {d['risk_level']} ({d['total_score']}점)"
+                + (f" | run_id={run_id}" if run_id else " | [dry-run, not saved]")
+            )
+            ok += 1
+        except Exception as exc:
+            print(f"  ✗ 오류: {exc}")
+            failed += 1
+
+        if i < total and delay > 0:
+            time.sleep(delay)
+
+    print(f"\n완료: {ok}개 성공, {failed}개 실패 (전체 {total}개)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ScamGuardian 배치 인제스트")
+    parser.add_argument(
+        "--file", "-f",
+        help="분석할 텍스트 파일 경로 (줄마다 1개 샘플, # 주석 지원)",
+    )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Serper API 검증 단계 생략 (빠름)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="DB에 저장하지 않고 결과만 출력",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.5,
+        help="샘플 간 대기 시간(초), 기본값 0.5",
+    )
+    args = parser.parse_args()
+
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"파일을 찾을 수 없습니다: {path}", file=sys.stderr)
+            sys.exit(1)
+        samples = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    else:
+        samples = SEED_SAMPLES
+
+    print(f"총 {len(samples)}개 샘플 {'(dry-run)' if args.dry_run else 'DB 저장'} 분석 시작\n")
+    run_batch(samples, skip_verify=args.skip_verify, dry_run=args.dry_run, delay=args.delay)
+
+
+if __name__ == "__main__":
+    main()

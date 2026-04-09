@@ -1,5 +1,5 @@
 """
-ScamGuardian v2 — Ollama 기반 LLM 보조 판정 모듈
+ScamGuardian v2 — Claude API 기반 LLM 보조 판정 모듈
 
 기존 규칙 파이프라인을 대체하지 않고, 추가 엔티티/플래그 후보를 제안한다.
 """
@@ -7,29 +7,40 @@ ScamGuardian v2 — Ollama 기반 LLM 보조 판정 모듈
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import requests
-
 from pipeline.config import (
     LLM_ENTITY_MERGE_THRESHOLD,
-  LLM_SCAM_TYPE_OVERRIDE_THRESHOLD,
-    OLLAMA_BASE_URL,
-    OLLAMA_KEEP_ALIVE,
-    OLLAMA_MAX_ENTITY_COUNT,
-    OLLAMA_MAX_TRANSCRIPT_CHARS,
-    OLLAMA_MAX_TRIGGERED_FLAG_COUNT,
-    OLLAMA_MODEL,
-    OLLAMA_NUM_PREDICT,
-    OLLAMA_TIMEOUT_SECONDS,
+    LLM_SCAM_TYPE_OVERRIDE_THRESHOLD,
+    OLLAMA_MAX_ENTITY_COUNT as _MAX_ENTITY_COUNT,
+    OLLAMA_MAX_TRANSCRIPT_CHARS as _MAX_TRANSCRIPT_CHARS,
+    OLLAMA_MAX_TRIGGERED_FLAG_COUNT as _MAX_FLAG_COUNT,
     RAG_MAX_CASES_IN_PROMPT,
     SCORING_RULES,
     get_runtime_scam_taxonomy,
 )
 from pipeline.extractor import Entity
 from pipeline.verifier import VerificationResult
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        import anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise EnvironmentError("ANTHROPIC_API_KEY가 설정되지 않았습니다.")
+        _client = anthropic.Anthropic(api_key=api_key)
+    return _client
+
+
+def default_model_name() -> str:
+    return os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
 @dataclass
@@ -76,8 +87,8 @@ class LLMAssessment:
         return {
             "model": self.model,
             "summary": self.summary,
-            "suggested_entities": [entity.to_dict() for entity in self.suggested_entities],
-            "suggested_flags": [flag.to_dict() for flag in self.suggested_flags],
+            "suggested_entities": [e.to_dict() for e in self.suggested_entities],
+            "suggested_flags": [f.to_dict() for f in self.suggested_flags],
             "error": self.error,
         }
 
@@ -96,16 +107,39 @@ class ScamTypeSuggestion:
         }
 
 
-def default_model_name() -> str:
-    return OLLAMA_MODEL
-
-
 def _clamp_confidence(value: Any, default: float = 0.6) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, number))
+
+
+def _call_claude(prompt: str, max_tokens: int = 512) -> dict[str, Any]:
+    client = _get_client()
+    model = default_model_name()
+    message = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system="당신은 한국어 스캠 탐지 보조 판정기입니다. JSON만 반환하세요. 마크다운 코드블록 없이 순수 JSON만 출력하세요.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = message.content[0].text
+    return _parse_json(raw)
+
+
+def _parse_json(raw: str) -> dict[str, Any]:
+    text = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        return {}
 
 
 def _build_prompt(
@@ -125,14 +159,14 @@ def _build_prompt(
             "score": round(entity.score, 4),
             "source": entity.source,
         }
-        for entity in entities[:OLLAMA_MAX_ENTITY_COUNT]
+        for entity in entities[:_MAX_ENTITY_COUNT]
     ]
     triggered_flags = [
         {
             "flag": result.flag,
             "description": result.flag_description,
         }
-        for result in verification_results[:OLLAMA_MAX_TRIGGERED_FLAG_COUNT]
+        for result in verification_results[:_MAX_FLAG_COUNT]
         if result.triggered
     ]
     rag_cases = (similar_cases or [])[:RAG_MAX_CASES_IN_PROMPT]
@@ -151,7 +185,6 @@ def _build_prompt(
 - suggested_flags[].flag 는 허용 플래그 중 하나만 사용
 - 확신이 낮으면 빈 배열
 - confidence 는 0~1 숫자
-- JSON 외 텍스트 금지
 - text 가 비어 있는 엔티티는 절대 반환하지 마라
 - 이미 추출된 엔티티와 동일하면 다시 제안하지 마라
 
@@ -171,7 +204,7 @@ def _build_prompt(
 {json.dumps(rag_cases, ensure_ascii=False)}
 
 전사 텍스트:
-{transcript[:OLLAMA_MAX_TRANSCRIPT_CHARS]}
+{transcript[:_MAX_TRANSCRIPT_CHARS]}
 
 반환 JSON 스키마:
 {{
@@ -200,7 +233,6 @@ def _build_scam_type_prompt(transcript: str) -> str:
     taxonomy = get_runtime_scam_taxonomy()
     scam_types = taxonomy["scam_types"]
     label_map = taxonomy["descriptions"]
-    # 설명적 레이블(문장)도 함께 줘서 문맥 판단을 돕는다.
     description_lines = [{"description": k, "scam_type": v} for k, v in label_map.items()]
 
     return f"""
@@ -215,7 +247,6 @@ def _build_scam_type_prompt(transcript: str) -> str:
 규칙:
 - scam_type 은 허용 목록 중 하나만
 - confidence 는 0~1 숫자
-- JSON 외 텍스트 금지
 
 허용 스캠 유형:
 {json.dumps(scam_types, ensure_ascii=False)}
@@ -224,7 +255,7 @@ def _build_scam_type_prompt(transcript: str) -> str:
 {json.dumps(description_lines, ensure_ascii=False)}
 
 전사 텍스트:
-{transcript[:OLLAMA_MAX_TRANSCRIPT_CHARS]}
+{transcript[:_MAX_TRANSCRIPT_CHARS]}
 
 반환 JSON 스키마:
 {{
@@ -241,7 +272,7 @@ def suggest_scam_type(transcript: str) -> ScamTypeSuggestion | None:
     confidence가 낮으면 None을 반환한다(기존 분류기 폴백용).
     """
     prompt = _build_scam_type_prompt(transcript)
-    result = _call_ollama(prompt)
+    result = _call_claude(prompt, max_tokens=256)
     scam_type = str(result.get("scam_type", "")).strip()
     confidence = _clamp_confidence(result.get("confidence"), default=0.55)
     reason = str(result.get("reason", "")).strip()
@@ -252,82 +283,6 @@ def suggest_scam_type(transcript: str) -> ScamTypeSuggestion | None:
     if confidence < LLM_SCAM_TYPE_OVERRIDE_THRESHOLD:
         return None
     return ScamTypeSuggestion(scam_type=scam_type, confidence=confidence, reason=reason)
-
-
-def _call_ollama(prompt: str) -> dict[str, Any]:
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {
-                "temperature": 0,
-                "num_predict": OLLAMA_NUM_PREDICT,
-            },
-        },
-        timeout=OLLAMA_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    raw_text = payload.get("response") or payload.get("thinking") or "{}"
-    return _parse_ollama_json(raw_text)
-
-
-def _parse_ollama_json(raw_text: str) -> dict[str, Any]:
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        repaired = _repair_truncated_json(raw_text)
-        return json.loads(repaired)
-
-
-def _repair_truncated_json(raw_text: str) -> str:
-    text = raw_text.strip()
-    if not text:
-        return "{}"
-
-    first_brace = text.find("{")
-    if first_brace > 0:
-        text = text[first_brace:]
-
-    stack: list[str] = []
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-        elif ch in "{[":
-            stack.append(ch)
-        elif ch == "}" and stack and stack[-1] == "{":
-            stack.pop()
-        elif ch == "]" and stack and stack[-1] == "[":
-            stack.pop()
-
-    if in_string:
-        text += '"'
-
-    text = re.sub(r",\s*$", "", text)
-
-    closing_parts: list[str] = []
-    for opener in reversed(stack):
-        closing_parts.append("}" if opener == "{" else "]")
-
-    repaired = text + "".join(closing_parts)
-    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
-    return repaired
 
 
 def assess(
@@ -344,7 +299,7 @@ def assess(
         verification_results,
         similar_cases=similar_cases,
     )
-    raw = _call_ollama(prompt)
+    raw = _call_claude(prompt, max_tokens=512)
 
     allowed_labels = set(get_runtime_scam_taxonomy()["label_sets"].get(scam_type, []))
     allowed_flags = set(SCORING_RULES.keys())
@@ -387,7 +342,7 @@ def assess(
         )
 
     return LLMAssessment(
-        model=OLLAMA_MODEL,
+        model=default_model_name(),
         summary=str(raw.get("summary", "")).strip(),
         suggested_entities=suggested_entities,
         suggested_flags=suggested_flags,

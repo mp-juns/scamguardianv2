@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -212,60 +213,135 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+_URL_RE = re.compile(r"https?://\S+")
+_YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
+
+
+def _kakao_extract_source(utterance: str, action_params: dict) -> str:
+    """
+    카카오 페이로드에서 분석 대상 소스를 추출한다.
+    우선순위: action.params 파일/영상 URL > utterance URL > utterance 텍스트
+    """
+    # 1) action.params에서 파일/영상 URL 확인
+    for key in ("video", "file", "video_url", "attachment"):
+        val = action_params.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+        if isinstance(val, dict):
+            url = val.get("url", "")
+            if url.startswith("http"):
+                return url
+
+    # 2) utterance가 URL이면 그대로 사용 (YouTube 링크 등)
+    if _URL_RE.match(utterance):
+        return utterance
+
+    # 3) utterance 안에서 URL 추출 (링크가 텍스트 중간에 섞인 경우)
+    url_match = _URL_RE.search(utterance)
+    if url_match:
+        return url_match.group(0)
+
+    return utterance
+
+
+def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
+    """파이프라인을 실행하고 report_dict를 반환한다."""
+    pipeline = ScamGuardianPipeline()
+    report = pipeline.analyze(
+        source,
+        skip_verification=True,
+        use_llm=use_llm,
+        use_rag=False,
+    )
+    report_dict = report.to_dict()
+    report_dict["transcript_text"] = (
+        pipeline.last_transcript_result.text
+        if pipeline.last_transcript_result is not None
+        else source
+    )
+    _persist_run(
+        pipeline,
+        AnalyzeRequest(
+            source=source,
+            skip_verification=True,
+            use_llm=use_llm,
+            use_rag=False,
+        ),
+        source,
+        report_dict,
+    )
+    return report_dict
+
+
+async def _kakao_callback_task(source: str, callback_url: str) -> None:
+    """
+    영상/URL 등 장기 분석을 백그라운드로 수행한 뒤
+    카카오 callbackUrl로 결과를 POST한다 (최대 60초).
+    """
+    import requests as _requests
+
+    try:
+        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, True)
+        result = kakao_formatter.format_result(report_dict)
+    except Exception as exc:
+        result = kakao_formatter.format_error(str(exc))
+
+    def _post():
+        try:
+            _requests.post(callback_url, json=result, timeout=10)
+        except Exception:
+            pass
+
+    await asyncio.to_thread(_post)
+
+
 @app.post("/webhook/kakao")
-async def kakao_webhook(request: Request) -> dict:
+async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> dict:
     """
     카카오 오픈빌더 Skill Webhook 엔드포인트.
 
-    카카오 서버가 사용자 발화를 POST로 전달하면
-    ScamGuardian 파이프라인을 실행하고 카카오 응답 포맷으로 반환한다.
+    지원 입력:
+    - 텍스트 발화 (utterance)
+    - YouTube URL / 영상 링크 (utterance 또는 action.params)
+    - 카카오 파일 업로드 (action.params.file / .video)
 
-    타임아웃: 카카오는 5초 이내 응답을 요구하므로
-    skip_verification=True, use_llm=False로 고정해 빠르게 처리한다.
+    타임아웃 처리:
+    - 카카오는 5초 이내 응답을 요구한다.
+    - URL/파일 등 장기 작업은 callbackUrl이 있으면 즉시 useCallback으로 응답하고
+      백그라운드에서 분석 후 callbackUrl로 POST한다.
+    - callbackUrl이 없으면 빠른 모드(skip_verification, use_llm=False)로 동기 처리한다.
     """
     try:
         body = await request.json()
     except Exception:
         return kakao_formatter.format_error("요청을 파싱할 수 없습니다.")
 
-    # 카카오 오픈빌더 v2: userRequest.utterance에 사용자 발화가 담긴다
     user_request = body.get("userRequest", {})
     utterance: str = (user_request.get("utterance") or "").strip()
+    callback_url: str = (user_request.get("callbackUrl") or "").strip()
+    action_params: dict = body.get("action", {}).get("params", {})
 
     # 빈 발화 또는 시작/도움말 명령
     if not utterance or utterance in ("새로 분석하기", "시작", "처음"):
         return kakao_formatter.format_help()
 
-    # 파이프라인 실행 (빠른 모드: 검색검증·LLM 생략)
-    def _run() -> dict:
-        pipeline = ScamGuardianPipeline()
-        report = pipeline.analyze(
-            utterance,
-            skip_verification=True,
-            use_llm=False,
-            use_rag=False,
-        )
-        report_dict = report.to_dict()
-        report_dict["transcript_text"] = (
-            pipeline.last_transcript_result.text
-            if pipeline.last_transcript_result is not None
-            else utterance
-        )
-        _persist_run(
-            pipeline,
-            AnalyzeRequest(
-                source=utterance,
-                skip_verification=True,
-                use_llm=False,
-                use_rag=False,
-            ),
-            utterance,
-            report_dict,
-        )
-        return report_dict
+    source = _kakao_extract_source(utterance, action_params)
+    is_heavy = bool(_URL_RE.match(source))  # URL이면 STT 필요 → 오래 걸림
 
+    # URL/파일 등 장기 작업: callback 모드
+    if is_heavy and callback_url:
+        background_tasks.add_task(_kakao_callback_task, source, callback_url)
+        return {
+            "version": "2.0",
+            "useCallback": True,
+            "data": {
+                "text": "🔍 영상을 분석 중입니다. 잠시만 기다려 주세요...",
+            },
+        }
+
+    # 텍스트 또는 callback 미지원: 빠른 동기 처리
     try:
-        report_dict = await asyncio.to_thread(_run)
+        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, False)
         return kakao_formatter.format_result(report_dict)
     except Exception as exc:
         return kakao_formatter.format_error(str(exc))
@@ -367,6 +443,47 @@ async def analyze_upload(
             wav_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+@app.get("/api/admin/runs")
+async def admin_list_runs(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    try:
+        _require_db()
+        runs = await asyncio.to_thread(
+            repository.list_runs_for_labeling,
+            limit=limit,
+            offset=offset,
+            status_filter=status,
+        )
+        return {"runs": runs, "limit": limit, "offset": offset}
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class ClaimRunRequest(BaseModel):
+    labeler: str
+
+
+@app.post("/api/admin/runs/{run_id}/claim")
+async def admin_claim_run(run_id: str, payload: ClaimRunRequest) -> dict[str, Any]:
+    try:
+        _require_db()
+        if not payload.labeler.strip():
+            raise HTTPException(status_code=400, detail="labeler 이름을 입력해주세요.")
+        ok = await asyncio.to_thread(repository.claim_run, run_id, payload.labeler.strip())
+        if not ok:
+            raise HTTPException(status_code=409, detail="다른 검수자가 이미 작업 중입니다.")
+        return {"ok": True}
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/admin/runs/next")

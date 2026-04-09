@@ -68,6 +68,10 @@ def compute_flag_metrics(
     }
 
 
+_REVIEW_ENTITY_F1_THRESHOLD = 0.5
+_REVIEW_FLAG_RECALL_THRESHOLD = 0.5
+
+
 def evaluate_annotated_runs(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not records:
         return {
@@ -76,6 +80,8 @@ def evaluate_annotated_runs(records: list[dict[str, Any]]) -> dict[str, Any]:
             "entity_micro": compute_entity_metrics([], []),
             "flag_micro": compute_flag_metrics([], []),
             "per_run": [],
+            "per_labeler": {},
+            "needs_review": [],
         }
 
     classification_hits = 0
@@ -130,6 +136,54 @@ def evaluate_annotated_runs(records: list[dict[str, Any]]) -> dict[str, Any]:
         else 0.0
     )
 
+    # ── per-labeler 집계 ───────────────────────────────────────
+    labeler_records: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        key = str(record.get("labeler") or "미입력")
+        labeler_records.setdefault(key, []).append(record)
+
+    per_labeler: dict[str, Any] = {}
+    for lname, lrecords in labeler_records.items():
+        lhits = sum(
+            1 for r in lrecords
+            if str(r.get("classification_scanner", {}).get("scam_type", "")).strip()
+            == str(r.get("scam_type_gt", "")).strip()
+        )
+        lentity_tp = lentity_fp = lentity_fn = 0
+        lflag_tp = lflag_fp = lflag_fn = 0
+        for r in lrecords:
+            em = compute_entity_metrics(r.get("entities_predicted", []), r.get("entities_gt", []))
+            fm = compute_flag_metrics(r.get("triggered_flags_predicted", []), r.get("triggered_flags_gt", []))
+            lentity_tp += int(em["tp"]); lentity_fp += int(em["fp"]); lentity_fn += int(em["fn"])
+            lflag_tp += int(fm["tp"]); lflag_fp += int(fm["fp"]); lflag_fn += int(fm["fn"])
+        le_prec = lentity_tp / (lentity_tp + lentity_fp) if (lentity_tp + lentity_fp) else 0.0
+        le_rec  = lentity_tp / (lentity_tp + lentity_fn) if (lentity_tp + lentity_fn) else 0.0
+        le_f1   = 2 * le_prec * le_rec / (le_prec + le_rec) if (le_prec + le_rec) else 0.0
+        lf_prec = lflag_tp / (lflag_tp + lflag_fp) if (lflag_tp + lflag_fp) else 0.0
+        lf_rec  = lflag_tp / (lflag_tp + lflag_fn) if (lflag_tp + lflag_fn) else 0.0
+        lf_f1   = 2 * lf_prec * lf_rec / (lf_prec + lf_rec) if (lf_prec + lf_rec) else 0.0
+        per_labeler[lname] = {
+            "sample_count": len(lrecords),
+            "classification_accuracy": lhits / len(lrecords),
+            "entity_f1": le_f1,
+            "flag_f1": lf_f1,
+        }
+
+    # ── 재검토 필요 목록 ────────────────────────────────────────
+    needs_review: list[dict[str, Any]] = []
+    for pr in per_run:
+        reasons = []
+        pred_type = pr["predicted_scam_type"]
+        gt_type = pr["scam_type_gt"]
+        if pred_type and gt_type and pred_type != gt_type:
+            reasons.append(f"분류 불일치: {pred_type} → {gt_type}")
+        if pr["entity_metrics"]["f1"] < _REVIEW_ENTITY_F1_THRESHOLD and pr["entity_metrics"]["fn"] > 0:
+            reasons.append(f"엔티티 recall 낮음 (F1={pr['entity_metrics']['f1']:.2f})")
+        if pr["flag_metrics"]["recall"] < _REVIEW_FLAG_RECALL_THRESHOLD and pr["flag_metrics"]["fn"] > 0:
+            reasons.append(f"플래그 recall 낮음 ({pr['flag_metrics']['recall']:.2f})")
+        if reasons:
+            needs_review.append({"run_id": pr["run_id"], "reasons": reasons})
+
     return {
         "sample_count": len(records),
         "classification_accuracy": classification_hits / len(records),
@@ -150,5 +204,7 @@ def evaluate_annotated_runs(records: list[dict[str, Any]]) -> dict[str, Any]:
             "fn": flag_fn,
         },
         "per_run": per_run,
+        "per_labeler": per_labeler,
+        "needs_review": needs_review,
     }
 
