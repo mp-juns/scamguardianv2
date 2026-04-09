@@ -1,73 +1,158 @@
 # ScamGuardian v2
 
-텍스트나 유튜브 URL을 받아 스캠 유형 분류, 엔티티 추출, 검색 기반 검증, 위험도 점수화를 수행하는 파이프라인입니다.
+한국어 음성·텍스트에서 전화사기를 탐지하는 AI 파이프라인 시스템.  
+카카오톡 챗봇, 웹 어드민, CLI를 통해 사용 가능.
 
 ## 구성
 
-- `pipeline/`: 기존 분석 파이프라인
-- `api_server.py`: FastAPI 기반 백엔드
-- `apps/web/`: Next.js 기반 웹 대시보드
-- `db/`: Postgres/pgvector + 로컬 SQLite 저장소 계층
+| 경로 | 설명 |
+|------|------|
+| `pipeline/` | STT → 분류 → 추출 → 검증 → RAG → LLM → 스코어링 |
+| `api_server.py` | FastAPI 백엔드 (카카오 웹훅 + REST API) |
+| `apps/web/` | Next.js 16 웹 프론트엔드 (어드민 포함) |
+| `db/` | SQLite / Postgres(pgvector) 저장소 계층 |
+| `scripts/` | 스택 실행·배치 인제스트 스크립트 |
 
 ## 빠른 실행
 
-### 1. Python API 실행
+### 전체 스택 (권장)
 
 ```bash
+./scripts/restart_stack.sh   # uvicorn(8000) + next dev(3100) 동시 실행
+./scripts/watch_logs.sh      # 로그 실시간 확인
+```
+
+### 개별 실행
+
+```bash
+# Python 백엔드
 pip install -r requirements.txt
 uvicorn api_server:app --reload
-```
 
-옵션:
-
-- 검색 검증을 쓰려면 루트 `.env`에 `SERPER_API_KEY`를 넣어야 합니다.
-- CORS 허용 도메인을 바꾸려면 `SCAMGUARDIAN_CORS_ORIGINS`를 설정하세요.
-- 분석 결과를 DB에 저장하려면 `SCAMGUARDIAN_DATABASE_URL` 또는 `SCAMGUARDIAN_SQLITE_PATH`와 `SCAMGUARDIAN_PERSIST_RUNS=true`를 설정하세요.
-- 로컬에서 빠르게 돌릴 때는 `SCAMGUARDIAN_SQLITE_PATH=.scamguardian/scamguardian.sqlite3`만으로도 `/admin`과 라벨 저장이 동작합니다.
-- RAG를 쓰려면 pgvector가 켜진 Postgres가 가장 좋지만, 로컬 SQLite 모드에서도 기본 유사도 검색 fallback으로 동작합니다.
-- 한국어 GLiNER가 `python-mecab-ko` 없이 로드되지 않으면, 파이프라인은 자동으로 규칙/키워드 기반 엔티티 추출로 계속 진행합니다.
-
-예시:
-
-```bash
-SCAMGUARDIAN_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/scamguardian
-SCAMGUARDIAN_PERSIST_RUNS=true
-SCAMGUARDIAN_RAG_TOP_K=3
-```
-
-로컬 SQLite 예시:
-
-```bash
-SCAMGUARDIAN_SQLITE_PATH=.scamguardian/scamguardian.sqlite3
-SCAMGUARDIAN_PERSIST_RUNS=true
-SCAMGUARDIAN_RAG_TOP_K=3
-```
-
-### 2. 웹 실행
-
-```bash
+# Next.js 프론트엔드
 cd apps/web
 npm install
 cp .env.example .env.local
-npm run dev
+npm run dev -- --port 3100
 ```
 
-기본 프록시 대상:
+### CLI 분석
 
 ```bash
-SCAMGUARDIAN_API_URL=http://127.0.0.1:8000
+python run_analysis.py "https://youtube.com/watch?v=..."
+python run_analysis.py --text "투자 설명 텍스트"
 ```
 
-## 라벨링/평가
+## 환경 변수 (`.env`)
 
-- 웹 어드민: `http://127.0.0.1:3000/admin` 또는 `3100/admin`
-- 어드민에서는 저장된 분석 run을 불러와 사람이 `scam_type`, 엔티티, 플래그, STT 교정본을 수정할 수 있습니다.
-- 어드민 대시보드에서 새 스캠 유형을 추가할 수 있고, 저장 즉시 분류 후보/라벨링 옵션에 반영됩니다.
-- 저장된 정답 데이터는 `/api/admin/metrics`에서 분류 정확도, 엔티티 F1, 플래그 F1으로 집계됩니다.
-- 분석 요청 시 `use_llm=true`와 `use_rag=true`를 함께 보내면, 사람 라벨이 붙은 과거 사례를 찾아 LLM 보조 판정 프롬프트에 참고 사례로 넣습니다.
+| 변수 | 설명 | 기본값 |
+|------|------|--------|
+| `SCAMGUARDIAN_API_URL` | Next.js → FastAPI 프록시 대상 | `http://127.0.0.1:8000` |
+| `SCAMGUARDIAN_SQLITE_PATH` | SQLite DB 경로 | `.scamguardian/scamguardian.sqlite3` |
+| `SCAMGUARDIAN_PERSIST_RUNS` | 분석 결과 DB 저장 여부 | `false` |
+| `SCAMGUARDIAN_DATABASE_URL` | Postgres 연결 문자열 | (없으면 SQLite) |
+| `ANTHROPIC_API_KEY` | LLM 보조 판정 + AI 라벨링 초안 | 필수 (`use_llm=true` 시) |
+| `ANTHROPIC_MODEL` | Claude 모델 | `claude-sonnet-4-6` |
+| `SERPER_API_KEY` | 교차 검증용 Google 검색 API | 필수 (검증 활성 시) |
+| `OPENAI_API_KEY` | OpenAI Whisper API | 없으면 로컬 Whisper 사용 |
+| `SCAMGUARDIAN_CORS_ORIGINS` | 허용 CORS 오리진 (콤마 구분) | `http://localhost:3000,...` |
 
-## 배포 방향
+## 파이프라인 단계
 
-- 프론트엔드: Vercel
-- Python API: Railway / Render / Fly.io 중 하나
-- 프론트에서는 `/api/analyze`만 호출하고, 실제 Python 서버 주소는 `SCAMGUARDIAN_API_URL`로 연결합니다.
+```
+입력 (텍스트 / YouTube URL / 음성 파일)
+  │
+  ▼
+STT (stt.py)               OpenAI Whisper API 또는 로컬 Whisper medium
+  │
+  ▼
+분류 (classifier.py)        mDeBERTa NLI + 키워드 부스팅 → 사기 유형 판별
+  │
+  ▼
+엔티티 추출 (extractor.py)   GLiNER(taeminlee/gliner_ko) → 유형별 엔티티
+  │
+  ▼
+교차 검증 (verifier.py)     Serper API로 엔티티 진위 확인 (생략 가능)
+  │
+  ▼
+RAG (rag.py)               SBERT 임베딩 → 과거 사람 라벨 사례 검색 (선택)
+  │
+  ▼
+LLM 판정 (llm_assessor.py)  Claude API 보조 판정 (선택)
+  │
+  ▼
+스코어링 (scorer.py)        플래그 합산 → 위험 점수 / 레벨
+  │
+  ▼
+ScamReport (JSON)
+```
+
+## 사기 유형 (12종)
+
+투자 사기 / 보이스피싱 / 대출 사기 / 메신저 피싱 / 로맨스 스캠 /  
+취업·알바 사기 / 납치·협박형 / 스미싱 / 중고거래 사기 / 정상 외
+
+어드민에서 커스텀 유형 추가 가능 → 즉시 파이프라인에 반영.
+
+## 어드민 기능
+
+| 경로 | 기능 |
+|------|------|
+| `/admin` | 라벨링 큐 — 검수자 claim, 상태 필터 (미완료/진행중/완료) |
+| `/admin/[runId]` | 라벨 편집 — AI 초안 생성, 엔티티/플래그/사기유형 수정 |
+| `/admin/stats` | DB 대시보드 — 사기 유형 분포, 위험도 분포, 일별 추이 |
+| `/admin/browse` | DB 브라우저 — 텍스트 검색, 필터, 페이지네이션 |
+
+### 라벨링 데이터 배치 생성
+
+```bash
+# 내장 시드 샘플(23개) DB 저장
+python scripts/batch_ingest.py --skip-verify
+
+# 외부 텍스트 파일 (줄마다 1개, # 주석 지원)
+python scripts/batch_ingest.py --file samples.txt --skip-verify
+
+# DB 저장 없이 결과만 확인
+python scripts/batch_ingest.py --dry-run
+```
+
+## 카카오톡 챗봇 연동
+
+카카오 오픈빌더 스킬 서버 URL: `https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`
+
+| 입력 | 처리 방식 |
+|------|-----------|
+| 텍스트 발화 | 즉시 동기 분석 |
+| YouTube URL | 콜백으로 백그라운드 처리 (60초 내 결과) |
+| 카카오 파일/영상 업로드 | URL 추출 후 콜백 처리 |
+
+**오픈빌더 설정 필요사항**
+- 스킬 블록에서 **콜백 사용** 체크
+- 파일 업로드는 블록에 파일 타입 파라미터 추가
+
+**로컬 외부 노출 (Tailscale Funnel)**
+
+```bash
+tailscale set --hostname scamguardian   # 호스트명 설정 (최초 1회)
+tailscale funnel --bg 3100              # Next.js 포트 노출
+```
+
+웹 어드민도 같은 주소 `/admin` 경로로 외부 접근 가능.
+
+## 품질 관리
+
+`GET /api/admin/metrics` 반환값:
+
+- `classification_accuracy`: 전체 분류 정확도
+- `entity_micro` / `flag_micro`: precision / recall / F1
+- `per_labeler`: 검수자별 완료 수, 분류 정확도, 엔티티 F1
+- `needs_review`: 분류 불일치 또는 recall 낮은 run 목록
+
+## 배포
+
+| 구성요소 | 플랫폼 |
+|----------|--------|
+| 프론트엔드 | Vercel (Root Directory: `apps/web`) |
+| Python API | Render (`uvicorn api_server:app --host 0.0.0.0 --port $PORT`) |
+
+세부 설정: `DEPLOY.md`, `render.yaml`
