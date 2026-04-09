@@ -3,6 +3,7 @@
 한국어 음성·텍스트에서 전화사기를 탐지하는 AI 파이프라인 시스템.  
 카카오톡 챗봇, 웹 어드민, CLI를 통해 사용 가능.
 
+관리 주소 : https://scamguardian.tail7e5dfc.ts.net/admin
 ## 구성
 
 | 경로 | 설명 |
