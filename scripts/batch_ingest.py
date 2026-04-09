@@ -76,7 +76,7 @@ SEED_SAMPLES = [
 
 
 def run_batch(
-    samples: list[str],
+    samples: list[dict[str, object]],
     skip_verify: bool,
     dry_run: bool,
     delay: float,
@@ -98,7 +98,14 @@ def run_batch(
     ok = 0
     failed = 0
 
-    for i, text in enumerate(samples, 1):
+    for i, sample in enumerate(samples, 1):
+        text = str(sample.get("text", "")).strip()
+        metadata = sample.get("metadata")
+        if not text:
+            print(f"[{i}/{total}] ✗ 비어있는 샘플이라 건너뜁니다.")
+            failed += 1
+            continue
+
         preview = text[:60].replace("\n", " ")
         print(f"[{i}/{total}] {preview}...")
 
@@ -136,7 +143,7 @@ def run_batch(
                     total_score_predicted=d["total_score"],
                     risk_level_predicted=d["risk_level"],
                     llm_assessment=d.get("llm_assessment"),
-                    metadata={"source": "batch_ingest"},
+                    metadata=(metadata if isinstance(metadata, dict) else {"source": "batch_ingest"}),
                 )
 
             print(
@@ -154,11 +161,47 @@ def run_batch(
     print(f"\n완료: {ok}개 성공, {failed}개 실패 (전체 {total}개)")
 
 
+def _normalize_text_samples(lines: list[str]) -> list[dict[str, object]]:
+    return [{"text": line, "metadata": {"source": "batch_ingest"}} for line in lines]
+
+
+def _load_jsonl_samples(path: Path) -> list[dict[str, object]]:
+    samples: list[dict[str, object]] = []
+    for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSONL 파싱 실패: {path}:{lineno}: {exc}") from exc
+
+        if isinstance(item, str):
+            samples.append({"text": item, "metadata": {"source": "batch_ingest"}})
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(f"JSONL 각 줄은 객체 또는 문자열이어야 합니다: {path}:{lineno}")
+        text = str(item.get("text", "")).strip()
+        if not text:
+            raise ValueError(f"text 필드가 비어 있습니다: {path}:{lineno}")
+        metadata = item.get("metadata")
+        if metadata is None:
+            metadata = {"source": "batch_ingest"}
+        elif not isinstance(metadata, dict):
+            raise ValueError(f"metadata 필드는 객체여야 합니다: {path}:{lineno}")
+        samples.append({"text": text, "metadata": metadata})
+    return samples
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ScamGuardian 배치 인제스트")
     parser.add_argument(
         "--file", "-f",
         help="분석할 텍스트 파일 경로 (줄마다 1개 샘플, # 주석 지원)",
+    )
+    parser.add_argument(
+        "--jsonl",
+        help="분석할 JSONL 파일 경로 (text/metadata 포함 JSONL 형식)",
     )
     parser.add_argument(
         "--skip-verify",
@@ -178,18 +221,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.file:
+    if args.file and args.jsonl:
+        print("--file 과 --jsonl 은 동시에 사용할 수 없습니다.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.jsonl:
+        path = Path(args.jsonl)
+        if not path.exists():
+            print(f"파일을 찾을 수 없습니다: {path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            samples = _load_jsonl_samples(path)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+    elif args.file:
         path = Path(args.file)
         if not path.exists():
             print(f"파일을 찾을 수 없습니다: {path}", file=sys.stderr)
             sys.exit(1)
-        samples = [
+        samples = _normalize_text_samples([
             line.strip()
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
-        ]
+        ])
     else:
-        samples = SEED_SAMPLES
+        samples = _normalize_text_samples(SEED_SAMPLES)
 
     print(f"총 {len(samples)}개 샘플 {'(dry-run)' if args.dry_run else 'DB 저장'} 분석 시작\n")
     run_batch(samples, skip_verify=args.skip_verify, dry_run=args.dry_run, delay=args.delay)

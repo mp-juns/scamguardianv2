@@ -112,6 +112,12 @@ python scripts/batch_ingest.py --skip-verify
 # 외부 텍스트 파일 (줄마다 1개, # 주석 지원)
 python scripts/batch_ingest.py --file samples.txt --skip-verify
 
+# JSONL 파일 (text + metadata 포함)
+python scripts/batch_ingest.py --jsonl data/processed/public_cases.jsonl --skip-verify
+
+# 공공기관 공개 자료 수집 → JSONL 생성
+python scripts/collect_public_cases.py --org all
+
 # DB 저장 없이 결과만 확인
 python scripts/batch_ingest.py --dry-run
 ```
@@ -156,3 +162,29 @@ tailscale funnel --bg 3100              # Next.js 포트 노출
 | Python API | Render (`uvicorn api_server:app --host 0.0.0.0 --port $PORT`) |
 
 세부 설정: `DEPLOY.md`, `render.yaml`
+
+
+## 공공기관 공개 사례 수집
+
+공식 공개 페이지와 첨부 PDF에서 사례성 문구를 수집해 JSONL로 저장한 뒤, 기존 배치 인제스트로 DB에 적재할 수 있다.
+
+지원 출처:
+- `kisa`: 보호나라 스미싱 주의보/보안공지
+- `police`: 전기통신금융사기 통합대응단 예보·경보/FAQ
+- `fsc`: 금융위원회 보이스피싱 예방 자료/카드뉴스
+
+```bash
+# 1) 공식 공개 자료를 JSONL로 수집
+python scripts/collect_public_cases.py --org all --max-items-per-source 50
+
+# 2) 수집 결과를 기존 파이프라인으로 적재
+python scripts/batch_ingest.py --jsonl data/processed/public_cases.jsonl --skip-verify
+```
+
+JSONL 각 줄 예시:
+
+```json
+{"text":"[CJ대한통운] 고객님 택배가 주소 불명...","metadata":{"source":"public_agency","source_org":"kisa","source_url":"https://...","doc_title":"...","published_at":"2026-02-10","channel":"security_notice","evidence_level":"official_public_case"}}
+```
+
+DB 브라우저 검색 API는 `source`, `source_org`, `channel` 필터를 지원한다.
