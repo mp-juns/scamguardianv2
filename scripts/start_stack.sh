@@ -11,6 +11,7 @@ FRONTEND_PORT="${FRONTEND_PORT:-3100}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 
 CONDA_ENV="${CONDA_ENV:-capstone}"
+ENABLE_FUNNEL="${ENABLE_FUNNEL:-true}"
 
 echo "[start] root=$ROOT_DIR"
 echo "[start] logs=$LOG_DIR"
@@ -51,6 +52,14 @@ cd "$ROOT_DIR/apps/web"
 SCAMGUARDIAN_API_URL="http://127.0.0.1:${BACKEND_PORT}" \
 nohup npm run dev -- --hostname 0.0.0.0 --port "$FRONTEND_PORT" \
   >"$LOG_DIR/frontend.log" 2>&1 &
+
+if [[ "$ENABLE_FUNNEL" == "true" ]] && command -v tailscale >/dev/null 2>&1; then
+  echo "[start] enabling tailscale funnel (backend:$BACKEND_PORT, frontend:$FRONTEND_PORT)..."
+  # funnel은 실패해도 스택 구동을 막지 않는다.
+  nohup tailscale funnel --bg "$BACKEND_PORT" >/dev/null 2>&1 || true
+  nohup tailscale funnel --bg "$FRONTEND_PORT" >/dev/null 2>&1 || true
+  tailscale funnel status 2>/dev/null || true
+fi
 
 echo "[start] done."
 echo "[start] tail logs:"

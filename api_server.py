@@ -204,8 +204,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup() -> None:
+    import logging
+    log = logging.getLogger("startup")
+
     if repository.database_configured():
         repository.init_db()
+
+    log.info("모델 워밍업 시작 (콜드스타트 방지)...")
+    try:
+        pipeline = ScamGuardianPipeline()
+        pipeline.analyze("워밍업 테스트", skip_verification=True, use_llm=False, use_rag=False)
+        log.info("모델 워밍업 완료")
+    except Exception as exc:
+        log.warning("모델 워밍업 실패 (무시): %s", exc)
 
 
 @app.get("/health")
@@ -217,31 +228,38 @@ _URL_RE = re.compile(r"https?://\S+")
 _YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
 
 
-def _kakao_extract_source(utterance: str, action_params: dict) -> str:
+def _kakao_detect_input(
+    utterance: str, action_params: dict
+) -> tuple[str, kakao_formatter.InputType]:
     """
-    카카오 페이로드에서 분석 대상 소스를 추출한다.
-    우선순위: action.params 파일/영상 URL > utterance URL > utterance 텍스트
+    카카오 페이로드에서 분석 대상 소스와 입력 유형을 감지한다.
+    Returns: (source, InputType)
     """
-    # 1) action.params에서 파일/영상 URL 확인
+    InputType = kakao_formatter.InputType
+
+    # 1) action.params에서 파일/영상 URL (카카오 파일 전송)
     for key in ("video", "file", "video_url", "attachment"):
         val = action_params.get(key)
         if isinstance(val, str) and val.startswith("http"):
-            return val
+            kind = InputType.VIDEO if "video" in key else InputType.FILE
+            return val, kind
         if isinstance(val, dict):
             url = val.get("url", "")
             if url.startswith("http"):
-                return url
+                kind = InputType.VIDEO if "video" in key else InputType.FILE
+                return url, kind
 
-    # 2) utterance가 URL이면 그대로 사용 (YouTube 링크 등)
+    # 2) utterance 전체가 URL
     if _URL_RE.match(utterance):
-        return utterance
+        return utterance, InputType.URL
 
-    # 3) utterance 안에서 URL 추출 (링크가 텍스트 중간에 섞인 경우)
+    # 3) utterance 안에 URL이 포함된 경우
     url_match = _URL_RE.search(utterance)
     if url_match:
-        return url_match.group(0)
+        return url_match.group(0), InputType.URL
 
-    return utterance
+    # 4) 순수 텍스트
+    return utterance, InputType.TEXT
 
 
 def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
@@ -273,24 +291,53 @@ def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
     return report_dict
 
 
-async def _kakao_callback_task(source: str, callback_url: str) -> None:
-    """
-    영상/URL 등 장기 분석을 백그라운드로 수행한 뒤
-    카카오 callbackUrl로 결과를 POST한다 (최대 60초).
-    """
+def _classify_error(exc: Exception) -> kakao_formatter.ErrorCode:
+    """예외 종류에 따라 적절한 ErrorCode를 반환한다."""
+    EC = kakao_formatter.ErrorCode
+    msg = str(exc).lower()
+    if "api" in msg and ("credit" in msg or "quota" in msg or "limit" in msg):
+        return EC.API_CREDIT
+    if "connection" in msg or "connect" in msg or "unreachable" in msg:
+        return EC.SERVER_DOWN
+    if "stt" in msg or "whisper" in msg or "audio" in msg or "transcri" in msg:
+        return EC.STT_FAIL
+    if "timeout" in msg or "timed out" in msg:
+        return EC.TIMEOUT
+    if "memory" in msg or "ollama" in msg:
+        return EC.LLM_UNAVAILABLE
+    if "empty" in msg or "비어" in msg:
+        return EC.EMPTY_INPUT
+    return EC.UNKNOWN
+
+
+async def _kakao_callback_task(
+    source: str,
+    callback_url: str,
+    input_type: kakao_formatter.InputType,
+    use_llm: bool = False,
+) -> None:
+    """분석을 백그라운드로 수행한 뒤 카카오 callbackUrl로 결과를 POST한다."""
+    import logging
     import requests as _requests
 
+    log = logging.getLogger("kakao_callback")
+
     try:
-        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, True)
-        result = kakao_formatter.format_result(report_dict)
+        log.info("callback 분석 시작: type=%s source=%s", input_type.value, source[:80])
+        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, use_llm)
+        result = kakao_formatter.format_result(report_dict, input_type)
+        log.info("callback 분석 완료: risk_level=%s", report_dict.get("risk_level"))
     except Exception as exc:
-        result = kakao_formatter.format_error(str(exc))
+        log.error("callback 분석 실패: %s", exc)
+        error_code = _classify_error(exc)
+        result = kakao_formatter.format_error(error_code, detail=str(exc))
 
     def _post():
         try:
-            _requests.post(callback_url, json=result, timeout=10)
-        except Exception:
-            pass
+            resp = _requests.post(callback_url, json=result, timeout=10)
+            log.info("callback POST 완료: status=%s", resp.status_code)
+        except Exception as e:
+            log.error("callback POST 실패: %s", e)
 
     await asyncio.to_thread(_post)
 
@@ -300,51 +347,67 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     """
     카카오 오픈빌더 Skill Webhook 엔드포인트.
 
-    지원 입력:
-    - 텍스트 발화 (utterance)
-    - YouTube URL / 영상 링크 (utterance 또는 action.params)
-    - 카카오 파일 업로드 (action.params.file / .video)
-
-    타임아웃 처리:
-    - 카카오는 5초 이내 응답을 요구한다.
-    - URL/파일 등 장기 작업은 callbackUrl이 있으면 즉시 useCallback으로 응답하고
-      백그라운드에서 분석 후 callbackUrl로 POST한다.
-    - callbackUrl이 없으면 빠른 모드(skip_verification, use_llm=False)로 동기 처리한다.
+    입력 유형을 자동 감지하여 분기 처리:
+    - 텍스트 → 즉시 분석 (callback 있으면 백그라운드)
+    - URL/영상 링크 → callback 필수, 다운로드+STT+분석
+    - 파일/영상 업로드 → callback 필수, STT+분석
     """
+    import logging
+    log = logging.getLogger("kakao_webhook")
+    EC = kakao_formatter.ErrorCode
+    InputType = kakao_formatter.InputType
+
     try:
         body = await request.json()
     except Exception:
-        return kakao_formatter.format_error("요청을 파싱할 수 없습니다.")
+        return kakao_formatter.format_error(EC.PARSE_ERROR)
+
+    log.info("kakao webhook 수신: %s", str(body)[:200])
 
     user_request = body.get("userRequest", {})
     utterance: str = (user_request.get("utterance") or "").strip()
     callback_url: str = (user_request.get("callbackUrl") or "").strip()
     action_params: dict = body.get("action", {}).get("params", {})
 
-    # 빈 발화 또는 시작/도움말 명령
-    if not utterance or utterance in ("새로 분석하기", "시작", "처음"):
+    # 도움말 / 시작 명령
+    if not utterance or utterance in ("새로 분석하기", "시작", "처음", "사용법"):
         return kakao_formatter.format_help()
 
-    source = _kakao_extract_source(utterance, action_params)
-    is_heavy = bool(_URL_RE.match(source))  # URL이면 STT 필요 → 오래 걸림
+    source, input_type = _kakao_detect_input(utterance, action_params)
+    is_heavy = input_type in (InputType.URL, InputType.VIDEO, InputType.FILE)
 
-    # URL/파일 등 장기 작업: callback 모드
-    if is_heavy and callback_url:
-        background_tasks.add_task(_kakao_callback_task, source, callback_url)
+    log.info("입력 감지: type=%s source=%s", input_type.value, source[:60])
+
+    # ── callbackUrl이 있으면: 무조건 callback 모드 ──
+    if callback_url:
+        msg = kakao_formatter.format_analyzing(input_type)
+        background_tasks.add_task(
+            _kakao_callback_task, source, callback_url, input_type, is_heavy,
+        )
         return {
             "version": "2.0",
             "useCallback": True,
-            "data": {
-                "text": "🔍 영상을 분석 중입니다. 잠시만 기다려 주세요...",
-            },
+            "data": {"text": msg},
         }
 
-    # 텍스트 또는 callback 미지원: 빠른 동기 처리
+    # ── callbackUrl 없음 ──
+    # 무거운 작업(URL/영상/파일)은 callback 없이 불가
+    if is_heavy:
+        return kakao_formatter.format_error(EC.CALLBACK_REQUIRED)
+
+    # 텍스트: 동기 모드 (4.5초 타임아웃 가드)
     try:
-        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, False)
-        return kakao_formatter.format_result(report_dict)
+        report_dict = await asyncio.wait_for(
+            asyncio.to_thread(_kakao_run_pipeline, source, False),
+            timeout=4.5,
+        )
+        return kakao_formatter.format_result(report_dict, InputType.TEXT)
+    except asyncio.TimeoutError:
+        return kakao_formatter.format_error(EC.TIMEOUT)
     except Exception as exc:
-        return kakao_formatter.format_error(str(exc))
+        log.error("동기 처리 실패: %s", exc)
+        error_code = _classify_error(exc)
+        return kakao_formatter.format_error(error_code, detail=str(exc))
 
 
 @app.post("/api/analyze")

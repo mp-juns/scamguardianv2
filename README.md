@@ -4,6 +4,7 @@
 카카오톡 챗봇, 웹 어드민, CLI를 통해 사용 가능.
 
 관리 주소 : https://scamguardian.tail7e5dfc.ts.net/admin
+
 ## 구성
 
 | 경로 | 설명 |
@@ -19,9 +20,12 @@
 ### 전체 스택 (권장)
 
 ```bash
-./scripts/restart_stack.sh   # uvicorn(8000) + next dev(3100) 동시 실행
-./scripts/watch_logs.sh      # 로그 실시간 확인
+./scripts/start_stack.sh    # uvicorn(8000) + next dev(3100) + Tailscale Funnel 동시 실행
+./scripts/watch_logs.sh     # 로그 실시간 확인
 ```
+
+> `start_stack.sh`는 conda 환경(`CONDA_ENV`, 기본 `capstone`)을 사용합니다.  
+> conda가 없으면 `scripts/restart_stack.sh`를 사용하세요.
 
 ### 개별 실행
 
@@ -90,8 +94,8 @@ ScamReport (JSON)
 
 ## 사기 유형 (12종)
 
-투자 사기 / 보이스피싱 / 대출 사기 / 메신저 피싱 / 로맨스 스캠 /  
-취업·알바 사기 / 납치·협박형 / 스미싱 / 중고거래 사기 / 정상 외
+투자 사기 / 건강식품 사기 / 부동산 사기 / 코인 사기 / 기관 사칭 / 대출 사기 /
+메신저 피싱 / 로맨스 스캠 / 취업·알바 사기 / 납치·협박형 / 스미싱 / 중고거래 사기
 
 어드민에서 커스텀 유형 추가 가능 → 즉시 파이프라인에 반영.
 
@@ -125,26 +129,51 @@ python scripts/batch_ingest.py --dry-run
 
 ## 카카오톡 챗봇 연동
 
+### 입력 유형별 자동 분기
 
+Webhook(`/webhook/kakao`)이 입력을 자동 감지하여 유형별로 다르게 처리한다.
 
-| 입력 | 처리 방식 |
-|------|-----------|
-| 텍스트 발화 | 즉시 동기 분석 |
-| YouTube URL | 콜백으로 백그라운드 처리 (60초 내 결과) |
-| 카카오 파일/영상 업로드 | URL 추출 후 콜백 처리 |
+| 입력 유형 | 감지 기준 | callbackUrl 있음 | callbackUrl 없음 |
+|-----------|----------|-------------------|-------------------|
+| 텍스트 | URL이 아닌 일반 발화 | 비동기 callback 분석 | 동기 분석 (4.5초 타임아웃) |
+| URL/영상 링크 | `http(s)://` 패턴 감지 | 비동기 callback (STT+분석) | 에러: "콜백 필요" |
+| 파일/영상 업로드 | `action.params`에서 추출 | 비동기 callback (STT+분석) | 에러: "콜백 필요" |
 
-**오픈빌더 설정 필요사항**
+### 유형별 응답 차이
+
+- **텍스트 분석**: `💬 텍스트 분석` 카드 — 스캠 유형, 플래그, 엔티티
+- **URL/영상 분석**: `🔗 URL/영상 분석` 카드 — 위 항목 + **음성 전사(STT) 미리보기**
+- **파일 분석**: `📎 파일 분석` / `🎬 업로드 영상 분석` 카드 — 위 항목 + STT 미리보기
+
+### 에러 처리
+
+| 에러 코드 | 상황 | 사용자 메시지 |
+|-----------|------|--------------|
+| `API_CREDIT` | API 크레딧 소진 | "서버의 API 크레딧이 부족합니다! 챗봇 관리자에게 알려주세요." |
+| `SERVER_DOWN` | 서버 연결 불가 | "분석 서버에 연결할 수 없습니다." |
+| `STT_FAIL` | 음성 인식 실패 | "음성 인식(STT)에 실패했습니다." |
+| `TIMEOUT` | 처리 시간 초과 | "처리 시간이 초과되었습니다." |
+| `LLM_UNAVAILABLE` | LLM 서버 불가 | "AI 보조 분석 서비스를 사용할 수 없습니다." |
+| `CALLBACK_REQUIRED` | URL인데 콜백 미설정 | "영상/URL 분석은 콜백 사용 설정이 필요합니다." |
+| `FILE_TOO_LARGE` | 100MB 초과 | "파일 크기가 너무 큽니다." |
+
+예외 메시지를 자동 분류하여(`_classify_error()`) 적절한 에러 코드로 매핑한다.
+
+### 오픈빌더 설정 필요사항
+
 - 스킬 블록에서 **콜백 사용** 체크
-- 파일 업로드는 블록에 파일 타입 파라미터 추가
+- 파일 업로드는 블록에 파일 타입 파라미터 추가 (`video`, `file`, `video_url` 등)
+- 스킬 서버 주소: `https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`
 
-**로컬 외부 노출 (Tailscale Funnel)**
+### 로컬 외부 노출 (Tailscale Funnel)
 
 ```bash
 tailscale set --hostname scamguardian   # 호스트명 설정 (최초 1회)
+tailscale funnel --bg 8000              # FastAPI 포트 노출
 tailscale funnel --bg 3100              # Next.js 포트 노출
 ```
 
-웹 어드민도 같은 주소 `/admin` 경로로 외부 접근 가능.
+`start_stack.sh`에서 `ENABLE_FUNNEL=true`(기본값)이면 자동으로 Funnel 설정.
 
 ## 품질 관리
 
@@ -163,7 +192,6 @@ tailscale funnel --bg 3100              # Next.js 포트 노출
 | Python API | Render (`uvicorn api_server:app --host 0.0.0.0 --port $PORT`) |
 
 세부 설정: `DEPLOY.md`, `render.yaml`
-
 
 ## 공공기관 공개 사례 수집
 
