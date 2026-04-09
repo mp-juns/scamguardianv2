@@ -125,7 +125,7 @@ python scripts/batch_ingest.py --dry-run
 
 ## 카카오톡 챗봇 연동
 
-카카오 오픈빌더 스킬 서버 URL: `https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`
+
 
 | 입력 | 처리 방식 |
 |------|-----------|
