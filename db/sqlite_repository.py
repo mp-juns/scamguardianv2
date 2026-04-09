@@ -590,6 +590,163 @@ def fetch_annotated_pairs(scam_type: str | None = None) -> list[dict[str, Any]]:
     ]
 
 
+def get_dashboard_stats() -> dict[str, Any]:
+    """대시보드용 집계 통계를 반환한다."""
+    init_db()
+    now = _now_iso()
+    expire_threshold = _expire_iso(now)
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0]
+        labeled = conn.execute("SELECT COUNT(*) FROM human_annotations").fetchone()[0]
+        in_progress = conn.execute(
+            "SELECT COUNT(*) FROM analysis_runs WHERE claimed_by IS NOT NULL AND claimed_at > ? AND id NOT IN (SELECT run_id FROM human_annotations)",
+            (expire_threshold,),
+        ).fetchone()[0]
+
+        # 스캠 유형 분포 (예측 기준)
+        type_rows = conn.execute(
+            """
+            SELECT
+                json_extract(classification_scanner, '$.scam_type') AS scam_type,
+                COUNT(*) AS cnt
+            FROM analysis_runs
+            GROUP BY scam_type
+            ORDER BY cnt DESC
+            """
+        ).fetchall()
+
+        # 위험도 분포
+        risk_rows = conn.execute(
+            """
+            SELECT risk_level_predicted, COUNT(*) AS cnt
+            FROM analysis_runs
+            GROUP BY risk_level_predicted
+            ORDER BY cnt DESC
+            """
+        ).fetchall()
+
+        # 날짜별 run 수 (최근 30일)
+        daily_rows = conn.execute(
+            """
+            SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS cnt
+            FROM analysis_runs
+            WHERE created_at >= date('now', '-30 days')
+            GROUP BY day
+            ORDER BY day ASC
+            """
+        ).fetchall()
+
+        # 스캠 유형별 라벨 완료 수
+        type_labeled_rows = conn.execute(
+            """
+            SELECT ha.scam_type_gt AS scam_type, COUNT(*) AS cnt
+            FROM human_annotations ha
+            GROUP BY scam_type_gt
+            ORDER BY cnt DESC
+            """
+        ).fetchall()
+
+    return {
+        "total_runs": total,
+        "labeled_runs": labeled,
+        "unlabeled_runs": total - labeled - in_progress,
+        "in_progress_runs": in_progress,
+        "scam_type_distribution": [
+            {"name": r["scam_type"] or "미분류", "count": r["cnt"]} for r in type_rows
+        ],
+        "risk_level_distribution": [
+            {"name": r["risk_level_predicted"], "count": r["cnt"]} for r in risk_rows
+        ],
+        "daily_runs": [
+            {"date": r["day"], "count": r["cnt"]} for r in daily_rows
+        ],
+        "labeled_by_type": [
+            {"name": r["scam_type"], "count": r["cnt"]} for r in type_labeled_rows
+        ],
+    }
+
+
+def search_runs(
+    query: str | None = None,
+    scam_type: str | None = None,
+    risk_level: str | None = None,
+    labeled: bool | None = None,
+    limit: int = 30,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """DB 브라우저용 run 검색."""
+    init_db()
+    conditions = []
+    params: list[Any] = []
+
+    if query:
+        conditions.append("ar.transcript_text LIKE ?")
+        params.append(f"%{query}%")
+    if scam_type:
+        conditions.append("json_extract(ar.classification_scanner, '$.scam_type') = ?")
+        params.append(scam_type)
+    if risk_level:
+        conditions.append("ar.risk_level_predicted = ?")
+        params.append(risk_level)
+    if labeled is True:
+        conditions.append("ha.run_id IS NOT NULL")
+    elif labeled is False:
+        conditions.append("ha.run_id IS NULL")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    with _connect() as conn:
+        count_row = conn.execute(
+            f"SELECT COUNT(*) FROM analysis_runs ar LEFT JOIN human_annotations ha ON ha.run_id = ar.id {where}",
+            params,
+        ).fetchone()
+        total = count_row[0]
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                ar.id,
+                ar.created_at,
+                ar.input_source,
+                ar.classification_scanner,
+                ar.total_score_predicted,
+                ar.risk_level_predicted,
+                ar.transcript_text,
+                ar.use_llm,
+                (ha.run_id IS NOT NULL) AS labeled,
+                ha.scam_type_gt,
+                ha.labeler
+            FROM analysis_runs ar
+            LEFT JOIN human_annotations ha ON ha.run_id = ar.id
+            {where}
+            ORDER BY ar.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        clf = _load_json(row["classification_scanner"], {})
+        transcript = row["transcript_text"] or ""
+        items.append({
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "input_source": row["input_source"],
+            "predicted_scam_type": clf.get("scam_type", ""),
+            "predicted_confidence": clf.get("confidence", 0.0),
+            "total_score_predicted": row["total_score_predicted"],
+            "risk_level_predicted": row["risk_level_predicted"],
+            "transcript_preview": transcript[:100] + ("..." if len(transcript) > 100 else ""),
+            "use_llm": bool(row["use_llm"]),
+            "labeled": bool(row["labeled"]),
+            "scam_type_gt": row["scam_type_gt"],
+            "labeler": row["labeler"],
+        })
+
+    return {"total": total, "items": items, "limit": limit, "offset": offset}
+
+
 def _l2_distance(left: list[float], right: list[float]) -> float:
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
 

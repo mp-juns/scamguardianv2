@@ -343,6 +343,32 @@ def claim_run(run_id: str, labeler: str) -> bool:
     raise NotImplementedError("Postgres claim_run 미구현")
 
 
+def get_dashboard_stats() -> dict[str, Any]:
+    if get_db_backend() == "sqlite":
+        return sqlite_repository.get_dashboard_stats()
+    raise NotImplementedError("Postgres get_dashboard_stats 미구현")
+
+
+def search_runs(
+    query: str | None = None,
+    scam_type: str | None = None,
+    risk_level: str | None = None,
+    labeled: bool | None = None,
+    limit: int = 30,
+    offset: int = 0,
+) -> dict[str, Any]:
+    if get_db_backend() == "sqlite":
+        return sqlite_repository.search_runs(
+            query=query,
+            scam_type=scam_type,
+            risk_level=risk_level,
+            labeled=labeled,
+            limit=limit,
+            offset=offset,
+        )
+    raise NotImplementedError("Postgres search_runs 미구현")
+
+
 def get_next_unannotated_run() -> dict[str, Any] | None:
     if get_db_backend() == "sqlite":
         return sqlite_repository.get_next_unannotated_run()

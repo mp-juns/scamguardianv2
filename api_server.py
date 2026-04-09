@@ -486,6 +486,38 @@ async def admin_claim_run(run_id: str, payload: ClaimRunRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/api/admin/runs/search")
+async def admin_search_runs(
+    q: str | None = None,
+    scam_type: str | None = None,
+    risk_level: str | None = None,
+    labeled: str | None = None,
+    limit: int = 30,
+    offset: int = 0,
+) -> dict[str, Any]:
+    try:
+        _require_db()
+        labeled_bool: bool | None = None
+        if labeled == "true":
+            labeled_bool = True
+        elif labeled == "false":
+            labeled_bool = False
+        result = await asyncio.to_thread(
+            repository.search_runs,
+            query=q,
+            scam_type=scam_type,
+            risk_level=risk_level,
+            labeled=labeled_bool,
+            limit=limit,
+            offset=offset,
+        )
+        return result
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/admin/runs/next")
 async def admin_next_run() -> dict[str, Any]:
     try:
@@ -587,6 +619,18 @@ async def admin_ai_draft(run_id: str) -> dict[str, Any]:
         return {"ok": True, "draft": draft}
     except HTTPException:
         raise
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/stats")
+async def admin_stats() -> dict[str, Any]:
+    try:
+        _require_db()
+        stats = await asyncio.to_thread(repository.get_dashboard_stats)
+        return stats
     except EnvironmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
