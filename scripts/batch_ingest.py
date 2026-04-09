@@ -8,8 +8,10 @@ ScamGuardian v2 — 배치 인제스트 스크립트
 사용법:
     python scripts/batch_ingest.py                        # 내장 샘플 전체
     python scripts/batch_ingest.py --file samples.txt    # 텍스트 파일 (줄마다 1개)
+    python scripts/batch_ingest.py --jsonl samples.jsonl # JSONL 파일
     python scripts/batch_ingest.py --skip-verify         # Serper 검증 생략 (빠름)
     python scripts/batch_ingest.py --dry-run             # DB 저장 없이 결과만 출력
+    python scripts/batch_ingest.py --workers 6           # 병렬 처리 워커 수 지정
 """
 
 from __future__ import annotations
@@ -19,7 +21,10 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -75,11 +80,65 @@ SEED_SAMPLES = [
 # fmt: on
 
 
+def _default_metadata(metadata: object) -> dict[str, Any]:
+    if isinstance(metadata, dict):
+        return metadata
+    return {"source": "batch_ingest"}
+
+torch.set_default_dtype(torch.float32)
+def _analyze_one(
+    idx: int,
+    total: int,
+    sample: dict[str, object],
+    skip_verify: bool,
+) -> dict[str, Any]:
+    from pipeline.runner import ScamGuardianPipeline
+
+    text = str(sample.get("text", "")).strip()
+    metadata = _default_metadata(sample.get("metadata"))
+
+    if not text:
+        return {
+            "idx": idx,
+            "total": total,
+            "ok": False,
+            "error": "비어있는 샘플이라 건너뜁니다.",
+            "text": "",
+            "metadata": metadata,
+        }
+
+    pipe = ScamGuardianPipeline(whisper_model="medium")
+    report = pipe.analyze(
+        text,
+        skip_verification=skip_verify,
+        use_llm=False,
+        use_rag=False,
+    )
+    d = report.to_dict()
+
+    transcript_text = (
+        pipe.last_transcript_result.text
+        if pipe.last_transcript_result is not None
+        else text
+    )
+
+    return {
+        "idx": idx,
+        "total": total,
+        "ok": True,
+        "text": text,
+        "metadata": metadata,
+        "report": d,
+        "transcript_text": transcript_text,
+    }
+
+
 def run_batch(
     samples: list[dict[str, object]],
     skip_verify: bool,
     dry_run: bool,
     delay: float,
+    workers: int,
 ) -> None:
     if dry_run:
         os.environ["SCAMGUARDIAN_PERSIST_RUNS"] = "false"
@@ -87,78 +146,122 @@ def run_batch(
         os.environ["SCAMGUARDIAN_PERSIST_RUNS"] = "true"
 
     from db import repository
-    from pipeline.runner import ScamGuardianPipeline
 
     if not dry_run:
         repository.init_db()
 
-    pipe = ScamGuardianPipeline(whisper_model="medium")
-
     total = len(samples)
     ok = 0
     failed = 0
+    started_at = time.perf_counter()
 
-    for i, sample in enumerate(samples, 1):
-        text = str(sample.get("text", "")).strip()
-        metadata = sample.get("metadata")
-        if not text:
-            print(f"[{i}/{total}] ✗ 비어있는 샘플이라 건너뜁니다.")
-            failed += 1
-            continue
+    if workers <= 1:
+        for i, sample in enumerate(samples, 1):
+            text = str(sample.get("text", "")).strip()
+            preview = text[:60].replace("\n", " ") if text else "(empty)"
+            print(f"[{i}/{total}] {preview}...")
 
-        preview = text[:60].replace("\n", " ")
-        print(f"[{i}/{total}] {preview}...")
+            try:
+                result = _analyze_one(i, total, sample, skip_verify=skip_verify)
+                if not result["ok"]:
+                    print(f"  ✗ {result['error']}")
+                    failed += 1
+                    continue
 
-        try:
-            report = pipe.analyze(
-                text,
-                skip_verification=skip_verify,
-                use_llm=False,
-                use_rag=False,
-            )
-            d = report.to_dict()
+                d = result["report"]
+                run_id = None
 
-            run_id = None
-            if not dry_run:
-                transcript_text = (
-                    pipe.last_transcript_result.text
-                    if pipe.last_transcript_result is not None
-                    else text
+                if not dry_run:
+                    run_id = repository.save_analysis_run(
+                        input_source=result["text"][:200],
+                        whisper_model="medium",
+                        skip_verification=skip_verify,
+                        use_llm=False,
+                        use_rag=False,
+                        transcript_text=result["transcript_text"],
+                        classification_scanner={
+                            "scam_type": d["scam_type"],
+                            "confidence": d["classification_confidence"],
+                            "is_uncertain": d["is_uncertain"],
+                        },
+                        entities_predicted=d["entities"],
+                        verification_results=d.get("all_verifications", []),
+                        triggered_flags_predicted=d["triggered_flags"],
+                        total_score_predicted=d["total_score"],
+                        risk_level_predicted=d["risk_level"],
+                        llm_assessment=d.get("llm_assessment"),
+                        metadata=result["metadata"],
+                    )
+
+                print(
+                    f"  → {d['scam_type']} | {d['risk_level']} ({d['total_score']}점)"
+                    + (f" | run_id={run_id}" if run_id else " | [dry-run, not saved]")
                 )
-                run_id = repository.save_analysis_run(
-                    input_source=text[:200],
-                    whisper_model="medium",
-                    skip_verification=skip_verify,
-                    use_llm=False,
-                    use_rag=False,
-                    transcript_text=transcript_text,
-                    classification_scanner={
-                        "scam_type": d["scam_type"],
-                        "confidence": d["classification_confidence"],
-                        "is_uncertain": d["is_uncertain"],
-                    },
-                    entities_predicted=d["entities"],
-                    verification_results=d.get("all_verifications", []),
-                    triggered_flags_predicted=d["triggered_flags"],
-                    total_score_predicted=d["total_score"],
-                    risk_level_predicted=d["risk_level"],
-                    llm_assessment=d.get("llm_assessment"),
-                    metadata=(metadata if isinstance(metadata, dict) else {"source": "batch_ingest"}),
-                )
+                ok += 1
+            except Exception as exc:
+                print(f"  ✗ 오류: {exc}")
+                failed += 1
 
-            print(
-                f"  → {d['scam_type']} | {d['risk_level']} ({d['total_score']}점)"
-                + (f" | run_id={run_id}" if run_id else " | [dry-run, not saved]")
-            )
-            ok += 1
-        except Exception as exc:
-            print(f"  ✗ 오류: {exc}")
-            failed += 1
+            if i < total and delay > 0:
+                time.sleep(delay)
+    else:
+        print(f"병렬 처리 시작: workers={workers}")
 
-        if i < total and delay > 0:
-            time.sleep(delay)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_analyze_one, i, total, sample, skip_verify): (i, sample)
+                for i, sample in enumerate(samples, 1)
+            }
 
-    print(f"\n완료: {ok}개 성공, {failed}개 실패 (전체 {total}개)")
+            for future in as_completed(future_map):
+                i, sample = future_map[future]
+                text = str(sample.get("text", "")).strip()
+                preview = text[:60].replace("\n", " ") if text else "(empty)"
+                print(f"[{i}/{total}] {preview}...")
+
+                try:
+                    result = future.result()
+                    if not result["ok"]:
+                        print(f"  ✗ {result['error']}")
+                        failed += 1
+                        continue
+
+                    d = result["report"]
+                    run_id = None
+
+                    if not dry_run:
+                        run_id = repository.save_analysis_run(
+                            input_source=result["text"][:200],
+                            whisper_model="medium",
+                            skip_verification=skip_verify,
+                            use_llm=False,
+                            use_rag=False,
+                            transcript_text=result["transcript_text"],
+                            classification_scanner={
+                                "scam_type": d["scam_type"],
+                                "confidence": d["classification_confidence"],
+                                "is_uncertain": d["is_uncertain"],
+                            },
+                            entities_predicted=d["entities"],
+                            verification_results=d.get("all_verifications", []),
+                            triggered_flags_predicted=d["triggered_flags"],
+                            total_score_predicted=d["total_score"],
+                            risk_level_predicted=d["risk_level"],
+                            llm_assessment=d.get("llm_assessment"),
+                            metadata=result["metadata"],
+                        )
+
+                    print(
+                        f"  → {d['scam_type']} | {d['risk_level']} ({d['total_score']}점)"
+                        + (f" | run_id={run_id}" if run_id else " | [dry-run, not saved]")
+                    )
+                    ok += 1
+                except Exception as exc:
+                    print(f"  ✗ 오류: {exc}")
+                    failed += 1
+
+    elapsed = time.perf_counter() - started_at
+    print(f"\n완료: {ok}개 성공, {failed}개 실패 (전체 {total}개, {elapsed:.2f}초)")
 
 
 def _normalize_text_samples(lines: list[str]) -> list[dict[str, object]]:
@@ -181,15 +284,19 @@ def _load_jsonl_samples(path: Path) -> list[dict[str, object]]:
             continue
         if not isinstance(item, dict):
             raise ValueError(f"JSONL 각 줄은 객체 또는 문자열이어야 합니다: {path}:{lineno}")
+
         text = str(item.get("text", "")).strip()
         if not text:
             raise ValueError(f"text 필드가 비어 있습니다: {path}:{lineno}")
+
         metadata = item.get("metadata")
         if metadata is None:
             metadata = {"source": "batch_ingest"}
         elif not isinstance(metadata, dict):
             raise ValueError(f"metadata 필드는 객체여야 합니다: {path}:{lineno}")
+
         samples.append({"text": text, "metadata": metadata})
+
     return samples
 
 
@@ -217,12 +324,27 @@ def main() -> None:
         "--delay",
         type=float,
         default=0.5,
-        help="샘플 간 대기 시간(초), 기본값 0.5",
+        help="샘플 간 대기 시간(초), workers=1일 때만 사실상 의미 있음",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(6, max(1, (os.cpu_count() or 4))),
+        help="병렬 처리 워커 수 (기본값: min(6, CPU 코어 수))",
     )
     args = parser.parse_args()
 
+    cpu_only = not torch.cuda.is_available()
+    if cpu_only and args.workers > 1:
+        print("[WARN] CPU 환경에서는 PyTorch/Whisper 스레드 병렬 처리 충돌이 날 수 있어 workers=1로 강제합니다.")
+        args.workers = 1
+
     if args.file and args.jsonl:
         print("--file 과 --jsonl 은 동시에 사용할 수 없습니다.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.workers < 1:
+        print("--workers 는 1 이상이어야 합니다.", file=sys.stderr)
         sys.exit(1)
 
     if args.jsonl:
@@ -248,8 +370,19 @@ def main() -> None:
     else:
         samples = _normalize_text_samples(SEED_SAMPLES)
 
-    print(f"총 {len(samples)}개 샘플 {'(dry-run)' if args.dry_run else 'DB 저장'} 분석 시작\n")
-    run_batch(samples, skip_verify=args.skip_verify, dry_run=args.dry_run, delay=args.delay)
+    print(
+        f"총 {len(samples)}개 샘플 "
+        f"{'(dry-run)' if args.dry_run else 'DB 저장'} 분석 시작 "
+        f"(workers={args.workers})\n"
+    )
+
+    run_batch(
+        samples,
+        skip_verify=args.skip_verify,
+        dry_run=args.dry_run,
+        delay=args.delay,
+        workers=args.workers,
+    )
 
 
 if __name__ == "__main__":

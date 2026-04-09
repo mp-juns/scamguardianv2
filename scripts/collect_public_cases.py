@@ -1,376 +1,696 @@
 #!/usr/bin/env python3
 """
-공공기관 공개 자료에서 사기/스미싱 사례 텍스트를 수집해 JSONL로 저장한다.
+ScamGuardian v2 — 공공기관 공개 사례 수집 스크립트
 
-기본 대상:
-- KISA 보호나라(boho.or.kr)
-- 경찰청 전기통신금융사기 통합대응단(counterscam112.go.kr)
-- 금융위원회/금감원(fsc.go.kr)
+목표:
+- 공공기관(경찰청/통합대응단, KISA, 금융위 등) 공개 페이지에서
+  보이스피싱/스미싱/피싱 관련 사례성 문구를 수집
+- 안내문/문의처/보도자료 헤더/푸터/예방수칙 제목 등은 최대한 제거
+- batch_ingest.py 에 바로 넣을 수 있는 JSONL 생성
 
-출력 형식(JSONL 각 줄):
-{"text": "...", "metadata": {...}}
+출력:
+- data/processed/public_cases.jsonl               : 적재 추천 샘플
+- data/processed/public_cases.rejected.jsonl      : 필터에서 탈락한 샘플
+- data/raw/public_cases_fetch_log.json            : 수집 로그
 
-예시:
+사용 예:
+    python scripts/collect_public_cases.py
     python scripts/collect_public_cases.py --org all
-    python scripts/collect_public_cases.py --org kisa --max-items-per-source 20
-    python scripts/collect_public_cases.py --output data/processed/public_cases.jsonl
+    python scripts/collect_public_cases.py --org kisa
+    python scripts/collect_public_cases.py --max-items-per-source 50
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
-from dataclasses import dataclass
-from html import unescape
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from pypdf import PdfReader
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
-RAW_DIR = ROOT / "data" / "raw" / "public_cases"
+RAW_DIR = ROOT / "data" / "raw"
 PROCESSED_DIR = ROOT / "data" / "processed"
-USER_AGENT = "ScamGuardianPublicCollector/1.0 (+official-public-data-only)"
-TIMEOUT = 20
 
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-@dataclass(frozen=True)
-class SourceSpec:
-    org: str
-    title: str
-    channel: str
-    listing_urls: list[str]
-    allowed_domains: tuple[str, ...]
-    detail_url_patterns: tuple[str, ...] = ()
-    direct_urls: tuple[str, ...] = ()
+OUTPUT_JSONL = PROCESSED_DIR / "public_cases.jsonl"
+REJECTED_JSONL = PROCESSED_DIR / "public_cases.rejected.jsonl"
+FETCH_LOG_JSON = RAW_DIR / "public_cases_fetch_log.json"
 
-
-SOURCE_SPECS: list[SourceSpec] = [
-    SourceSpec(
-        org="kisa",
-        title="KISA 보호나라 스미싱 주의보/보안공지",
-        channel="security_notice",
-        listing_urls=[
-            "https://www.boho.or.kr/kr/bbs/view.do?bbsId=B0000030&menuNo=205027&nttId=71280",
-            "https://www.boho.or.kr/kr/bbs/view.do?bbsId=B0000133&menuNo=205020&nttId=71675",
-        ],
-        allowed_domains=("boho.or.kr",),
-        detail_url_patterns=("/kr/bbs/view.do",),
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    SourceSpec(
-        org="police",
-        title="경찰청 전기통신금융사기 통합대응단",
-        channel="advisory",
-        listing_urls=[
-            "https://www.counterscam112.go.kr/bbs003/board/boardList.do",
-            "https://www.counterscam112.go.kr/bbs006/board/boardList.do",
-        ],
-        allowed_domains=("counterscam112.go.kr",),
-        detail_url_patterns=("/bbs003/board/boardDetail.do", "/bbs006/board/boardDetail.do"),
-        direct_urls=(
-            "https://www.counterscam112.go.kr/",
-        ),
-    ),
-    SourceSpec(
-        org="fsc",
-        title="금융위원회 보이스피싱 예방 자료",
-        channel="prevention_guide",
-        listing_urls=[
-            "https://www.fsc.go.kr/no010101/86250",
-            "https://www.fsc.go.kr/no040101?cnId=2426&curPage=&pastPage=&srchKey=sj&srchText=%EB%B3%B4%EC%9D%B4%EC%8A%A4%ED%94%BC%EC%8B%B1",
-        ],
-        allowed_domains=("fsc.go.kr",),
-        detail_url_patterns=("/no010101/", "/edu/cardnews", "/comm/getFile"),
-        direct_urls=(
-            "https://www.fsc.go.kr/no010101/86250",
-            "https://www.fsc.go.kr/comm/getFile?fileNo=2&fileTy=ATTACH&srvcId=BBSTY1&upperNo=86250",
-        ),
-    ),
-]
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+SOURCE_CONFIGS: dict[str, list[str]] = {
+    "kisa": [
+        "https://www.boho.or.kr/kr/bbs/list.do?bbsId=B0000030&menuNo=205027",  # 스미싱 주의보 계열
+        "https://www.boho.or.kr/kr/bbs/list.do?bbsId=B0000133&menuNo=205020",  # 보안공지 계열
+    ],
+    "police": [
+        "https://www.counterscam112.go.kr/",
+        "https://www.counterscam112.go.kr/phishing/prevent.do",
+        "https://www.counterscam112.go.kr/board/notice/list.do",
+    ],
+    "fsc": [
+        "https://www.fsc.go.kr/no010101/86250",
+        "https://www.fsc.go.kr/no040101?cnId=2426&curPage=&pastPage=&srchKey=sj&srchText=%EB%B3%B4%EC%9D%B4%EC%8A%A4%ED%94%BC%EC%8B%B1",
+    ],
+}
+
+ORG_LABELS = {
+    "kisa": "KISA",
+    "police": "경찰청",
+    "fsc": "금융위",
+}
 
 SCAM_HINTS = [
-    "링크", "url", "클릭", "설치", "앱", "원격", "송금", "이체", "입금", "계좌", "현금",
-    "검찰", "경찰", "금감원", "택배", "등기", "부고", "청첩장", "과태료", "범칙금", "대출",
-    "보증금", "공탁금", "카드", "명의도용", "본인확인", "악성", "apk", "사칭", "피싱", "스미싱",
+    "링크",
+    "클릭",
+    "주소를 재입력",
+    "인증",
+    "본인 확인",
+    "비밀번호",
+    "인증번호",
+    "계좌",
+    "입금",
+    "송금",
+    "이체",
+    "원금 보장",
+    "수익 보장",
+    "대출",
+    "수사",
+    "검찰",
+    "경찰",
+    "금감원",
+    "금융감독원",
+    "국세청",
+    "택배",
+    "반송",
+    "청첩장",
+    "부고",
+    "범칙금",
+    "과태료",
+    "앱 설치",
+    "악성앱",
+    "보안카드",
+    "공인인증서",
+    "OTP",
+    "카카오톡",
+    "엄마 나",
+    "아들",
+    "딸",
+    "안전 계좌",
+    "보호 계좌",
+    "저금리",
+    "사전 물량",
+    "투자 리딩방",
 ]
-URL_RE = re.compile(r"https?://\S+", re.I)
-TAG_RE = re.compile(r"<[^>]+>")
-MULTISPACE_RE = re.compile(r"[ \t]+")
-MULTINEW_RE = re.compile(r"\n{3,}")
-HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.I)
-TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-DATE_RE = re.compile(r"(20\d{2}[.-]\d{1,2}[.-]\d{1,2})")
+
+DROP_KEYWORDS = [
+    "예방 방법",
+    "예방수칙",
+    "행동수칙",
+    "대응 방법",
+    "유의사항",
+    "주의사항",
+    "유의하세요",
+    "피해예방",
+    "보도자료",
+    "보도 참고자료",
+    "참고자료",
+    "참고 ",
+    "붙임",
+    "문의",
+    "대표전화",
+    "작성 :",
+    "작성:",
+    "배포일",
+    "담당부서",
+    "담당자",
+    "국민피해대응단",
+    "전기통신금융사기 통합대응단",
+    "금융위 문의",
+    "홈페이지",
+    "저작권",
+    "무단전재",
+    "재배포",
+    "바로가기",
+    "다운로드",
+    "첨부파일",
+    "목차",
+    "요약",
+]
+
+SECTION_DROP_PATTERNS = [
+    r"^o\s",
+    r"^□\s",
+    r"^■\s",
+    r"^※",
+    r"^\[붙임",
+    r"^\[참고",
+    r"^문의\s*:",
+    r"^담당부서",
+    r"^금융위 문의",
+]
+
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+PHONE_RE = re.compile(r"\b\d{2,4}-\d{3,4}-\d{4}\b")
+DATE_RE = re.compile(r"(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)")
+MULTISPACE_RE = re.compile(r"\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[.!?])|(?<=다\.))\s+")
+KOREAN_CHAR_RE = re.compile(r"[가-힣]")
 
 
-def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
+@dataclass
+class FetchLogItem:
+    org: str
+    url: str
+    ok: bool
+    status_code: int | None = None
+    content_type: str | None = None
+    error: str | None = None
+    discovered_links: int = 0
+    extracted_segments: int = 0
+    accepted_segments: int = 0
+    rejected_segments: int = 0
 
 
-def _slugify(value: str) -> str:
-    value = re.sub(r"[^0-9A-Za-z가-힣._-]+", "-", value.strip())
-    return value.strip("-")[:80] or "document"
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    return session
 
 
-def _is_allowed(url: str, allowed_domains: tuple[str, ...]) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(host.endswith(domain) for domain in allowed_domains)
+def fetch_url(session: requests.Session, url: str, timeout: int = 20) -> requests.Response:
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
-def _clean_html_text(html: str) -> str:
-    html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
-    html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.I)
-    html = re.sub(r"</(p|div|li|tr|br|h1|h2|h3|h4|h5|h6)>", "\n", html, flags=re.I)
-    text = TAG_RE.sub(" ", html)
-    text = unescape(text)
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\t", " ")
+    text = text.replace("\r", "\n")
     text = MULTISPACE_RE.sub(" ", text)
-    text = MULTINEW_RE.sub("\n\n", text)
     return text.strip()
 
 
-def _extract_title(html: str, fallback: str) -> str:
-    m = TITLE_RE.search(html)
-    if not m:
-        return fallback
-    title = _clean_html_text(m.group(1))
-    return title or fallback
+def split_text_to_segments(text: str) -> list[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
 
-
-def _extract_dates(text: str) -> str | None:
-    m = DATE_RE.search(text)
-    if not m:
-        return None
-    return m.group(1).replace(".", "-")
-
-
-def _extract_links(base_url: str, html: str, spec: SourceSpec) -> list[str]:
-    urls: list[str] = []
-    for href in HREF_RE.findall(html):
-        abs_url = urljoin(base_url, href)
-        if not _is_allowed(abs_url, spec.allowed_domains):
+    # 줄기반 분리
+    raw_parts: list[str] = []
+    for line in text.split("\n"):
+        line = normalize_text(line)
+        if not line:
             continue
-        if spec.detail_url_patterns and not any(pattern in abs_url for pattern in spec.detail_url_patterns):
-            continue
-        urls.append(abs_url)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for url in [*spec.direct_urls, *urls]:
-        if url not in seen:
-            seen.add(url)
-            deduped.append(url)
-    return deduped
+        raw_parts.append(line)
 
-
-def _extract_pdf_text(content: bytes) -> str:
-    try:
-        from pypdf import PdfReader  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("PDF 추출을 위해 pypdf가 필요합니다. requirements.txt 설치 후 다시 시도하세요.") from exc
-
-    import io
-    reader = PdfReader(io.BytesIO(content))
+    # 문장 길이가 길면 문장 분할
     parts: list[str] = []
+    for part in raw_parts:
+        if len(part) > 180:
+            chunks = [normalize_text(s) for s in SENTENCE_SPLIT_RE.split(part) if normalize_text(s)]
+            parts.extend(chunks if chunks else [part])
+        else:
+            parts.append(part)
+
+    # 최종 정리
+    cleaned: list[str] = []
+    for part in parts:
+        part = normalize_text(part)
+        if not part:
+            continue
+        cleaned.append(part)
+
+    return cleaned
+
+
+def extract_text_from_html(html: str) -> tuple[str, list[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href:
+            links.append(href)
+
+    return text, links
+
+
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    reader = PdfReader(io.BytesIO(data))
+    texts: list[str] = []
     for page in reader.pages:
-        page_text = page.extract_text() or ""
-        if page_text.strip():
-            parts.append(page_text)
-    return "\n\n".join(parts).strip()
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        page_text = normalize_text(page_text)
+        if page_text:
+            texts.append(page_text)
+    return "\n".join(texts)
 
 
-def _looks_like_case(line: str) -> bool:
-    compact = line.strip()
-    if len(compact) < 18:
-        return False
-    lowered = compact.lower()
-    if URL_RE.search(compact):
-        return True
-    return any(hint in lowered for hint in SCAM_HINTS)
+def is_probably_korean_text(text: str) -> bool:
+    return bool(KOREAN_CHAR_RE.search(text))
 
 
-def _split_candidate_blocks(text: str) -> list[str]:
-    text = text.replace("\r\n", "\n")
-    blocks = re.split(r"\n\s*\n", text)
-    candidates: list[str] = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        lines = [MULTISPACE_RE.sub(" ", line).strip(" -•·\t") for line in block.splitlines()]
-        lines = [line for line in lines if line]
-        if not lines:
-            continue
-        joined = " ".join(lines)
-        if _looks_like_case(joined):
-            candidates.append(joined)
-            continue
-        for line in lines:
-            if _looks_like_case(line):
-                candidates.append(line)
-    return candidates
+def score_segment(text: str) -> int:
+    score = 0
+    t = text
+
+    if len(t) >= 45:
+        score += 1
+    if len(t) >= 70:
+        score += 1
+
+    if URL_RE.search(t):
+        score += 3
+    if PHONE_RE.search(t):
+        score += 1
+
+    hint_hits = sum(1 for hint in SCAM_HINTS if hint in t)
+    score += min(hint_hits, 5)
+
+    if "http" in t or "www." in t:
+        score += 2
+    if "클릭" in t:
+        score += 2
+    if "입금" in t or "송금" in t or "이체" in t:
+        score += 2
+    if "앱 설치" in t or "악성앱" in t:
+        score += 2
+    if "비밀번호" in t or "인증번호" in t or "보안카드" in t:
+        score += 2
+    if "검찰" in t or "경찰" in t or "금감원" in t or "금융감독원" in t:
+        score += 1
+
+    drop_hits = sum(1 for kw in DROP_KEYWORDS if kw in t)
+    score -= min(drop_hits * 2, 8)
+
+    for pattern in SECTION_DROP_PATTERNS:
+        if re.search(pattern, t):
+            score -= 2
+
+    if len(t) < 20:
+        score -= 4
+    elif len(t) < 35:
+        score -= 2
+
+    return score
 
 
-def _normalize_case_text(text: str) -> str:
-    text = MULTISPACE_RE.sub(" ", text)
-    return text.strip()
+def reject_reason(text: str) -> str | None:
+    t = text.strip()
 
+    if not t:
+        return "empty"
+    if not is_probably_korean_text(t):
+        return "not_korean"
+    if len(t) < 18:
+        return "too_short"
+    if len(t) > 400:
+        return "too_long"
 
-def _infer_type(text: str) -> str | None:
-    mapping = {
-        "기관사칭": ["검찰", "경찰", "금감원", "명의도용"],
-        "대출빙자": ["대출", "보증금", "공탁금"],
-        "스미싱": ["택배", "링크", "url", "클릭", "앱", "부고", "청첩장", "과태료", "범칙금"],
-        "카드배송사칭": ["카드", "배송", "등기"],
-    }
-    lowered = text.lower()
-    for label, hints in mapping.items():
-        if any(h.lower() in lowered for h in hints):
-            return label
+    if DATE_RE.fullmatch(t):
+        return "date_only"
+
+    for pattern in SECTION_DROP_PATTERNS:
+        if re.search(pattern, t):
+            return "section_header"
+
+    for kw in DROP_KEYWORDS:
+        if kw in t:
+            # 단, 스캠 유도 표현이 아주 강한 경우는 살릴 수 있게 아래 score에서 다시 판정
+            if score_segment(t) < 5:
+                return f"drop_keyword:{kw}"
+
+    # 기관명만 덩그러니 있는 라인
+    if len(t) < 40 and any(x in t for x in ["경찰청", "금융위원회", "금융감독원", "KISA", "보호나라"]):
+        if score_segment(t) < 4:
+            return "org_header"
+
     return None
 
 
-def _build_record(*, text: str, spec: SourceSpec, source_url: str, doc_title: str, published_at: str | None) -> dict[str, object]:
-    normalized = _normalize_case_text(text)
+def is_good_case_text(text: str) -> bool:
+    reason = reject_reason(text)
+    if reason is not None:
+        return False
+
+    score = score_segment(text)
+    if score >= 4:
+        return True
+
+    # 점수는 낮아도 URL/입금/클릭/인증번호 등 직접 유도면 살림
+    forced_keep = [
+        "아래 링크",
+        "클릭하여 인증",
+        "본인 확인",
+        "인증번호를 입력",
+        "입금해주시면",
+        "송금해주세요",
+        "계좌로 보내",
+        "앱을 설치",
+        "보호 계좌",
+        "안전 계좌",
+        "급하게 돈",
+        "엄마 나",
+    ]
+    if any(x in text for x in forced_keep):
+        return True
+
+    return False
+
+
+def infer_channel(text: str, url: str) -> str:
+    if "보도자료" in text:
+        return "press_release"
+    if "주의보" in text or "경보" in text:
+        return "alert"
+    if "FAQ" in text or "faq" in url.lower():
+        return "faq"
+    if "예방" in text or "수칙" in text:
+        return "prevention"
+    return "web_page"
+
+
+def infer_scam_type_hint(text: str) -> str | None:
+    if any(x in text for x in ["청첩장", "택배", "반송", "과태료", "범칙금", "악성앱", "앱 설치", "링크"]):
+        return "스미싱"
+    if any(x in text for x in ["검찰", "경찰", "금감원", "보호 계좌", "안전 계좌"]):
+        return "기관사칭"
+    if any(x in text for x in ["저금리", "대출", "선납", "보험료"]):
+        return "대출 사기"
+    if any(x in text for x in ["원금 보장", "수익 보장", "투자 리딩방", "코인"]):
+        return "투자 사기"
+    if any(x in text for x in ["엄마 나", "카카오톡", "친구 폰"]):
+        return "메신저 피싱"
+    return None
+
+
+def build_record(
+    *,
+    org_key: str,
+    url: str,
+    doc_title: str,
+    published_at: str | None,
+    text: str,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "source": "public_agency",
+        "source_org": ORG_LABELS.get(org_key, org_key),
+        "source_url": url,
+        "doc_title": doc_title[:300],
+        "published_at": published_at,
+        "channel": infer_channel(doc_title + " " + text, url),
+        "evidence_level": "official_case",
+        "scam_type_hint": infer_scam_type_hint(text),
+        "collector": "collect_public_cases.py",
+    }
     return {
-        "text": normalized,
-        "metadata": {
-            "source": "public_agency",
-            "source_org": spec.org,
-            "source_title": spec.title,
-            "source_url": source_url,
-            "doc_title": doc_title,
-            "published_at": published_at,
-            "channel": spec.channel,
-            "evidence_level": "official_public_case",
-            "scam_type_hint": _infer_type(normalized),
-            "has_url": bool(URL_RE.search(normalized)),
-        },
+        "text": text,
+        "metadata": metadata,
     }
 
 
-def collect_from_spec(spec: SourceSpec, *, max_items_per_source: int, save_raw: bool, session: requests.Session) -> list[dict[str, object]]:
-    collected: list[dict[str, object]] = []
-    seen_texts: set[str] = set()
-    raw_dir = RAW_DIR / spec.org
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    candidate_urls: list[str] = []
-    for listing_url in spec.listing_urls:
-        try:
-            response = session.get(listing_url, timeout=TIMEOUT)
-            response.raise_for_status()
-        except Exception as exc:
-            print(f"[WARN] 목록 페이지 수집 실패: {listing_url} ({exc})", file=sys.stderr)
+def parse_links(base_url: str, hrefs: list[str]) -> list[str]:
+    results: list[str] = []
+    for href in hrefs:
+        if href.startswith("javascript:") or href.startswith("#"):
             continue
-
-        html = response.text
-        if save_raw:
-            (raw_dir / f"listing-{_slugify(listing_url)}.html").write_text(html, encoding="utf-8")
-        candidate_urls.extend(_extract_links(listing_url, html, spec))
-
-    # direct URLs only source도 허용
-    for url in spec.direct_urls:
-        if url not in candidate_urls:
-            candidate_urls.append(url)
-
-    for source_url in candidate_urls:
-        if len(collected) >= max_items_per_source:
-            break
-        try:
-            response = session.get(source_url, timeout=TIMEOUT)
-            response.raise_for_status()
-        except Exception as exc:
-            print(f"[WARN] 상세 페이지 수집 실패: {source_url} ({exc})", file=sys.stderr)
+        full = urljoin(base_url, href)
+        parsed = urlparse(full)
+        if parsed.scheme not in {"http", "https"}:
             continue
+        if full not in results:
+            results.append(full)
+    return results
 
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "pdf" in content_type or source_url.lower().endswith(".pdf"):
-            try:
-                text = _extract_pdf_text(response.content)
-            except Exception as exc:
-                print(f"[WARN] PDF 추출 실패: {source_url} ({exc})", file=sys.stderr)
-                continue
-            doc_title = source_url.rsplit("/", 1)[-1]
-        else:
-            html = response.text
-            if save_raw:
-                (raw_dir / f"detail-{_slugify(source_url)}.html").write_text(html, encoding="utf-8")
-            text = _clean_html_text(html)
-            doc_title = _extract_title(html, source_url)
 
-        published_at = _extract_dates(text)
-        cases = _split_candidate_blocks(text)
-        for case_text in cases:
-            normalized = _normalize_case_text(case_text)
-            if normalized in seen_texts:
-                continue
-            seen_texts.add(normalized)
-            collected.append(
-                _build_record(
-                    text=normalized,
-                    spec=spec,
-                    source_url=source_url,
+def extract_doc_title(text: str, url: str) -> str:
+    lines = [normalize_text(x) for x in text.split("\n") if normalize_text(x)]
+    if lines:
+        return lines[0][:300]
+    return url
+
+
+def extract_published_at(text: str) -> str | None:
+    match = DATE_RE.search(text)
+    if not match:
+        return None
+    return normalize_text(match.group(1))
+
+
+def process_page(
+    *,
+    session: requests.Session,
+    org_key: str,
+    url: str,
+    max_links: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], FetchLogItem]:
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    try:
+        resp = fetch_url(session, url)
+    except Exception as exc:
+        return [], [], FetchLogItem(
+            org=org_key,
+            url=url,
+            ok=False,
+            error=str(exc),
+        )
+
+    content_type = resp.headers.get("Content-Type", "")
+    log = FetchLogItem(
+        org=org_key,
+        url=url,
+        ok=True,
+        status_code=resp.status_code,
+        content_type=content_type,
+    )
+
+    discovered_urls: list[str] = []
+
+    if "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
+        text = extract_text_from_pdf_bytes(resp.content)
+        doc_title = extract_doc_title(text, url)
+        published_at = extract_published_at(text)
+        segments = split_text_to_segments(text)
+    else:
+        html = resp.text
+        text, hrefs = extract_text_from_html(html)
+        doc_title = extract_doc_title(text, url)
+        published_at = extract_published_at(text)
+        segments = split_text_to_segments(text)
+        discovered_urls = parse_links(url, hrefs)
+
+    log.discovered_links = len(discovered_urls)
+
+    seen_segments: set[str] = set()
+    filtered_segments: list[str] = []
+    for seg in segments:
+        seg = normalize_text(seg)
+        if not seg or seg in seen_segments:
+            continue
+        seen_segments.add(seg)
+        filtered_segments.append(seg)
+
+    log.extracted_segments = len(filtered_segments)
+
+    for seg in filtered_segments:
+        if is_good_case_text(seg):
+            accepted.append(
+                build_record(
+                    org_key=org_key,
+                    url=url,
                     doc_title=doc_title,
                     published_at=published_at,
+                    text=seg,
                 )
             )
-            if len(collected) >= max_items_per_source:
-                break
+        else:
+            rejected.append(
+                {
+                    "text": seg,
+                    "metadata": {
+                        "source": "public_agency_rejected",
+                        "source_org": ORG_LABELS.get(org_key, org_key),
+                        "source_url": url,
+                        "doc_title": doc_title[:300],
+                        "published_at": published_at,
+                        "reject_reason": reject_reason(seg),
+                        "score": score_segment(seg),
+                        "collector": "collect_public_cases.py",
+                    },
+                }
+            )
 
-    return collected
+    log.accepted_segments = len(accepted)
+    log.rejected_segments = len(rejected)
+
+    # 목록 페이지에서 발견한 링크 중 관련성 있는 몇 개 추가 수집
+    crawled_subpages = 0
+    for sub_url in discovered_urls:
+        if crawled_subpages >= max_links:
+            break
+        lower = sub_url.lower()
+
+        # 파일/페이지 중 관련성 낮은 것 배제
+        if any(x in lower for x in [".jpg", ".png", ".gif", ".zip", ".hwp"]):
+            continue
+
+        # 피싱/스미싱/보이스피싱/금융사기 관련 링크만 우선 수집
+        if not any(
+            k in sub_url
+            for k in ["피싱", "스미싱", "보이스", "금융사기", "phishing", "smishing", "scam", "fraud"]
+        ):
+            # 링크 텍스트가 없는 상황이라 URL 기준으로 느슨하게만 필터
+            continue
+
+        crawled_subpages += 1
+        try:
+            sub_accepted, sub_rejected, _ = process_page(
+                session=session,
+                org_key=org_key,
+                url=sub_url,
+                max_links=0,
+            )
+            accepted.extend(sub_accepted)
+            rejected.extend(sub_rejected)
+        except Exception:
+            pass
+
+    return accepted, rejected, log
 
 
-def _iter_specs(org: str) -> Iterable[SourceSpec]:
-    org = org.lower().strip()
-    if org == "all":
-        return SOURCE_SPECS
-    return [spec for spec in SOURCE_SPECS if spec.org == org]
+def dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+
+    for item in records:
+        text = normalize_text(str(item.get("text", "")))
+        md = item.get("metadata", {})
+        source_url = str(md.get("source_url", "")) if isinstance(md, dict) else ""
+        key = (text, source_url)
+
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped
+
+
+def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for item in records:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="공공기관 공개 사기 사례 수집기")
-    parser.add_argument("--org", choices=["all", "kisa", "police", "fsc"], default="all")
-    parser.add_argument("--output", default=str(PROCESSED_DIR / "public_cases.jsonl"))
-    parser.add_argument("--max-items-per-source", type=int, default=50)
-    parser.add_argument("--no-raw", action="store_true", help="raw HTML/PDF 저장 생략")
+    parser = argparse.ArgumentParser(description="공공기관 공개 사례 수집기")
+    parser.add_argument(
+        "--org",
+        choices=["all", "kisa", "police", "fsc"],
+        default="all",
+        help="수집 기관 선택",
+    )
+    parser.add_argument(
+        "--max-items-per-source",
+        type=int,
+        default=20,
+        help="목록 페이지에서 추가로 따라갈 하위 링크 수 제한",
+    )
     args = parser.parse_args()
 
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = Path(args.output)
-    if not output_path.is_absolute():
-        output_path = ROOT / output_path
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    target_orgs = list(SOURCE_CONFIGS.keys()) if args.org == "all" else [args.org]
 
-    session = _session()
-    all_records: list[dict[str, object]] = []
-    for spec in _iter_specs(args.org):
-        records = collect_from_spec(
-            spec,
-            max_items_per_source=max(1, args.max_items_per_source),
-            save_raw=not args.no_raw,
-            session=session,
-        )
-        print(f"[{spec.org}] {len(records)}건 수집")
-        all_records.extend(records)
+    session = get_session()
 
-    deduped: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for record in all_records:
-        text = str(record.get("text", "")).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        deduped.append(record)
+    all_accepted: list[dict[str, Any]] = []
+    all_rejected: list[dict[str, Any]] = []
+    fetch_logs: list[dict[str, Any]] = []
 
-    with output_path.open("w", encoding="utf-8") as fh:
-        for record in deduped:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    for org_key in target_orgs:
+        start_count = len(all_accepted)
+        for url in SOURCE_CONFIGS[org_key]:
+            print(f"[INFO] 수집 중: {org_key} | {url}")
+            accepted, rejected, log = process_page(
+                session=session,
+                org_key=org_key,
+                url=url,
+                max_links=args.max_items_per_source,
+            )
+            all_accepted.extend(accepted)
+            all_rejected.extend(rejected)
+            fetch_logs.append(asdict(log))
 
-    print(f"총 {len(deduped)}건 저장: {output_path}")
+            if log.ok:
+                print(
+                    f"  -> accepted={log.accepted_segments}, "
+                    f"rejected={log.rejected_segments}, "
+                    f"links={log.discovered_links}"
+                )
+            else:
+                print(f"  -> [WARN] 수집 실패: {log.error}")
+
+        delta = len(all_accepted) - start_count
+        print(f"[{org_key}] {delta}건 accepted 누적")
+
+    all_accepted = dedupe_records(all_accepted)
+    all_rejected = dedupe_records(all_rejected)
+
+    write_jsonl(OUTPUT_JSONL, all_accepted)
+    write_jsonl(REJECTED_JSONL, all_rejected)
+    FETCH_LOG_JSON.write_text(
+        json.dumps(fetch_logs, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"\n총 accepted {len(all_accepted)}건 저장: {OUTPUT_JSONL}")
+    print(f"총 rejected {len(all_rejected)}건 저장: {REJECTED_JSONL}")
+    print(f"수집 로그 저장: {FETCH_LOG_JSON}")
+    print("\n다음 단계:")
+    print(f"python scripts/batch_ingest.py --jsonl {OUTPUT_JSONL} --skip-verify --workers 1")
 
 
 if __name__ == "__main__":

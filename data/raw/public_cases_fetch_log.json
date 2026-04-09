@@ -1,0 +1,86 @@
+[
+  {
+    "org": "kisa",
+    "url": "https://www.boho.or.kr/kr/bbs/list.do?bbsId=B0000030&menuNo=205027",
+    "ok": true,
+    "status_code": 200,
+    "content_type": "text/html;charset=utf-8",
+    "error": null,
+    "discovered_links": 60,
+    "extracted_segments": 7,
+    "accepted_segments": 0,
+    "rejected_segments": 7
+  },
+  {
+    "org": "kisa",
+    "url": "https://www.boho.or.kr/kr/bbs/list.do?bbsId=B0000133&menuNo=205020",
+    "ok": true,
+    "status_code": 200,
+    "content_type": "text/html;charset=utf-8",
+    "error": null,
+    "discovered_links": 75,
+    "extracted_segments": 7,
+    "accepted_segments": 0,
+    "rejected_segments": 7
+  },
+  {
+    "org": "police",
+    "url": "https://www.counterscam112.go.kr/",
+    "ok": true,
+    "status_code": 200,
+    "content_type": "text/html;charset=UTF-8",
+    "error": null,
+    "discovered_links": 70,
+    "extracted_segments": 27,
+    "accepted_segments": 1,
+    "rejected_segments": 26
+  },
+  {
+    "org": "police",
+    "url": "https://www.counterscam112.go.kr/phishing/prevent.do",
+    "ok": false,
+    "status_code": null,
+    "content_type": null,
+    "error": "404 Client Error: Not Found for url: https://www.counterscam112.go.kr/phishing/prevent.do",
+    "discovered_links": 0,
+    "extracted_segments": 0,
+    "accepted_segments": 0,
+    "rejected_segments": 0
+  },
+  {
+    "org": "police",
+    "url": "https://www.counterscam112.go.kr/board/notice/list.do",
+    "ok": false,
+    "status_code": null,
+    "content_type": null,
+    "error": "404 Client Error: Not Found for url: https://www.counterscam112.go.kr/board/notice/list.do",
+    "discovered_links": 0,
+    "extracted_segments": 0,
+    "accepted_segments": 0,
+    "rejected_segments": 0
+  },
+  {
+    "org": "fsc",
+    "url": "https://www.fsc.go.kr/no010101/86250",
+    "ok": true,
+    "status_code": 200,
+    "content_type": "text/html;charset=UTF-8",
+    "error": null,
+    "discovered_links": 112,
+    "extracted_segments": 93,
+    "accepted_segments": 25,
+    "rejected_segments": 68
+  },
+  {
+    "org": "fsc",
+    "url": "https://www.fsc.go.kr/no040101?cnId=2426&curPage=&pastPage=&srchKey=sj&srchText=%EB%B3%B4%EC%9D%B4%EC%8A%A4%ED%94%BC%EC%8B%B1",
+    "ok": true,
+    "status_code": 200,
+    "content_type": "text/html;charset=UTF-8",
+    "error": null,
+    "discovered_links": 118,
+    "extracted_segments": 7,
+    "accepted_segments": 0,
+    "rejected_segments": 7
+  }
+]
