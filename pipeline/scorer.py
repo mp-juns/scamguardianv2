@@ -47,6 +47,9 @@ class ScamReport:
     total_score: int = 0
     risk_level: str = ""
     risk_description: str = ""
+    is_scam: bool = False
+    agent_verdict: str = ""
+    agent_reasoning: list[str] = field(default_factory=list)
     triggered_flags: list[FlagDetail] = field(default_factory=list)
 
     # 검증 상세 (디버깅/감사용)
@@ -69,6 +72,9 @@ class ScamReport:
             "total_score": self.total_score,
             "risk_level": self.risk_level,
             "risk_description": self.risk_description,
+            "is_scam": self.is_scam,
+            "agent_verdict": self.agent_verdict,
+            "agent_reasoning": self.agent_reasoning,
             "triggered_flags": [
                 {
                     "flag": f.flag,
@@ -105,6 +111,7 @@ class ScamReport:
         lines.append(f"  총 위험 점수: {self.total_score}점")
         lines.append(f"  위험도 레벨: {self.risk_level}")
         lines.append(f"  판정: {self.risk_description}")
+        lines.append(f"  에이전트 결론: {self.agent_verdict}")
         lines.append("")
 
         if self.triggered_flags:
@@ -140,6 +147,50 @@ class ScamReport:
 
         lines.extend(["", "=" * 60])
         return "\n".join(lines)
+
+
+def _build_agent_reasoning(
+    *,
+    triggered: list[FlagDetail],
+    llm_assessment: LLMAssessment | None,
+    scam_type_source: str,
+    scam_type_reason: str,
+) -> list[str]:
+    reasons: list[str] = []
+
+    if scam_type_source == "llm" and scam_type_reason.strip():
+        reasons.append(f"유형 근거: {scam_type_reason.strip()}")
+
+    if llm_assessment is not None and not llm_assessment.error:
+        for item in llm_assessment.reasoning[:3]:
+            text = item.strip()
+            if text:
+                reasons.append(text)
+        if llm_assessment.summary.strip():
+            reasons.append(llm_assessment.summary.strip())
+
+    for flag in sorted(triggered, key=lambda x: abs(x.score_delta), reverse=True)[:3]:
+        evidence = flag.evidence[0].strip() if flag.evidence else ""
+        if evidence:
+            reasons.append(f"{flag.flag}: {flag.description} (근거: {evidence})")
+        else:
+            reasons.append(f"{flag.flag}: {flag.description}")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        compact = " ".join(reason.split())
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        unique.append(compact)
+        if len(unique) >= 5:
+            break
+
+    if not unique:
+        unique.append("명확한 스캠 징후가 충분히 확인되지 않았습니다.")
+
+    return unique
 
 
 def _scale_llm_flag_delta(delta: int) -> int:
@@ -218,6 +269,14 @@ def score(
             ))
 
     risk_level, risk_description = get_risk_level(total)
+    is_scam = risk_level != "안전"
+    agent_verdict = "사기 의심" if is_scam else "비사기 가능성 높음"
+    agent_reasoning = _build_agent_reasoning(
+        triggered=triggered,
+        llm_assessment=llm_assessment,
+        scam_type_source=scam_type_source,
+        scam_type_reason=scam_type_reason,
+    )
 
     return ScamReport(
         source=source,
@@ -235,6 +294,9 @@ def score(
         total_score=total,
         risk_level=risk_level,
         risk_description=risk_description,
+        is_scam=is_scam,
+        agent_verdict=agent_verdict,
+        agent_reasoning=agent_reasoning,
         triggered_flags=triggered,
         all_verifications=[vr.to_dict() for vr in verification_results],
         llm_assessment=llm_assessment.to_dict() if llm_assessment is not None else None,

@@ -48,20 +48,38 @@ class VerificationResult:
         }
 
 
+_serper_call_count = 0
+
+
 def _serper_search(query: str, num_results: int = 5) -> dict:
     """Serper API를 호출하여 검색 결과를 반환한다."""
+    global _serper_call_count
     api_key = os.getenv("SERPER_API_KEY", "")
     if not api_key:
         raise EnvironmentError("SERPER_API_KEY가 .env에 설정되지 않았습니다.")
 
+    _serper_call_count += 1
+    call_num = _serper_call_count
+    payload = {"q": query, "num": num_results, "gl": "kr", "hl": "ko"}
+    print(f"    [Serper #{call_num}] → 쿼리: {query[:80]}")
+
+    t0 = time.time()
     resp = requests.post(
         SERPER_API_URL,
         headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-        json={"q": query, "num": num_results, "gl": "kr", "hl": "ko"},
+        json=payload,
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    elapsed = time.time() - t0
+    hits = len(data.get("organic", []))
+    top_titles = [item.get("title", "")[:40] for item in data.get("organic", [])[:2]]
+    print(
+        f"    [Serper #{call_num}] ← {hits}건 ({elapsed:.1f}s)"
+        + (f" | {', '.join(top_titles)}" if top_titles else "")
+    )
+    return data
 
 
 def _count_hits(result: dict) -> int:

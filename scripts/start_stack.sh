@@ -44,7 +44,7 @@ sleep 0.5
 
 echo "[start] starting backend (uvicorn :$BACKEND_PORT) in conda env '$CONDA_ENV'..."
 cd "$ROOT_DIR"
-nohup conda run -n "$CONDA_ENV" python -m uvicorn api_server:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
+PYTHONUNBUFFERED=1 nohup conda run --no-capture-output -n "$CONDA_ENV" python -u -m uvicorn api_server:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload --log-level info \
   >"$LOG_DIR/backend.log" 2>&1 &
 
 echo "[start] starting frontend (next dev :$FRONTEND_PORT)..."

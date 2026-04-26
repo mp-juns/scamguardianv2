@@ -7,6 +7,7 @@ ScamGuardian v2 FastAPI server.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 from db import repository
 from pipeline import eval as pipeline_eval
@@ -37,7 +44,7 @@ class AnalyzeRequest(BaseModel):
         pattern="^(tiny|base|small|medium|large)$",
     )
     skip_verification: bool = True
-    use_llm: bool = False
+    use_llm: bool = True
     use_rag: bool = False
 
 
@@ -156,23 +163,31 @@ def _persist_run(
 
 
 def _run_pipeline(payload: AnalyzeRequest) -> dict:
-    source = _resolve_source(payload)
+    normalized_payload = AnalyzeRequest(
+        source=payload.source,
+        text=payload.text,
+        whisper_model=payload.whisper_model,
+        skip_verification=payload.skip_verification,
+        use_llm=True,
+        use_rag=payload.use_rag,
+    )
+    source = _resolve_source(normalized_payload)
     if not source:
         raise ValueError("분석할 텍스트 또는 URL을 입력해주세요.")
 
-    pipeline = ScamGuardianPipeline(whisper_model=payload.whisper_model)
+    pipeline = ScamGuardianPipeline(whisper_model=normalized_payload.whisper_model)
     report = pipeline.analyze(
         source,
-        skip_verification=payload.skip_verification,
-        use_llm=payload.use_llm,
-        use_rag=payload.use_rag,
+        skip_verification=normalized_payload.skip_verification,
+        use_llm=True,
+        use_rag=normalized_payload.use_rag,
     )
     report_dict = report.to_dict()
     # 프론트에서 "전체 전사"를 화면에 그대로 보여줄 수 있게 원문 텍스트도 함께 내려준다.
     report_dict["transcript_text"] = (
         pipeline.last_transcript_result.text if pipeline.last_transcript_result is not None else ""
     )
-    run_id = _persist_run(pipeline, payload, source, report_dict)
+    run_id = _persist_run(pipeline, normalized_payload, source, report_dict)
     if run_id:
         report_dict["analysis_run_id"] = run_id
     return report_dict
@@ -213,7 +228,7 @@ def startup() -> None:
     log.info("모델 워밍업 시작 (콜드스타트 방지)...")
     try:
         pipeline = ScamGuardianPipeline()
-        pipeline.analyze("워밍업 테스트", skip_verification=True, use_llm=False, use_rag=False)
+        pipeline.analyze("워밍업 테스트", skip_verification=True, use_llm=True, use_rag=False)
         log.info("모델 워밍업 완료")
     except Exception as exc:
         log.warning("모델 워밍업 실패 (무시): %s", exc)
@@ -264,10 +279,11 @@ def _kakao_detect_input(
 
 def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
     """파이프라인을 실행하고 report_dict를 반환한다."""
+    use_llm = True
     pipeline = ScamGuardianPipeline()
     report = pipeline.analyze(
         source,
-        skip_verification=True,
+        skip_verification=False,
         use_llm=use_llm,
         use_rag=False,
     )
@@ -281,8 +297,8 @@ def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
         pipeline,
         AnalyzeRequest(
             source=source,
-            skip_verification=True,
-            use_llm=use_llm,
+            skip_verification=False,
+            use_llm=True,
             use_rag=False,
         ),
         source,
@@ -310,11 +326,31 @@ def _classify_error(exc: Exception) -> kakao_formatter.ErrorCode:
     return EC.UNKNOWN
 
 
+_KAKAO_CALLBACK_TIMEOUT = 55  # 카카오 콜백 제한 60초, 여유 5초
+_KAKAO_POLL_TIMEOUT = 300  # 폴링 모드 최대 대기 5분
+_KAKAO_JOB_TTL = 600  # 완료된 결과 보관 10분 (초)
+
+# user_id → {"status": "running"|"done"|"error", "result": dict|None,
+#              "input_type": InputType, "started_at": float, "finished_at": float|None}
+_pending_jobs: dict[str, dict] = {}
+
+
+def _cleanup_expired_jobs() -> None:
+    import time
+    now = time.time()
+    expired = [
+        uid for uid, job in _pending_jobs.items()
+        if job["status"] != "running" and (now - (job.get("finished_at") or now)) > _KAKAO_JOB_TTL
+    ]
+    for uid in expired:
+        del _pending_jobs[uid]
+
+
 async def _kakao_callback_task(
     source: str,
     callback_url: str,
     input_type: kakao_formatter.InputType,
-    use_llm: bool = False,
+    use_llm: bool = True,
 ) -> None:
     """분석을 백그라운드로 수행한 뒤 카카오 callbackUrl로 결과를 POST한다."""
     import logging
@@ -323,23 +359,99 @@ async def _kakao_callback_task(
     log = logging.getLogger("kakao_callback")
 
     try:
-        log.info("callback 분석 시작: type=%s source=%s", input_type.value, source[:80])
-        report_dict = await asyncio.to_thread(_kakao_run_pipeline, source, use_llm)
+        log.info(
+            "callback 분석 시작 (제한 %ds):\n"
+            "  type: %s\n"
+            "  source: %s\n"
+            "  use_llm: %s",
+            _KAKAO_CALLBACK_TIMEOUT, input_type.value, source[:100], use_llm,
+        )
+        report_dict = await asyncio.wait_for(
+            asyncio.to_thread(_kakao_run_pipeline, source, use_llm),
+            timeout=_KAKAO_CALLBACK_TIMEOUT,
+        )
         result = kakao_formatter.format_result(report_dict, input_type)
-        log.info("callback 분석 완료: risk_level=%s", report_dict.get("risk_level"))
+        log.info(
+            "callback 분석 완료:\n"
+            "  scam_type: %s\n"
+            "  risk: %s/100 (%s)\n"
+            "  transcript_len: %s자",
+            report_dict.get("scam_type", "?"),
+            report_dict.get("total_score", "?"),
+            report_dict.get("risk_level", "?"),
+            len(report_dict.get("transcript_text", "")),
+        )
+    except asyncio.TimeoutError:
+        log.warning("callback 분석 타임아웃 (%ds 초과)", _KAKAO_CALLBACK_TIMEOUT)
+        result = kakao_formatter.format_error(
+            kakao_formatter.ErrorCode.TIMEOUT,
+            detail=f"분석이 {_KAKAO_CALLBACK_TIMEOUT}초를 초과했습니다. 더 짧은 영상이나 텍스트로 시도해주세요.",
+        )
     except Exception as exc:
-        log.error("callback 분석 실패: %s", exc)
+        log.error("callback 분석 실패: %s", exc, exc_info=True)
         error_code = _classify_error(exc)
         result = kakao_formatter.format_error(error_code, detail=str(exc))
 
+    import json as _json
+
     def _post():
         try:
+            log.info(
+                "callback POST 전송:\n"
+                "  url: %s\n"
+                "  body: %s",
+                callback_url[:80],
+                _json.dumps(result, ensure_ascii=False)[:500],
+            )
             resp = _requests.post(callback_url, json=result, timeout=10)
-            log.info("callback POST 완료: status=%s", resp.status_code)
+            log.info("callback POST 완료: status=%s body=%s", resp.status_code, resp.text[:200])
         except Exception as e:
             log.error("callback POST 실패: %s", e)
 
     await asyncio.to_thread(_post)
+
+
+async def _kakao_poll_task(
+    user_id: str,
+    source: str,
+    input_type: kakao_formatter.InputType,
+    use_llm: bool = True,
+) -> None:
+    """폴링 모드: 백그라운드에서 파이프라인을 실행하고 결과를 _pending_jobs에 저장한다."""
+    import logging
+    import time
+
+    log = logging.getLogger("kakao_poll")
+    log.info("폴링 분석 시작: user=%s type=%s source=%s", user_id[:12], input_type.value, source[:80])
+
+    try:
+        report_dict = await asyncio.wait_for(
+            asyncio.to_thread(_kakao_run_pipeline, source, use_llm),
+            timeout=_KAKAO_POLL_TIMEOUT,
+        )
+        _pending_jobs[user_id] = {
+            "status": "done",
+            "result": report_dict,
+            "input_type": input_type,
+            "started_at": _pending_jobs.get(user_id, {}).get("started_at", time.time()),
+            "finished_at": time.time(),
+        }
+        log.info(
+            "폴링 분석 완료: user=%s risk=%s/100 (%s)",
+            user_id[:12],
+            report_dict.get("total_score", "?"),
+            report_dict.get("risk_level", "?"),
+        )
+    except Exception as exc:
+        log.error("폴링 분석 실패: user=%s error=%s", user_id[:12], exc)
+        _pending_jobs[user_id] = {
+            "status": "error",
+            "result": None,
+            "error": exc,
+            "input_type": input_type,
+            "started_at": _pending_jobs.get(user_id, {}).get("started_at", time.time()),
+            "finished_at": time.time(),
+        }
 
 
 @app.post("/webhook/kakao")
@@ -362,63 +474,131 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     except Exception:
         return kakao_formatter.format_error(EC.PARSE_ERROR)
 
-    log.info("kakao webhook 수신: %s", str(body)[:200])
+    log.info(
+        "kakao webhook 수신:\n"
+        "  utterance: %s\n"
+        "  callbackUrl: %s\n"
+        "  action.params: %s",
+        (body.get("userRequest", {}).get("utterance") or "")[:100],
+        (body.get("userRequest", {}).get("callbackUrl") or "")[:80],
+        str(body.get("action", {}).get("params", {}))[:200],
+    )
+
+    import time
 
     user_request = body.get("userRequest", {})
     utterance: str = (user_request.get("utterance") or "").strip()
     callback_url: str = (user_request.get("callbackUrl") or "").strip()
     action_params: dict = body.get("action", {}).get("params", {})
+    user_id: str = (user_request.get("user", {}).get("id") or "").strip()
 
-    # 도움말 / 시작 명령
     if not utterance or utterance in ("새로 분석하기", "시작", "처음", "사용법"):
+        log.info("→ 도움말 응답 반환")
         return kakao_formatter.format_help()
+
+    # ── '결과확인' 폴링 ──
+    if utterance == "결과확인":
+        _cleanup_expired_jobs()
+        job = _pending_jobs.get(user_id)
+        log.info("→ 결과확인 요청: user=%s job=%s", user_id[:12] if user_id else "?", job and job.get("status"))
+        if job is None:
+            return kakao_formatter.format_no_job()
+        if job["status"] == "running":
+            return kakao_formatter.format_still_running()
+        if job["status"] == "error":
+            del _pending_jobs[user_id]
+            error_code = _classify_error(job.get("error") or Exception())
+            return kakao_formatter.format_error(error_code)
+        # done
+        result = kakao_formatter.format_result(job["result"], job["input_type"])
+        del _pending_jobs[user_id]
+        return result
 
     source, input_type = _kakao_detect_input(utterance, action_params)
     is_heavy = input_type in (InputType.URL, InputType.VIDEO, InputType.FILE)
 
-    log.info("입력 감지: type=%s source=%s", input_type.value, source[:60])
+    log.info("입력 감지: type=%s, heavy=%s, source=%s", input_type.value, is_heavy, source[:80])
 
     # ── callbackUrl이 있으면: 무조건 callback 모드 ──
     if callback_url:
+        log.info("→ callback 모드: 백그라운드 분석 시작, callbackUrl=%s", callback_url[:80])
         msg = kakao_formatter.format_analyzing(input_type)
         background_tasks.add_task(
-            _kakao_callback_task, source, callback_url, input_type, is_heavy,
+            _kakao_callback_task, source, callback_url, input_type, True,
         )
-        return {
+        resp = {
             "version": "2.0",
             "useCallback": True,
             "data": {"text": msg},
         }
+        log.info("→ 즉시 응답: %s", str(resp)[:200])
+        return resp
 
-    # ── callbackUrl 없음 ──
-    # 무거운 작업(URL/영상/파일)은 callback 없이 불가
+    # ── callbackUrl 없음, heavy 입력 → 폴링 모드 ──
     if is_heavy:
-        return kakao_formatter.format_error(EC.CALLBACK_REQUIRED)
+        if not user_id:
+            log.warning("→ user_id 없음, 폴링 불가 → CALLBACK_REQUIRED 에러")
+            return kakao_formatter.format_error(EC.CALLBACK_REQUIRED)
+        log.info("→ 폴링 모드: user=%s type=%s", user_id[:12], input_type.value)
+        _pending_jobs[user_id] = {
+            "status": "running",
+            "result": None,
+            "input_type": input_type,
+            "started_at": time.time(),
+            "finished_at": None,
+        }
+        background_tasks.add_task(_kakao_poll_task, user_id, source, input_type, True)
+        return kakao_formatter.format_queued(input_type)
 
     # 텍스트: 동기 모드 (4.5초 타임아웃 가드)
+    log.info("→ 동기 모드: 텍스트 분석 시작 (4.5s 타임아웃)")
     try:
         report_dict = await asyncio.wait_for(
-            asyncio.to_thread(_kakao_run_pipeline, source, False),
+            asyncio.to_thread(_kakao_run_pipeline, source, True),
             timeout=4.5,
         )
-        return kakao_formatter.format_result(report_dict, InputType.TEXT)
+        result = kakao_formatter.format_result(report_dict, InputType.TEXT)
+        log.info("→ 동기 분석 완료: risk=%s", report_dict.get("risk_level", "?"))
+        log.info("→ 응답: %s", str(result)[:300])
+        return result
     except asyncio.TimeoutError:
+        log.warning("→ 동기 분석 타임아웃 (4.5s 초과)")
         return kakao_formatter.format_error(EC.TIMEOUT)
     except Exception as exc:
-        log.error("동기 처리 실패: %s", exc)
+        log.error("→ 동기 처리 실패: %s", exc)
         error_code = _classify_error(exc)
         return kakao_formatter.format_error(error_code, detail=str(exc))
 
 
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest) -> dict:
+    import logging
+    log = logging.getLogger("api_analyze")
+    source = _resolve_source(payload)
+    log.info(
+        "/api/analyze 요청:\n"
+        "  source: %s\n"
+        "  whisper_model: %s, skip_verification: %s, use_llm: true(강제), use_rag: %s",
+        source[:100], payload.whisper_model, payload.skip_verification,
+        payload.use_rag,
+    )
     try:
-        return await asyncio.to_thread(_run_pipeline, payload)
+        result = await asyncio.to_thread(_run_pipeline, payload)
+        log.info(
+            "/api/analyze 완료: scam_type=%s, risk=%s/100 (%s)",
+            result.get("scam_type", "?"),
+            result.get("total_score", "?"),
+            result.get("risk_level", "?"),
+        )
+        return result
     except ValueError as exc:
+        log.warning("/api/analyze 입력 오류: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except EnvironmentError as exc:
+        log.warning("/api/analyze 환경 오류: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        log.error("/api/analyze 서버 오류: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -427,7 +607,7 @@ async def analyze_upload(
     file: UploadFile = File(...),
     whisper_model: str = Form("medium"),
     skip_verification: bool = Form(True),
-    use_llm: bool = Form(False),
+    use_llm: bool = Form(True),
     use_rag: bool = Form(False),
 ) -> dict:
     """
@@ -489,7 +669,7 @@ async def analyze_upload(
             source=str(wav_path),
             whisper_model=whisper_model,
             skip_verification=skip_verification,
-            use_llm=use_llm,
+            use_llm=True,
             use_rag=use_rag,
         )
         return await asyncio.to_thread(_run_pipeline, payload)

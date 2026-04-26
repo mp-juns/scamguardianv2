@@ -12,6 +12,7 @@ FRONTEND_PORT="${FRONTEND_PORT:-3100}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 ENABLE_FUNNEL="${ENABLE_FUNNEL:-true}"
+CONDA_ENV="${CONDA_ENV:-capstone}"
 
 echo "[restart] root=$ROOT_DIR"
 echo "[restart] logs=$LOG_DIR"
@@ -45,9 +46,9 @@ echo "[restart] starting Ollama..."
 OLLAMA_MODELS="$OLLAMA_MODELS_DIR" nohup ollama serve >"$LOG_DIR/ollama.log" 2>&1 &
 sleep 0.5
 
-echo "[restart] starting backend (uvicorn :$BACKEND_PORT)..."
+echo "[restart] starting backend (uvicorn :$BACKEND_PORT) in conda env '$CONDA_ENV'..."
 cd "$ROOT_DIR"
-nohup uvicorn api_server:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
+PYTHONUNBUFFERED=1 nohup conda run --no-capture-output -n "$CONDA_ENV" python -u -m uvicorn api_server:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload --log-level info \
   >"$LOG_DIR/backend.log" 2>&1 &
 
 echo "[restart] starting frontend (next dev :$FRONTEND_PORT)..."

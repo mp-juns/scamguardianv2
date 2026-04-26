@@ -79,6 +79,7 @@ class SuggestedFlag:
 class LLMAssessment:
     model: str
     summary: str = ""
+    reasoning: list[str] = field(default_factory=list)
     suggested_entities: list[SuggestedEntity] = field(default_factory=list)
     suggested_flags: list[SuggestedFlag] = field(default_factory=list)
     error: str = ""
@@ -87,6 +88,7 @@ class LLMAssessment:
         return {
             "model": self.model,
             "summary": self.summary,
+            "reasoning": self.reasoning,
             "suggested_entities": [e.to_dict() for e in self.suggested_entities],
             "suggested_flags": [f.to_dict() for f in self.suggested_flags],
             "error": self.error,
@@ -116,16 +118,36 @@ def _clamp_confidence(value: Any, default: float = 0.6) -> float:
 
 
 def _call_claude(prompt: str, max_tokens: int = 512) -> dict[str, Any]:
+    import time as _time
+
     client = _get_client()
     model = default_model_name()
+    prompt_len = len(prompt)
+    print(
+        f"    [Claude API] → 모델: {model}, "
+        f"프롬프트: {prompt_len}자, max_tokens: {max_tokens}"
+    )
+    t0 = _time.time()
     message = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system="당신은 한국어 스캠 탐지 보조 판정기입니다. JSON만 반환하세요. 마크다운 코드블록 없이 순수 JSON만 출력하세요.",
         messages=[{"role": "user", "content": prompt}],
     )
+    elapsed = _time.time() - t0
     raw = message.content[0].text
-    return _parse_json(raw)
+    usage = getattr(message, "usage", None)
+    usage_str = ""
+    if usage:
+        usage_str = f", 토큰: in={usage.input_tokens}/out={usage.output_tokens}"
+    print(
+        f"    [Claude API] ← 응답: {len(raw)}자 ({elapsed:.1f}s{usage_str})"
+    )
+    parsed = _parse_json(raw)
+    summary = parsed.get("summary", "")
+    if summary:
+        print(f"    [Claude API] ← 요약: {summary[:80]}")
+    return parsed
 
 
 def _parse_json(raw: str) -> dict[str, Any]:
@@ -179,6 +201,7 @@ def _build_prompt(
 1. 기존 추출에서 빠졌을 수 있는 엔티티 최대 2개
 2. 기존 검증과 별도로 점수 반영 후보 플래그 최대 2개
 3. 짧은 한국어 요약 1문장
+4. 왜 사기/비사기라고 보는지 핵심 근거 최대 3개
 
 규칙:
 - missing_entities[].label 은 허용 레이블 중 하나만 사용
@@ -209,6 +232,7 @@ def _build_prompt(
 반환 JSON 스키마:
 {{
   "summary": "짧은 한국어 요약",
+  "reasoning": ["핵심 근거 1", "핵심 근거 2"],
   "missing_entities": [
     {{
       "text": "문자열",
@@ -341,9 +365,16 @@ def assess(
             )
         )
 
+    reasoning: list[str] = []
+    for item in raw.get("reasoning", [])[:3]:
+        text = str(item).strip()
+        if text:
+            reasoning.append(text)
+
     return LLMAssessment(
         model=default_model_name(),
         summary=str(raw.get("summary", "")).strip(),
+        reasoning=reasoning,
         suggested_entities=suggested_entities,
         suggested_flags=suggested_flags,
     )

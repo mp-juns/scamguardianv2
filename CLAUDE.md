@@ -211,8 +211,20 @@ python scripts/batch_ingest.py --dry-run
 | 입력 유형 | callbackUrl 있음 | callbackUrl 없음 |
 |-----------|------------------|-------------------|
 | `TEXT` | 비동기 callback 분석 | 동기 분석 (4.5초 타임아웃) |
-| `URL` | 비동기 callback (STT+분석) | 에러: `CALLBACK_REQUIRED` |
-| `VIDEO`/`FILE` | 비동기 callback (STT+분석) | 에러: `CALLBACK_REQUIRED` |
+| `URL` | 비동기 callback (STT+분석) | 폴링 모드: 즉시 "분석 시작" 응답 후 백그라운드 실행 |
+| `VIDEO`/`FILE` | 비동기 callback (STT+분석) | 폴링 모드: 즉시 "분석 시작" 응답 후 백그라운드 실행 |
+
+#### 폴링 모드 흐름 (callbackUrl 없을 때)
+
+1. 사용자가 URL/영상 전송 → 즉시 "분석 시작됨, '결과확인' 입력하세요" 응답
+2. 서버에서 `_pending_jobs[user_id]`에 상태 저장하며 백그라운드 파이프라인 실행
+3. 사용자가 `결과확인` 입력:
+   - `running` → "아직 분석 중입니다" 응답 (quick reply로 재확인 유도)
+   - `done` → 결과 카드 반환 후 job 삭제
+   - `error` → 에러 메시지 반환 후 job 삭제
+   - 없음 → "진행 중인 분석 없음" 안내
+- `user_id`: `userRequest.user.id`로 사용자 식별 (없으면 CALLBACK_REQUIRED 에러 폴백)
+- job TTL: 완료 후 10분(`_KAKAO_JOB_TTL`), 최대 대기 5분(`_KAKAO_POLL_TIMEOUT`)
 
 #### 유형별 응답 포맷
 

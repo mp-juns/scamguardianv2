@@ -217,14 +217,23 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[tuple[str, int
 
 
 def _deduplicate(entities: list[Entity]) -> list[Entity]:
-    """위치가 겹치는 중복 엔티티를 제거한다 (높은 점수 우선)."""
+    """중복 엔티티를 제거한다 (높은 점수 우선).
+
+    두 가지 기준으로 중복 판단:
+    1) 위치가 겹치는 동일 텍스트+라벨 (기존)
+    2) 텍스트+라벨이 완전히 같으면 위치 무관하게 최고 점수 하나만 유지
+    """
     entities.sort(key=lambda e: -e.score)
     kept: list[Entity] = []
+    seen_text_label: set[tuple[str, str]] = set()
 
     for ent in entities:
+        pair = (ent.text, ent.label)
+        if pair in seen_text_label:
+            continue
+
         is_dup = False
         for existing in kept:
-            # 같은 위치 근처 + 같은 내용일 때만 중복으로 본다.
             if (
                 abs(ent.start - existing.start) < 5
                 and abs(ent.end - existing.end) < 5
@@ -235,6 +244,7 @@ def _deduplicate(entities: list[Entity]) -> list[Entity]:
                 break
         if not is_dup:
             kept.append(ent)
+            seen_text_label.add(pair)
 
     kept.sort(key=lambda e: e.start)
     return kept

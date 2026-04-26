@@ -106,6 +106,12 @@ _QUICK_REPLY_HELP = {
     "messageText": "사용법",
 }
 
+_QUICK_REPLY_CHECK = {
+    "label": "결과확인",
+    "action": "message",
+    "messageText": "결과확인",
+}
+
 
 def _risk_icon(level: str) -> str:
     return _RISK_ICON.get(level, "❓")
@@ -259,6 +265,59 @@ def format_analyzing(input_type: InputType = InputType.TEXT) -> dict[str, Any]:
         InputType.FILE: "📎 파일을 분석 중입니다...",
     }
     return msgs.get(input_type, msgs[InputType.TEXT])
+
+
+def format_queued(input_type: InputType = InputType.URL) -> dict[str, Any]:
+    """폴링 모드: 분석 시작 안내 (콜백 없을 때 즉시 응답)."""
+    msgs = {
+        InputType.URL: "🔍 영상 분석을 시작했습니다.\n음성 인식(STT) 후 사기 여부를 판별합니다.\n\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.VIDEO: "🎬 영상 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.FILE: "📎 파일 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.TEXT: "🔍 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
+    }
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {"simpleText": {"text": msgs.get(input_type, msgs[InputType.TEXT])}}
+            ],
+            "quickReplies": [_QUICK_REPLY_CHECK],
+        },
+    }
+
+
+def format_still_running() -> dict[str, Any]:
+    """폴링 모드: 아직 분석 중일 때 응답."""
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {
+                    "simpleText": {
+                        "text": "⏳ 아직 분석 중입니다.\n잠시 후 다시 '결과확인'을 입력해 주세요."
+                    }
+                }
+            ],
+            "quickReplies": [_QUICK_REPLY_CHECK],
+        },
+    }
+
+
+def format_no_job() -> dict[str, Any]:
+    """폴링 모드: 진행 중인 분석이 없을 때 응답."""
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {
+                    "simpleText": {
+                        "text": "📭 현재 진행 중인 분석이 없습니다.\n의심 텍스트, URL, 또는 영상을 보내주세요."
+                    }
+                }
+            ],
+            "quickReplies": [_QUICK_REPLY_NEW, _QUICK_REPLY_HELP],
+        },
+    }
 
 
 def format_help() -> dict[str, Any]:
