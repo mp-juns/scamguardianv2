@@ -411,3 +411,166 @@ def merge_suggested_entities(
 
     merged.sort(key=lambda entity: (entity.start < 0, entity.start, -entity.score))
     return merged
+
+
+# ──────────────────────────────────────────────
+# 통합 LLM 호출 (suggest_scam_type + assess를 1회로)
+# ──────────────────────────────────────────────
+
+@dataclass
+class UnifiedLLMResult:
+    """suggest_scam_type + assess 결과를 하나로 묶은 통합 결과."""
+    scam_type_suggestion: ScamTypeSuggestion | None
+    assessment: LLMAssessment
+
+
+def _build_unified_prompt(
+    transcript: str,
+    classifier_scam_type: str,
+) -> str:
+    taxonomy = get_runtime_scam_taxonomy()
+    scam_types = taxonomy["scam_types"]
+    description_lines = [{"description": k, "scam_type": v} for k, v in taxonomy["descriptions"].items()]
+    allowed_labels = taxonomy["label_sets"].get(classifier_scam_type, [])
+    allowed_flags = list(SCORING_RULES.keys())
+
+    return f"""
+역할: 한국어 스캠 탐지 통합 판정기
+출력: JSON만
+
+해야 할 일 (한 번에 모두 수행):
+1. 스캠 유형을 직접 판정하라. 분류기가 "{classifier_scam_type}"(으)로 판단했지만, 문맥상 더 적절한 유형이 있으면 교체.
+2. 전사에서 핵심 엔티티(이름, 금액, 기관 등) 최대 5개를 찾아라.
+3. 스캠 징후 플래그 최대 3개를 제안하라.
+4. 짧은 한국어 요약 1문장과 핵심 근거 최대 3개를 작성하라.
+
+규칙:
+- scam_type 은 허용 스캠 유형 중 하나만
+- missing_entities[].label 은 허용 레이블 중 하나만
+- suggested_flags[].flag 는 허용 플래그 중 하나만
+- confidence 는 0~1 숫자
+- text 가 비어 있는 엔티티는 절대 반환하지 마라
+- 확신이 낮으면 빈 배열
+
+허용 스캠 유형:
+{json.dumps(scam_types, ensure_ascii=False)}
+
+유형 설명(참고):
+{json.dumps(description_lines, ensure_ascii=False)}
+
+허용 레이블 (분류기 기준 "{classifier_scam_type}" 유형):
+{json.dumps(allowed_labels, ensure_ascii=False)}
+
+허용 플래그:
+{json.dumps(allowed_flags, ensure_ascii=False)}
+
+전사 텍스트:
+{transcript[:_MAX_TRANSCRIPT_CHARS]}
+
+반환 JSON 스키마:
+{{
+  "scam_type": "허용 목록 중 하나",
+  "scam_type_confidence": 0.0,
+  "scam_type_reason": "근거 요약",
+  "summary": "짧은 한국어 요약",
+  "reasoning": ["핵심 근거 1", "핵심 근거 2"],
+  "missing_entities": [
+    {{
+      "text": "문자열",
+      "label": "허용 레이블 중 하나",
+      "reason": "왜 중요한지",
+      "confidence": 0.0
+    }}
+  ],
+  "suggested_flags": [
+    {{
+      "flag": "허용 플래그 중 하나",
+      "reason": "왜 제안하는지",
+      "evidence": "전사에서 근거가 되는 짧은 문구",
+      "confidence": 0.0
+    }}
+  ]
+}}
+""".strip()
+
+
+def analyze_unified(
+    transcript: str,
+    classifier_scam_type: str,
+) -> UnifiedLLMResult:
+    """
+    LLM 스캠 유형 재판정 + 엔티티/플래그 제안을 1회 API 호출로 처리.
+    verification_results 없이 동작하여 병렬 파이프라인에서 사용 가능.
+    """
+    prompt = _build_unified_prompt(transcript, classifier_scam_type)
+    raw = _call_claude(prompt, max_tokens=512)
+
+    # ── 스캠 유형 제안 파싱 ──
+    scam_type_suggestion: ScamTypeSuggestion | None = None
+    suggested_type = str(raw.get("scam_type", "")).strip()
+    type_confidence = _clamp_confidence(raw.get("scam_type_confidence"), default=0.55)
+    type_reason = str(raw.get("scam_type_reason", "")).strip()
+
+    taxonomy = get_runtime_scam_taxonomy()
+    if suggested_type and suggested_type in taxonomy["scam_types"]:
+        if type_confidence >= LLM_SCAM_TYPE_OVERRIDE_THRESHOLD:
+            scam_type_suggestion = ScamTypeSuggestion(
+                scam_type=suggested_type,
+                confidence=type_confidence,
+                reason=type_reason,
+            )
+
+    # ── 엔티티/플래그 제안 파싱 (assess와 동일 로직) ──
+    effective_type = suggested_type if scam_type_suggestion else classifier_scam_type
+    allowed_labels = set(taxonomy["label_sets"].get(effective_type, []))
+    allowed_flags = set(SCORING_RULES.keys())
+
+    suggested_entities: list[SuggestedEntity] = []
+    seen_entity_pairs: set[tuple[str, str]] = set()
+    for item in raw.get("missing_entities", [])[:5]:
+        label = str(item.get("label", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if not label or not text or label not in allowed_labels:
+            continue
+        pair = (label, text)
+        if pair in seen_entity_pairs:
+            continue
+        seen_entity_pairs.add(pair)
+        suggested_entities.append(SuggestedEntity(
+            text=text, label=label,
+            reason=str(item.get("reason", "")).strip(),
+            confidence=_clamp_confidence(item.get("confidence")),
+        ))
+
+    suggested_flags: list[SuggestedFlag] = []
+    seen_flags: set[str] = set()
+    for item in raw.get("suggested_flags", [])[:3]:
+        flag = str(item.get("flag", "")).strip()
+        if not flag or flag not in allowed_flags or flag in seen_flags:
+            continue
+        seen_flags.add(flag)
+        suggested_flags.append(SuggestedFlag(
+            flag=flag,
+            reason=str(item.get("reason", "")).strip(),
+            evidence=str(item.get("evidence", "")).strip(),
+            confidence=_clamp_confidence(item.get("confidence")),
+        ))
+
+    reasoning: list[str] = []
+    for item in raw.get("reasoning", [])[:3]:
+        text = str(item).strip()
+        if text:
+            reasoning.append(text)
+
+    assessment = LLMAssessment(
+        model=default_model_name(),
+        summary=str(raw.get("summary", "")).strip(),
+        reasoning=reasoning,
+        suggested_entities=suggested_entities,
+        suggested_flags=suggested_flags,
+    )
+
+    return UnifiedLLMResult(
+        scam_type_suggestion=scam_type_suggestion,
+        assessment=assessment,
+    )

@@ -5,13 +5,14 @@ ScamGuardian v2 — 파이프라인 오케스트레이터
 
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from pipeline import classifier, extractor, llm_assessor, rag, scorer, stt, verifier
 from pipeline.config import CLASSIFICATION_THRESHOLD
-from pipeline.config import RAG_TOP_K
+from pipeline.config import RAG_TOP_K, SCORING_RULES
 from pipeline.scorer import ScamReport
 
 
@@ -191,14 +192,15 @@ class ScamGuardianPipeline:
         self.last_report = None
         pipeline_start = time.time()
         effective_use_rag = use_llm and use_rag
-        total_steps = 7 if effective_use_rag else (6 if use_llm else 5)
         self._debug(
             "analyze() 시작: "
             f"skip_verification={skip_verification}, use_llm={use_llm}, use_rag={effective_use_rag}"
         )
 
-        # 1단계: STT
-        print(f"[1/{total_steps}] STT 처리 중...")
+        # ════════════════════════════════
+        # Phase 1: STT
+        # ════════════════════════════════
+        print("[Phase 1] STT 처리 중...")
         print(f"      → 입력: {source[:80]}{'…' if len(source) > 80 else ''}")
         transcript = self.transcribe(source)
         text = transcript.text
@@ -207,8 +209,10 @@ class ScamGuardianPipeline:
         if transcript.source_type != "text":
             print(f"      ← 전사: {preview}")
 
-        # 2단계: 스캠 유형 분류
-        print(f"[2/{total_steps}] 스캠 유형 분류 중...")
+        # ════════════════════════════════
+        # Phase 2: 스캠 유형 분류 (mDeBERTa)
+        # ════════════════════════════════
+        print("[Phase 2] 스캠 유형 분류 중...")
         print(f"      → mDeBERTa NLI 모델에 {len(text)}자 전송")
         classification = self.classify(text)
         classifier_original = classification
@@ -219,44 +223,110 @@ class ScamGuardianPipeline:
         print(f"      ← 판정: {classification.scam_type} (신뢰도: {classification.confidence:.1%})")
         print(f"      ← Top3: {top3_str}")
 
-        # (옵션) LLM이 문맥으로 스캠 유형을 재판정하여 이후 추출/검증을 그 유형으로 수행
-        if use_llm:
-            try:
-                suggestion = llm_assessor.suggest_scam_type(text)
-                if suggestion is not None and suggestion.scam_type != classification.scam_type:
-                    classification = classifier.ClassificationResult(
-                        scam_type=suggestion.scam_type,
-                        confidence=suggestion.confidence,
-                        all_scores=classifier_original.all_scores,
-                        is_uncertain=suggestion.confidence < CLASSIFICATION_THRESHOLD,
-                    )
-                    scam_type_source = "llm"
-                    scam_type_reason = suggestion.reason
+        # ════════════════════════════════
+        # Phase 3: 병렬 실행 (LLM통합 + 엔티티추출 + RAG)
+        # ════════════════════════════════
+        print("[Phase 3] 병렬 실행 중 (LLM + 추출 + RAG)...")
+        llm_result: llm_assessor.LLMAssessment | None = None
+        unified_result: llm_assessor.UnifiedLLMResult | None = None
+        entities: list[extractor.Entity] = []
+        similar_cases: list[dict[str, Any]] = []
+
+        def _task_extract():
+            return self.extract(text, classification.scam_type)
+
+        def _task_llm_unified():
+            return llm_assessor.analyze_unified(text, classification.scam_type)
+
+        def _task_rag():
+            return self.retrieve_similar_cases(text, classification.scam_type)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # 항상 엔티티 추출
+            future_extract = executor.submit(_task_extract)
+
+            # LLM 통합 호출 (use_llm일 때만)
+            future_llm = executor.submit(_task_llm_unified) if use_llm else None
+
+            # RAG (use_rag일 때만)
+            future_rag = executor.submit(_task_rag) if effective_use_rag else None
+
+            # 결과 수집
+            entities = future_extract.result()
+            print(f"      ← 엔티티 추출: {len(entities)}개")
+            for e in entities:
+                print(f"         [{e.label}] {e.text} ({e.score:.2f})")
+
+            if future_llm is not None:
+                try:
+                    unified_result = future_llm.result()
+                    llm_result = unified_result.assessment
+                    suggestion = unified_result.scam_type_suggestion
                     print(
-                        f"      → [LLM 재판정] {classification.scam_type} (신뢰도: {classification.confidence:.1%})"
+                        f"      ← LLM 통합: 엔티티 {len(llm_result.suggested_entities)}개, "
+                        f"플래그 {len(llm_result.suggested_flags)}개"
                     )
-            except Exception as exc:
-                # 실패하면 기존 분류기로 계속 진행
-                self._log_step("LLM-유형재판정", time.time(), {"error": str(exc)})
-                self._debug(f"suggest_scam_type() 실패: {exc}")
+                    # LLM 스캠 유형 재판정 적용
+                    if suggestion is not None and suggestion.scam_type != classification.scam_type:
+                        classification = classifier.ClassificationResult(
+                            scam_type=suggestion.scam_type,
+                            confidence=suggestion.confidence,
+                            all_scores=classifier_original.all_scores,
+                            is_uncertain=suggestion.confidence < CLASSIFICATION_THRESHOLD,
+                        )
+                        scam_type_source = "llm"
+                        scam_type_reason = suggestion.reason
+                        print(
+                            f"      → [LLM 재판정] {classification.scam_type} "
+                            f"(신뢰도: {classification.confidence:.1%})"
+                        )
+                except Exception as exc:
+                    llm_result = llm_assessor.LLMAssessment(
+                        model=llm_assessor.default_model_name(), error=str(exc),
+                    )
+                    self._debug(f"analyze_unified() 실패: {exc}")
+                    print(f"      ← LLM 통합 실패: {exc}")
 
-        # 3단계: 엔티티 추출
-        print(f"[3/{total_steps}] 엔티티 추출 중...")
-        print(f"      → GLiNER에 전송: scam_type={classification.scam_type}")
-        entities = self.extract(text, classification.scam_type)
-        print(f"      ← {len(entities)}개 엔티티 추출")
-        for e in entities:
-            print(f"         [{e.label}] {e.text} ({e.score:.2f})")
+            if future_rag is not None:
+                try:
+                    similar_cases = future_rag.result()
+                    print(f"      ← RAG: 참고 사례 {len(similar_cases)}개")
+                except Exception as exc:
+                    self._debug(f"retrieve_similar_cases() 실패: {exc}")
+                    print(f"      ← RAG 실패: {exc}")
 
-        # 4단계: 교차 검증
+        # LLM 엔티티 병합
+        merged_entities = llm_assessor.merge_suggested_entities(entities, llm_result)
+        if len(merged_entities) != len(entities):
+            print(f"      ← 엔티티 병합 후 총 {len(merged_entities)}개")
+
+        # ════════════════════════════════
+        # Phase 4: 교차 검증 (내부 병렬) + 스코어링
+        # ════════════════════════════════
         if skip_verification:
-            print(f"[4/{total_steps}] 교차 검증 건너뜀 (skip_verification=True)")
+            print("[Phase 4] 교차 검증 건너뜀 (skip_verification=True)")
             verification_results: list[verifier.VerificationResult] = []
         else:
-            print(f"[4/{total_steps}] 교차 검증 중 (Serper API)...")
-            print(f"      → Serper에 전송: 엔티티 {len(entities)}개, scam_type={classification.scam_type}")
+            # 검증 대상 엔티티를 스코어 상위 15개로 제한 (라벨당 최대 2개)
+            MAX_VERIFY_ENTITIES = 15
+            seen_labels: dict[str, int] = {}
+            verify_entities: list[extractor.Entity] = []
+            for e in sorted(merged_entities, key=lambda x: -x.score):
+                count = seen_labels.get(e.label, 0)
+                if count >= 2:
+                    continue
+                seen_labels[e.label] = count + 1
+                verify_entities.append(e)
+                if len(verify_entities) >= MAX_VERIFY_ENTITIES:
+                    break
+
+            print("[Phase 4] 교차 검증 중 (Serper API, 병렬)...")
+            print(
+                f"      → 엔티티 {len(verify_entities)}개 (전체 {len(merged_entities)}개 중), "
+                f"scam_type={classification.scam_type}"
+            )
             verification_results = self.verify(
-                entities,
+                verify_entities,
                 classification.scam_type,
                 transcript=text,
             )
@@ -264,66 +334,14 @@ class ScamGuardianPipeline:
             print(f"      ← {len(verification_results)}건 검증, {triggered}건 플래그 발동")
             for r in verification_results:
                 if r.triggered:
-                    print(f"         🚩 {r.flag} (+{r.score_delta}점) {r.evidence.get('reason', '')[:60]}")
+                    delta = SCORING_RULES.get(r.flag, 0)
+                    reason = r.evidence_snippets[0][:60] if r.evidence_snippets else ""
+                    print(f"         🚩 {r.flag} (+{delta}점) {reason}")
 
-        llm_result: llm_assessor.LLMAssessment | None = None
-        merged_entities = entities
-        similar_cases: list[dict[str, Any]] = []
-        llm_step_index = 5
-        if effective_use_rag:
-            print(f"[5/{total_steps}] 유사 사례 검색 중 (RAG)...")
-            print(f"      → 벡터 DB 쿼리: top_k={RAG_TOP_K}, scam_type={classification.scam_type}")
-            try:
-                similar_cases = self.retrieve_similar_cases(text, classification.scam_type)
-                print(f"      ← 참고 사례 {len(similar_cases)}개")
-                for sc in similar_cases[:3]:
-                    sim_src = sc.get("source", "?")[:40]
-                    sim_score = sc.get("similarity", 0)
-                    print(f"         ↳ {sim_src} (유사도: {sim_score:.2f})")
-            except Exception as exc:
-                self._log_step("RAG", time.time(), {"error": str(exc)})
-                self._debug(f"retrieve_similar_cases() 실패: {exc}")
-                print(f"      ← 유사 사례 검색 실패: {exc}")
-            llm_step_index = 6
-
-        if use_llm:
-            model_name = llm_assessor.default_model_name()
-            print(f"[{llm_step_index}/{total_steps}] LLM 보조 판정 중 ({model_name})...")
-            print(
-                f"      → LLM에 전송: text {len(text)}자, "
-                f"entities {len(entities)}개, flags {len(verification_results)}개"
-            )
-            try:
-                llm_result = self.assess_with_llm(
-                    text,
-                    classification.scam_type,
-                    entities,
-                    verification_results,
-                    similar_cases=similar_cases,
-                )
-                print(
-                    f"      ← 추가 엔티티 {len(llm_result.suggested_entities)}개, "
-                    f"추가 플래그 {len(llm_result.suggested_flags)}개"
-                )
-                if llm_result.suggested_entities:
-                    for se in llm_result.suggested_entities[:5]:
-                        print(f"         ↳ 엔티티: [{se.label}] {se.text}")
-                if llm_result.suggested_flags:
-                    for sf in llm_result.suggested_flags[:5]:
-                        print(f"         ↳ 플래그: {sf.flag}")
-                merged_entities = llm_assessor.merge_suggested_entities(entities, llm_result)
-                if len(merged_entities) != len(entities):
-                    print(f"      ← 엔티티 병합 후 총 {len(merged_entities)}개")
-            except Exception as exc:
-                llm_result = llm_assessor.LLMAssessment(
-                    model=llm_assessor.default_model_name(),
-                    error=str(exc),
-                )
-                self._log_step("LLM", time.time(), {"error": str(exc)})
-                print(f"      ← LLM 보조 판정 실패: {exc}")
-
-        # 마지막 단계: 스코어링
-        print(f"[{total_steps}/{total_steps}] 스캠 스코어 산출 중...")
+        # ════════════════════════════════
+        # Phase 5: 스코어링
+        # ════════════════════════════════
+        print("[Phase 5] 스캠 스코어 산출 중...")
         print(
             f"      → 입력: 검증플래그 {len(verification_results)}개, "
             f"엔티티 {len(merged_entities)}개, 분류={classification.scam_type}"

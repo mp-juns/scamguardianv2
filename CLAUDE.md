@@ -8,7 +8,7 @@ ScamGuardian v2는 한국어 음성/텍스트에서 전화사기를 탐지하는
 
 - **Frontend**: Next.js 16 App Router (`apps/web/`) — Next 16은 기존 버전과 API·컨벤션이 다릅니다. `node_modules/next/dist/docs/`를 먼저 확인하세요.
 - **Backend**: FastAPI (`api_server.py`) — Next.js Route Handler가 모든 API 요청을 이 서버로 프록시
-- **Pipeline**: `pipeline/` — STT → 분류 → 추출 → 검증 → (RAG) → (LLM) → 스코어링 순서로 실행
+- **Pipeline**: `pipeline/` — 5 Phase 병렬 구조 (아래 참조)
 - **DB**: Postgres(+pgvector) 또는 SQLite, `db/repository.py`가 Facade 역할
 
 ## 개발 실행 명령
@@ -78,6 +78,8 @@ python scripts/batch_ingest.py --dry-run
 | `ANTHROPIC_MODEL` | Claude 모델 | `claude-sonnet-4-6` |
 | `OPENAI_API_KEY` | OpenAI Whisper API 키 | 없으면 로컬 Whisper 사용 |
 | `SCAMGUARDIAN_CORS_ORIGINS` | 허용 CORS 오리진 (콤마 구분) | `http://localhost:3000,...` |
+| `SERPER_MAX_CONCURRENT` | Serper API 동시 호출 수 | `3` |
+| `SERPER_BATCH_DELAY` | Serper 호출 간 딜레이 (초) | `0.2` |
 
 ## 아키텍처
 
@@ -97,43 +99,22 @@ python scripts/batch_ingest.py --dry-run
               ScamGuardianPipeline.analyze()
               (pipeline/runner.py)
                            │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-       STT              분류기           (결과)
-    (stt.py)       (classifier.py)         │
-          │                │               │
-          └────────────────┘               │
-                  텍스트                   │
-                    │                      │
-          ┌─────────▼──────────┐           │
-          │  엔티티 추출        │           │
-          │  (extractor.py)    │           │
-          └─────────┬──────────┘           │
-                    │                      │
-          ┌─────────▼──────────┐           │
-          │  교차 검증          │           │
-          │  (verifier.py)     │           │
-          │  Serper API 사용   │           │
-          └─────────┬──────────┘           │
-                    │                      │
-          ┌─────────▼──────────┐           │
-          │  RAG (선택)         │           │
-          │  (rag.py)          │           │
-          │  유사 사례 검색     │           │
-          └─────────┬──────────┘           │
-                    │                      │
-          ┌─────────▼──────────┐           │
-          │  LLM 보조 판정(선택) │          │
-          │  (llm_assessor.py) │           │
-          │  Claude API 사용   │           │
-          └─────────┬──────────┘           │
-                    │                      │
-          ┌─────────▼──────────┐           │
-          │  스코어링           │           │
-          │  (scorer.py)       │           │
-          │  → ScamReport      │           │
-          └─────────┬──────────┘           │
-                    └──────────────────────┘
+                  Phase 1: STT (stt.py)
+                           │
+                  Phase 2: 분류 (classifier.py)
+                           │
+                  Phase 3: ─── 병렬 실행 (ThreadPoolExecutor) ───
+                           │                │                │
+                    LLM 통합 호출     엔티티 추출        RAG 검색
+                  (llm_assessor.py)  (extractor.py)    (rag.py)
+                    analyze_unified()  GLiNER            SBERT
+                           │                │                │
+                           └────────────────┴────────────────┘
+                                          │
+                  Phase 4: 교차 검증 (verifier.py, 내부 병렬)
+                           │  Serper API × 상위 15 엔티티
+                           │
+                  Phase 5: 스코어링 (scorer.py) → ScamReport
                            │
                     ScamReport.to_dict()
                            │
@@ -145,15 +126,26 @@ python scripts/batch_ingest.py --dry-run
 
 ### 파이프라인 단계 (`pipeline/runner.py`)
 
-`ScamGuardianPipeline.analyze(source, skip_verification, use_llm, use_rag)`가 순서대로 실행:
+`ScamGuardianPipeline.analyze(source, skip_verification, use_llm, use_rag)` — **5 Phase 병렬 구조**:
 
-1. **STT** (`stt.py`): YouTube URL / 파일 / 텍스트 → 텍스트. `OPENAI_API_KEY` 있으면 OpenAI Whisper API(빠름), 없으면 로컬 Whisper medium 사용. YouTube는 앞 5분만 mp3로 추출 (카카오 콜백 1분 제한 + OpenAI 25MB 제한 대응)
+```
+Phase 1: STT (순차)
+Phase 2: mDeBERTa 분류 (순차)
+Phase 3: ┌ LLM 통합 호출 (analyze_unified) ┐  ← ThreadPoolExecutor 병렬
+         ├ GLiNER 엔티티 추출               │
+         └ RAG 유사 사례 검색               ┘
+Phase 4: Serper 교차 검증 (내부 병렬, 세마포어 레이트 리미팅)
+Phase 5: 스코어링
+```
+
+1. **STT** (`stt.py`): YouTube URL / 파일 / 텍스트 → 텍스트. OpenAI Whisper API 사용. YouTube는 앞 3분만 mp3로 추출
 2. **분류** (`classifier.py`): mDeBERTa NLI + 키워드 부스팅으로 스캠 유형 판별
-3. **추출** (`extractor.py`): GLiNER(`taeminlee/gliner_ko`)로 스캠 유형별 엔티티 추출
-4. **검증** (`verifier.py`): Serper API로 엔티티 교차검증 (skip_verification=True로 생략 가능)
-5. **RAG** (`rag.py`): SBERT 임베딩으로 과거 사람 라벨 사례 검색 (use_llm && use_rag일 때만)
-6. **LLM** (`llm_assessor.py`): Claude API로 추가 엔티티/플래그 제안 (use_llm일 때만)
-7. **스코어링** (`scorer.py`): 플래그 합산 → 위험 점수 / 레벨 산출
+3. **병렬 실행** (Phase 3): 분류 결과를 기반으로 아래 3개를 `ThreadPoolExecutor`로 동시 실행
+   - **추출** (`extractor.py`): GLiNER(`taeminlee/gliner_ko`)로 스캠 유형별 엔티티 추출
+   - **LLM 통합** (`llm_assessor.py`): `analyze_unified()` — 스캠 유형 재판정 + 엔티티/플래그 제안을 **1회 API 호출**로 처리 (기존 `suggest_scam_type()` + `assess()` 2회 호출을 통합)
+   - **RAG** (`rag.py`): SBERT 임베딩으로 과거 사람 라벨 사례 검색 (use_rag일 때만)
+4. **검증** (`verifier.py`): Serper API로 엔티티 교차검증. **엔티티별 병렬 검증** (`ThreadPoolExecutor` + `Semaphore(SERPER_MAX_CONCURRENT)` 레이트 리미팅). 검증 대상은 상위 15개 엔티티로 제한 (라벨당 최대 2개)
+5. **스코어링** (`scorer.py`): 플래그 합산 → 위험 점수 / 레벨 산출
 
 ### pipeline/ 파일별 역할
 
@@ -165,7 +157,7 @@ python scripts/batch_ingest.py --dry-run
 | `extractor.py` | 엔티티 추출 | `extract(text, scam_type)` → `list[Entity]` |
 | `verifier.py` | Serper API 교차검증 | `verify(entities, scam_type)` → `list[VerificationResult]` |
 | `rag.py` | 유사 사례 벡터 검색 | `retrieve_similar_runs(embedding, k)` |
-| `llm_assessor.py` | Claude API 보조 판정 | `assess(text, ...)` → `LLMAssessment` |
+| `llm_assessor.py` | Claude API 보조 판정 | `analyze_unified(text, scam_type)` → `UnifiedLLMResult`, `assess()` / `suggest_scam_type()` (레거시) |
 | `scorer.py` | 플래그 합산 → 점수/레벨 | `score(verification_results, ...)` → `ScamReport` |
 | `config.py` | 스캠 유형·플래그·점수 규칙 정의 | `SCORING_RULES`, `RISK_LEVELS`, `get_runtime_scam_taxonomy()` |
 | `kakao_formatter.py` | ScamReport → 카카오 챗봇 응답 JSON | `format_result(report, input_type)`, `format_error(code, detail)` |
@@ -224,7 +216,7 @@ python scripts/batch_ingest.py --dry-run
    - `error` → 에러 메시지 반환 후 job 삭제
    - 없음 → "진행 중인 분석 없음" 안내
 - `user_id`: `userRequest.user.id`로 사용자 식별 (없으면 CALLBACK_REQUIRED 에러 폴백)
-- job TTL: 완료 후 10분(`_KAKAO_JOB_TTL`), 최대 대기 5분(`_KAKAO_POLL_TIMEOUT`)
+- job TTL: 완료 후 10분(`_KAKAO_JOB_TTL`), 최대 대기 10분(`_KAKAO_POLL_TIMEOUT`)
 
 #### 유형별 응답 포맷
 
@@ -260,7 +252,8 @@ python scripts/batch_ingest.py --dry-run
 - 스킬 블록에서 **"콜백 사용"** 체크 → `callbackUrl`이 페이로드에 포함돼야 영상 분석이 안정적
 - 콜백 기능은 **카카오 관리자센터 → 챗봇 > 설정 > AI 챗봇 관리에서 별도 신청 후 승인** 필요
 - 파일 업로드를 받으려면 블록에 **파일 타입 파라미터** 추가 (`video`, `file`, `video_url` 등)
-- 스킬 서버 주소: `https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`
+- 스킬 서버 주소: Tailscale Funnel (`https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`) 또는 ngrok 터널 사용
+- **참고**: 카카오 오픈빌더에서 Tailscale `.ts.net` 도메인 접속이 불안정할 수 있음. ngrok 권장: `~/bin/ngrok http 3100`
 
 ### 어드민 라벨링 흐름
 

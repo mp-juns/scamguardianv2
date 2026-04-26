@@ -327,7 +327,7 @@ def _classify_error(exc: Exception) -> kakao_formatter.ErrorCode:
 
 
 _KAKAO_CALLBACK_TIMEOUT = 55  # 카카오 콜백 제한 60초, 여유 5초
-_KAKAO_POLL_TIMEOUT = 300  # 폴링 모드 최대 대기 5분
+_KAKAO_POLL_TIMEOUT = 600  # 폴링 모드 최대 대기 10분
 _KAKAO_JOB_TTL = 600  # 완료된 결과 보관 10분 (초)
 
 # user_id → {"status": "running"|"done"|"error", "result": dict|None,
@@ -443,7 +443,8 @@ async def _kakao_poll_task(
             report_dict.get("risk_level", "?"),
         )
     except Exception as exc:
-        log.error("폴링 분석 실패: user=%s error=%s", user_id[:12], exc)
+        import traceback
+        log.error("폴링 분석 실패: user=%s error=%s\n%s", user_id[:12], exc, traceback.format_exc())
         _pending_jobs[user_id] = {
             "status": "error",
             "result": None,

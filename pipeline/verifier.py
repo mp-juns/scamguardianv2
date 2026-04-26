@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,7 +21,14 @@ import torch
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, util
 
-from pipeline.config import MODELS, SERPER_API_URL, SERPER_DELAY, TRUSTED_QUERY_A_DOMAINS
+from pipeline.config import (
+    MODELS,
+    SERPER_API_URL,
+    SERPER_BATCH_DELAY,
+    SERPER_DELAY,
+    SERPER_MAX_CONCURRENT,
+    TRUSTED_QUERY_A_DOMAINS,
+)
 from pipeline.extractor import Entity
 
 load_dotenv()
@@ -49,37 +58,43 @@ class VerificationResult:
 
 
 _serper_call_count = 0
+_serper_call_lock = threading.Lock()
+_serper_semaphore = threading.Semaphore(SERPER_MAX_CONCURRENT)
 
 
 def _serper_search(query: str, num_results: int = 5) -> dict:
-    """Serper API를 호출하여 검색 결과를 반환한다."""
+    """Serper API를 호출하여 검색 결과를 반환한다. 세마포어로 동시 호출 제한."""
     global _serper_call_count
-    api_key = os.getenv("SERPER_API_KEY", "")
-    if not api_key:
-        raise EnvironmentError("SERPER_API_KEY가 .env에 설정되지 않았습니다.")
 
-    _serper_call_count += 1
-    call_num = _serper_call_count
-    payload = {"q": query, "num": num_results, "gl": "kr", "hl": "ko"}
-    print(f"    [Serper #{call_num}] → 쿼리: {query[:80]}")
+    with _serper_semaphore:
+        api_key = os.getenv("SERPER_API_KEY", "")
+        if not api_key:
+            raise EnvironmentError("SERPER_API_KEY가 .env에 설정되지 않았습니다.")
 
-    t0 = time.time()
-    resp = requests.post(
-        SERPER_API_URL,
-        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-        json=payload,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    elapsed = time.time() - t0
-    hits = len(data.get("organic", []))
-    top_titles = [item.get("title", "")[:40] for item in data.get("organic", [])[:2]]
-    print(
-        f"    [Serper #{call_num}] ← {hits}건 ({elapsed:.1f}s)"
-        + (f" | {', '.join(top_titles)}" if top_titles else "")
-    )
-    return data
+        with _serper_call_lock:
+            _serper_call_count += 1
+            call_num = _serper_call_count
+        payload = {"q": query, "num": num_results, "gl": "kr", "hl": "ko"}
+        print(f"    [Serper #{call_num}] → 쿼리: {query[:80]}")
+
+        t0 = time.time()
+        resp = requests.post(
+            SERPER_API_URL,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        elapsed = time.time() - t0
+        hits = len(data.get("organic", []))
+        top_titles = [item.get("title", "")[:40] for item in data.get("organic", [])[:2]]
+        print(
+            f"    [Serper #{call_num}] ← {hits}건 ({elapsed:.1f}s)"
+            + (f" | {', '.join(top_titles)}" if top_titles else "")
+        )
+        time.sleep(SERPER_BATCH_DELAY)
+        return data
 
 
 def _count_hits(result: dict) -> int:
@@ -135,6 +150,7 @@ _BERT_SIM_THRESHOLD_UNCERTAIN = 0.6
 _BERT_SIM_THRESHOLD_MISMATCH = 0.3
 
 _speaker_profile_model: SentenceTransformer | None = None
+_sbert_lock = threading.Lock()
 
 
 def _project_hf_cache_dir() -> Path:
@@ -161,7 +177,11 @@ def _resolve_local_hf_snapshot(model_id: str) -> str | None:
 
 def _get_sbert_model() -> SentenceTransformer:
     global _speaker_profile_model
-    if _speaker_profile_model is None:
+    if _speaker_profile_model is not None:
+        return _speaker_profile_model
+    with _sbert_lock:
+        if _speaker_profile_model is not None:
+            return _speaker_profile_model
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model_source = _resolve_local_hf_snapshot(f"sentence-transformers/{_BERT_SIM_MODEL_NAME}")
         if model_source:
@@ -296,50 +316,51 @@ def _verify_company(entity: Entity, all_entities: list[Entity]) -> list[Verifica
     results: list[VerificationResult] = []
     name = entity.text
 
-    # 1) 사업자등록 확인
+    # 회사 검증 3개 쿼리를 병렬로 실행
+    person_entities = [e for e in all_entities if e.label == "사람 이름"]
+    person_name = person_entities[0].text if person_entities else None
+
     q1 = f'"{name}" 사업자등록 site:bizno.net'
-    sr1 = _serper_search(q1)
+    q2 = f'"{name}" site:fss.or.kr'
+    q3 = f'"{person_name}" "{name}" 대표이사' if person_name else None
+
+    queries = [q1, q2] + ([q3] if q3 else [])
+    with ThreadPoolExecutor(max_workers=len(queries)) as ex:
+        futures = {ex.submit(_serper_search, q): q for q in queries}
+        search_results = {}
+        for f in as_completed(futures):
+            search_results[futures[f]] = f.result()
+
+    sr1 = search_results[q1]
     results.append(VerificationResult(
-        entity=entity,
-        query=q1,
+        entity=entity, query=q1,
         flag="business_not_registered",
         flag_description=f"'{name}' 사업자등록 정보 미확인",
         triggered=_count_hits(sr1) == 0,
         search_hits=_count_hits(sr1),
         evidence_snippets=_extract_snippets(sr1),
     ))
-    time.sleep(SERPER_DELAY)
 
-    # 2) 금감원 등록 확인
-    q2 = f'"{name}" site:fss.or.kr'
-    sr2 = _serper_search(q2)
+    sr2 = search_results[q2]
     results.append(VerificationResult(
-        entity=entity,
-        query=q2,
+        entity=entity, query=q2,
         flag="fss_not_registered",
         flag_description=f"'{name}' 금융감독원 등록 미확인",
         triggered=_count_hits(sr2) == 0,
         search_hits=_count_hits(sr2),
         evidence_snippets=_extract_snippets(sr2),
     ))
-    time.sleep(SERPER_DELAY)
 
-    # 3) 대표명 교차 확인
-    person_entities = [e for e in all_entities if e.label == "사람 이름"]
-    if person_entities:
-        person_name = person_entities[0].text
-        q3 = f'"{person_name}" "{name}" 대표이사'
-        sr3 = _serper_search(q3)
+    if q3:
+        sr3 = search_results[q3]
         results.append(VerificationResult(
-            entity=entity,
-            query=q3,
+            entity=entity, query=q3,
             flag="ceo_name_mismatch",
             flag_description=f"'{person_name}'이(가) '{name}'의 대표인지 확인 불가",
             triggered=_count_hits(sr3) == 0,
             search_hits=_count_hits(sr3),
             evidence_snippets=_extract_snippets(sr3),
         ))
-        time.sleep(SERPER_DELAY)
 
     return results
 
@@ -504,35 +525,34 @@ _COMPANY_LABELS = {"회사명 또는 기관명"}
 def verify(entities: list[Entity], scam_type: str, transcript: str) -> list[VerificationResult]:
     """
     추출된 엔티티 리스트를 교차 검증한다.
+    엔티티별 검증을 병렬로 실행하여 속도를 높인다.
 
     Args:
         entities: GLiNER가 추출한 엔티티 리스트
         scam_type: 분류된 스캠 유형
+        transcript: 원본 텍스트
 
     Returns:
         검증 결과 리스트 (트리거된 것과 미트리거된 것 모두 포함)
     """
     results: list[VerificationResult] = []
 
-    for entity in entities:
+    # ── 엔티티별 검증을 병렬 실행 ──
+    def _verify_entity(entity: Entity) -> list[VerificationResult]:
         label = entity.label
-
-        # 회사명: 다른 엔티티(사람 이름)도 참조해야 하므로 별도 호출
         if label in _COMPANY_LABELS:
-            results.extend(_verify_company(entity, entities))
-            time.sleep(SERPER_DELAY)
-            continue
-
-        # 매핑된 검증 함수가 있으면 실행
+            return _verify_company(entity, entities)
         verify_fn = _VERIFY_DISPATCH.get(label)
         if verify_fn is not None:
-            results.extend(verify_fn(entity))
-            time.sleep(SERPER_DELAY)
+            return verify_fn(entity)
+        return []
 
-    # ──────────────────────────────────────────────
-    # 노션 다음 단계: BERT 유사도 + 화자 프로파일 + 쿼리 A/B/C
-    # ──────────────────────────────────────────────
-    # (기존 Serper 교차 검증과는 별도로, "근거를 어디서 찾았는지"를 플래그 evidence로 남긴다.)
+    with ThreadPoolExecutor(max_workers=SERPER_MAX_CONCURRENT) as executor:
+        futures = [executor.submit(_verify_entity, e) for e in entities]
+        for f in futures:
+            results.extend(f.result())
+
+    # ── 화자 프로파일 + 쿼리 A/B/C (병렬) ──
     if transcript and entities:
         speaker_entity = _choose_speaker(entities)
         claim_keyword = _extract_claim_keyword(entities)
@@ -542,11 +562,25 @@ def verify(entities: list[Entity], scam_type: str, transcript: str) -> list[Veri
         if speaker_entity and claim_keyword:
             speaker_name = speaker_entity.text
 
-            # 1) 화자 프로파일(Serper snippets) 수집 → BERT 유사도 계산
+            # 4개 쿼리를 동시 실행
             q_profile = f'"{speaker_name}" 직업 분야 최근 활동'
-            sr_profile = _serper_search(q_profile, num_results=5)
-            profile_snippets = _extract_snippets(sr_profile, max_snippets=5)
+            q_a = _build_query_a(speaker_name, claim_keyword)
+            q_b = _build_query_b(claim_keyword, year)
+            q_c = _build_query_c(speaker_name, amount_or_investment, claim_keyword)
 
+            with ThreadPoolExecutor(max_workers=SERPER_MAX_CONCURRENT) as executor:
+                f_profile = executor.submit(_serper_search, q_profile, 5)
+                f_a = executor.submit(_serper_search, q_a, 10)
+                f_b = executor.submit(_serper_search, q_b, 10)
+                f_c = executor.submit(_serper_search, q_c, 10)
+
+                sr_profile = f_profile.result()
+                sr_a = f_a.result()
+                sr_b = f_b.result()
+                sr_c = f_c.result()
+
+            # 화자 프로파일 → BERT 유사도
+            profile_snippets = _extract_snippets(sr_profile, max_snippets=5)
             speech_content_text = transcript[:2000]
             speaker_profile_text = " ".join(profile_snippets)[:4000]
 
@@ -555,76 +589,53 @@ def verify(entities: list[Entity], scam_type: str, transcript: str) -> list[Veri
 
                 if sim < _BERT_SIM_THRESHOLD_MISMATCH:
                     results.append(VerificationResult(
-                        entity=speaker_entity,
-                        query=q_profile,
+                        entity=speaker_entity, query=q_profile,
                         flag="authority_context_mismatch",
                         flag_description=f"화자 프로파일 vs 발화 맥락 의미가 불일치 (cos={sim:.3f})",
                         triggered=True,
                         search_hits=_count_hits(sr_profile),
-                        evidence_snippets=[
-                            f"[cosine_similarity] {sim:.3f}",
-                            *profile_snippets[:3],
-                        ],
+                        evidence_snippets=[f"[cosine_similarity] {sim:.3f}", *profile_snippets[:3]],
                     ))
                 elif sim < _BERT_SIM_THRESHOLD_UNCERTAIN:
                     results.append(VerificationResult(
-                        entity=speaker_entity,
-                        query=q_profile,
+                        entity=speaker_entity, query=q_profile,
                         flag="authority_context_uncertain",
                         flag_description=f"화자 프로파일 vs 발화 맥락 의미가 애매 (cos={sim:.3f})",
                         triggered=True,
                         search_hits=_count_hits(sr_profile),
-                        evidence_snippets=[
-                            f"[cosine_similarity] {sim:.3f}",
-                            *profile_snippets[:3],
-                        ],
+                        evidence_snippets=[f"[cosine_similarity] {sim:.3f}", *profile_snippets[:3]],
                     ))
 
-            time.sleep(SERPER_DELAY)
-
-            # 2) Query A: 신뢰 언론에서 화자+발언 동시 히트 여부
-            q_a = _build_query_a(speaker_name, claim_keyword)
-            sr_a = _serper_search(q_a, num_results=10)
+            # Query A: 신뢰 언론 히트
             organic_a = sr_a.get("organic", []) or []
             hit_in_sa = _hit_in_sa_domains(organic_a)
             snippets_a = _extract_snippets(sr_a, max_snippets=5)
-
             results.append(VerificationResult(
-                entity=speaker_entity,
-                query=q_a,
+                entity=speaker_entity, query=q_a,
                 flag="query_a_confirmed" if hit_in_sa else "query_a_unconfirmed",
-                flag_description=(
-                    f"신뢰 도메인(S/A)에서 화자+발언 동시 히트 확인 ({'있음' if hit_in_sa else '없음'})"
-                ),
+                flag_description=f"신뢰 도메인(S/A)에서 화자+발언 동시 히트 확인 ({'있음' if hit_in_sa else '없음'})",
                 triggered=True,
                 search_hits=_count_hits(sr_a),
                 evidence_snippets=snippets_a,
             ))
 
-            time.sleep(SERPER_DELAY)
-
-            # 3) Query B: 팩트체크/확인/부인 이력
-            q_b = _build_query_b(claim_keyword, year)
-            sr_b = _serper_search(q_b, num_results=10)
+            # Query B: 팩트체크
             snippets_b = _extract_snippets(sr_b, max_snippets=5)
             b_has_scam_keywords = _has_scam_keywords(snippets_b)
             b_has_confirmed = _has_factcheck_confirmed(snippets_b)
 
             if b_has_scam_keywords:
                 results.append(VerificationResult(
-                    entity=speaker_entity,
-                    query=q_b,
+                    entity=speaker_entity, query=q_b,
                     flag="query_b_factcheck_found",
                     flag_description="팩트체크/검증 결과 스캠/사기 관련 단서 포함",
                     triggered=True,
                     search_hits=_count_hits(sr_b),
                     evidence_snippets=snippets_b,
                 ))
-
             if b_has_confirmed:
                 results.append(VerificationResult(
-                    entity=speaker_entity,
-                    query=q_b,
+                    entity=speaker_entity, query=q_b,
                     flag="query_b_confirmed",
                     flag_description="팩트체크에서 확인/부인(denied) 등 검증 단서 발견",
                     triggered=True,
@@ -632,18 +643,11 @@ def verify(entities: list[Entity], scam_type: str, transcript: str) -> list[Veri
                     evidence_snippets=snippets_b,
                 ))
 
-            time.sleep(SERPER_DELAY)
-
-            # 4) Query C: 스캠 패턴(사기/사칭/피싱 등) 정합성
-            q_c = _build_query_c(speaker_name, amount_or_investment, claim_keyword)
-            sr_c = _serper_search(q_c, num_results=10)
+            # Query C: 스캠 패턴
             snippets_c = _extract_snippets(sr_c, max_snippets=5)
-            c_has_scam_keywords = _has_scam_keywords(snippets_c)
-
-            if c_has_scam_keywords:
+            if _has_scam_keywords(snippets_c):
                 results.append(VerificationResult(
-                    entity=speaker_entity,
-                    query=q_c,
+                    entity=speaker_entity, query=q_c,
                     flag="query_c_scam_pattern_found",
                     flag_description="스캠/사기 패턴 관련 단서가 검색 결과에서 확인됨",
                     triggered=True,

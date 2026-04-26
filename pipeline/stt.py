@@ -61,7 +61,7 @@ def _download_youtube_audio(
                 "preferredquality": "64",
             }
         ],
-        "postprocessor_args": {"ExtractAudio": ["-t", "300"]},
+        "postprocessor_args": {"ExtractAudio": ["-t", "180"]},
         "quiet": not debug,
         "no_warnings": not debug,
     }
@@ -138,11 +138,99 @@ def _transcribe_with_openai_api(
     return {"text": text, "language": "ko", "segments": []}
 
 
+def _transcribe_with_claude(
+    audio_path: str,
+    logger: Callable[[str], None] | None = None,
+) -> dict:
+    """Claude API에 오디오를 직접 전송하여 전사한다."""
+    import base64
+
+    import anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY가 설정되지 않았습니다. "
+            ".env 파일에 ANTHROPIC_API_KEY를 추가해주세요."
+        )
+
+    audio_bytes = Path(audio_path).read_bytes()
+    file_size_mb = len(audio_bytes) / (1024 * 1024)
+
+    # 확장자로 media_type 결정
+    ext = Path(audio_path).suffix.lower().lstrip(".")
+    media_type_map = {
+        "mp3": "audio/mp3",
+        "wav": "audio/wav",
+        "flac": "audio/flac",
+        "ogg": "audio/ogg",
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "webm": "audio/webm",
+    }
+    media_type = media_type_map.get(ext, "audio/mp3")
+    audio_b64 = base64.standard_b64encode(audio_bytes).decode("utf-8")
+
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    if logger:
+        logger(
+            f"[STT] Claude Audio API 호출 시작\n"
+            f"       → 파일: {Path(audio_path).name} ({file_size_mb:.1f}MB)\n"
+            f"       → 모델: {model}, 타입: {media_type}"
+        )
+
+    t0 = time.time()
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": audio_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "위 오디오를 한국어로 전사(transcription)해주세요. "
+                            "말한 내용을 그대로 텍스트로 옮기세요. "
+                            "전사 결과만 출력하고, 다른 설명은 하지 마세요."
+                        ),
+                    },
+                ],
+            }
+        ],
+    )
+    elapsed = time.time() - t0
+    text = message.content[0].text.strip()
+    preview = text[:150] + "…" if len(text) > 150 else text
+
+    if logger:
+        logger(
+            f"[STT] Claude Audio API 완료 ({elapsed:.1f}s)\n"
+            f"       ← 전사 길이: {len(text)}자\n"
+            f"       ← 미리보기: {preview}"
+        )
+    return {"text": text, "language": "ko", "segments": []}
+
+
+# STT 백엔드 설정 (현재 whisper만 지원)
+STT_BACKEND = os.getenv("STT_BACKEND", "whisper")
+
+
 def transcribe(
     source: str,
     model_size: str = "medium",
     debug: bool = False,
     logger: Callable[[str], None] | None = None,
+    stt_backend: str | None = None,
 ) -> TranscriptResult:
     """
     입력 소스를 텍스트로 변환한다.
@@ -150,15 +238,21 @@ def transcribe(
     Args:
         source: YouTube URL, 로컬 파일 경로, 또는 텍스트
         model_size: (미사용, 호환성 유지)
+        stt_backend: "whisper" 또는 "claude" (None이면 STT_BACKEND 환경변수 사용)
 
     Returns:
         TranscriptResult 객체
     """
+    backend = stt_backend or STT_BACKEND
+
     if not _is_youtube_url(source) and not _is_file(source):
         return TranscriptResult(
             text=source.strip(),
             source_type="text",
         )
+
+    # STT 함수 선택
+    _do_stt = _transcribe_with_claude if backend == "claude" else _transcribe_with_openai_api
 
     # YouTube URL
     if _is_youtube_url(source):
@@ -169,7 +263,7 @@ def transcribe(
             if logger:
                 logger(f"[STT] 오디오 파일 준비 완료: {audio_path}")
             _ensure_audio_nonempty(audio_path)
-            result = _transcribe_with_openai_api(audio_path, logger=logger)
+            result = _do_stt(audio_path, logger=logger)
         return TranscriptResult(
             text=result["text"],
             language=result.get("language", "ko"),
@@ -179,7 +273,7 @@ def transcribe(
 
     # 로컬 파일
     _ensure_audio_nonempty(source)
-    result = _transcribe_with_openai_api(source, logger=logger)
+    result = _do_stt(source, logger=logger)
     return TranscriptResult(
         text=result["text"],
         language=result.get("language", "ko"),
