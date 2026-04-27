@@ -368,3 +368,32 @@ Phase 5: 스코어링
 - **Frontend**: Vercel (Root Directory: `apps/web`)
 - **Backend**: Render (`uvicorn api_server:app --host 0.0.0.0 --port $PORT`)
 - 세부 설정: `DEPLOY.md`, `render.yaml`
+
+## 다음 작업 (TODO)
+
+다음 세션에서 이어서 진행할 작업 목록 (2026-04-28 정리):
+
+### 큰 항목
+
+1. **점수 산정 정당성 — 논문/학술 출처 보강**
+   - 현재 `pipeline/config.py:FLAG_RATIONALE` 의 출처는 KISA·금감원·경찰청·자본시장법 위주
+   - 추가로 **학술 논문/연구**(보이스피싱·금융사기 한국어 연구, Cialdini 영향력 원리 등) 인용으로 신뢰도 보강
+   - 각 플래그 점수 값(15/20/25)이 왜 그 값인지 정량적 근거 (사기 사례 통계, 분류기 성능 등)
+
+2. **점수 산정 방식 전용 페이지 (신규 라우트)**
+   - 예: `/methodology` — 별도 공개 페이지
+   - 내용: 점수 합산식, 위험도 등급(0~20/21~40/41~70/71+), 플래그별 점수표 + 정당성 + **인용 논문 전체 리스트**
+   - LLM 보조 가중치(`LLM_FLAG_SCORE_RATIO=0.5`) 같은 설계 결정도 설명
+   - 결과 페이지에서 "점수 기준 자세히 보기" 링크로 연결
+
+3. **라벨링에서 영상/URL 미디어 보존**
+   - YouTube URL 입력의 경우 → 어드민 라벨링 페이지에 클릭 가능한 링크 노출
+   - 업로드 영상의 경우 → 로컬에 저장(예: `.scamguardian/uploads/{run_id}/...`)하고 어드민에서 재생/다운로드 가능
+   - 라벨러가 STT 결과뿐 아니라 원본 미디어로 검증할 수 있게
+
+### 작은 버그 / UX
+
+4. **결과확인 버튼 누락** — 폴링/refining 단계에선 `결과확인` 버튼이 우선 노출돼야 (현재는 `[사용법, 분석 초기화]` 두 개로만 통일됨)
+   - `kakao_formatter.py:_QUICK_REPLY_PRESETS` 에 phase 별 분기 다시 도입 권장
+5. **stt_quality 텍스트 입력엔 숨김** — 어드민 라벨링 폼에서 `metadata.source_type == "text"` 일 때 STT 품질 항목 미표시
+6. **AI 초안 생성 에러 (어드민)** — `/api/admin/runs/{id}/ai-draft` 호출 시 발생. 백엔드 로그 + `pipeline/claude_labeler.py` 점검 필요
