@@ -424,15 +424,41 @@ class UnifiedLLMResult:
     assessment: LLMAssessment
 
 
+def _format_user_context_block(user_context: dict[str, Any] | None) -> str:
+    """사용자 컨텍스트 대화 결과를 프롬프트용 블록으로 변환."""
+    if not user_context:
+        return "(사용자 컨텍스트 없음)"
+
+    summary = str(user_context.get("summary_text", "")).strip()
+    if not summary:
+        qa_pairs = user_context.get("qa_pairs") or []
+        lines = []
+        for qa in qa_pairs:
+            q = str(qa.get("question", "")).strip()
+            a = str(qa.get("answer", "")).strip()
+            if not a:
+                continue
+            if q:
+                lines.append(f"Q: {q}")
+            lines.append(f"A: {a}")
+        summary = "\n".join(lines)
+
+    if not summary:
+        return "(사용자 컨텍스트 없음)"
+    return summary[:1000]
+
+
 def _build_unified_prompt(
     transcript: str,
     classifier_scam_type: str,
+    user_context: dict[str, Any] | None = None,
 ) -> str:
     taxonomy = get_runtime_scam_taxonomy()
     scam_types = taxonomy["scam_types"]
     description_lines = [{"description": k, "scam_type": v} for k, v in taxonomy["descriptions"].items()]
     allowed_labels = taxonomy["label_sets"].get(classifier_scam_type, [])
     allowed_flags = list(SCORING_RULES.keys())
+    user_context_block = _format_user_context_block(user_context)
 
     return f"""
 역할: 한국어 스캠 탐지 통합 판정기
@@ -451,6 +477,12 @@ def _build_unified_prompt(
 - confidence 는 0~1 숫자
 - text 가 비어 있는 엔티티는 절대 반환하지 마라
 - 확신이 낮으면 빈 배열
+
+사용자 제보(prior, 참고용):
+- 사용자가 챗봇과 대화하며 직접 알려준 정보다. 출처·의심 포인트·권유받은 행동 등이 포함될 수 있다.
+- 강한 prior 이지만 맹신하지 마라. 전사와 일치하지 않으면 전사를 우선한다.
+- 사용자가 "수익 보장 받았다", "송금 요구받았다" 같은 구체적 행동 단서를 줬다면 관련 플래그 confidence 를 높여도 된다.
+{user_context_block}
 
 허용 스캠 유형:
 {json.dumps(scam_types, ensure_ascii=False)}
@@ -497,12 +529,15 @@ def _build_unified_prompt(
 def analyze_unified(
     transcript: str,
     classifier_scam_type: str,
+    user_context: dict[str, Any] | None = None,
 ) -> UnifiedLLMResult:
     """
     LLM 스캠 유형 재판정 + 엔티티/플래그 제안을 1회 API 호출로 처리.
     verification_results 없이 동작하여 병렬 파이프라인에서 사용 가능.
+
+    user_context: 챗봇 대화로 모은 사용자 제보. context_chat.summarize_for_pipeline() 결과.
     """
-    prompt = _build_unified_prompt(transcript, classifier_scam_type)
+    prompt = _build_unified_prompt(transcript, classifier_scam_type, user_context=user_context)
     raw = _call_claude(prompt, max_tokens=512)
 
     # ── 스캠 유형 제안 파싱 ──

@@ -262,6 +262,29 @@ def save_analysis_run(
     return run_id
 
 
+def merge_run_metadata(run_id: str, partial: dict[str, Any]) -> None:
+    """기존 metadata 와 partial 을 머지(키 단위 덮어쓰기). row 없으면 무시."""
+    if not partial:
+        return
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT metadata FROM analysis_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return
+        current = _load_json(row["metadata"], {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update(partial)
+        conn.execute(
+            "UPDATE analysis_runs SET metadata = ? WHERE id = ?",
+            (_dump_json(current), run_id),
+        )
+        conn.commit()
+
+
 def save_transcript_embedding(run_id: str, embedding: list[float], model_name: str) -> None:
     if len(embedding) != _VECTOR_DIMENSION:
         raise ValueError(

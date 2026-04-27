@@ -29,9 +29,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+import threading
+
 from db import repository
-from pipeline import eval as pipeline_eval
-from pipeline import kakao_formatter, rag
+from pipeline import context_chat, eval as pipeline_eval
+from pipeline import kakao_formatter, rag, stt as stt_module
 from pipeline.config import DEFAULT_SCAM_TYPES, SCORING_RULES, get_runtime_scam_taxonomy
 from pipeline.runner import ScamGuardianPipeline
 
@@ -107,6 +109,8 @@ def _persist_run(
     payload: AnalyzeRequest,
     source: str,
     report_dict: dict[str, Any],
+    *,
+    user_context: dict[str, Any] | None = None,
 ) -> str | None:
     if not repository.persistence_enabled():
         return None
@@ -130,6 +134,8 @@ def _persist_run(
         ],
         "rag_context": report_dict.get("rag_context"),
     }
+    if user_context:
+        metadata["user_context"] = user_context
 
     run_id = repository.save_analysis_run(
         input_source=source,
@@ -239,6 +245,39 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/result/{token}")
+async def get_result_by_token(token: str) -> dict[str, Any]:
+    """카카오 카드의 '자세히 보기' 링크 백엔드 — 토큰으로 분석 결과 반환.
+
+    1시간 TTL. 토큰 없거나 만료 시 404/410.
+    """
+    import time as _time
+    _cleanup_expired_result_tokens()
+    entry = _result_tokens.get(token)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="결과를 찾을 수 없습니다.")
+    if entry.get("expires_at", 0) < _time.time():
+        _result_tokens.pop(token, None)
+        raise HTTPException(status_code=410, detail="결과 링크가 만료됐어요 (1시간 후 만료).")
+    # 플래그별 정당성·출처 — 결과 페이지에서 "왜 이 점수인가요?" 표시
+    from pipeline.config import flag_rationale
+    flag_info: dict[str, dict[str, str]] = {}
+    for f in (entry["result"].get("triggered_flags") or []):
+        key = (f.get("flag") or "").strip()
+        if key and key not in flag_info:
+            info = flag_rationale(key)
+            if info:
+                flag_info[key] = info
+    return {
+        "result": entry["result"],
+        "user_context": entry.get("user_context"),
+        "input_type": entry.get("input_type"),
+        "chat_history": entry.get("chat_history") or [],
+        "flag_rationale": flag_info,
+        "expires_at": entry["expires_at"],
+    }
+
+
 _URL_RE = re.compile(r"https?://\S+")
 _YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
 
@@ -330,20 +369,191 @@ _KAKAO_CALLBACK_TIMEOUT = 55  # 카카오 콜백 제한 60초, 여유 5초
 _KAKAO_POLL_TIMEOUT = 600  # 폴링 모드 최대 대기 10분
 _KAKAO_JOB_TTL = 600  # 완료된 결과 보관 10분 (초)
 
-# user_id → {"status": "running"|"done"|"error", "result": dict|None,
-#              "input_type": InputType, "started_at": float, "finished_at": float|None}
+# 결과 상세 페이지 공개 토큰 — 카카오 카드의 "자세히 보기" 링크에 박힌 키
+_RESULT_TOKEN_TTL = 3600  # 1시간
+# token → {result, user_context, input_type, expires_at, user_id, chat_history}
+_result_tokens: dict[str, dict[str, Any]] = {}
+# 공개 URL — 1) env, 2) ngrok local API, 3) Tailscale Funnel 환경 추정 순서로 탐색
+_public_url_cache: dict[str, Any] = {"url": "", "expires": 0.0}
+
+
+def _get_public_base_url() -> str:
+    """결과 링크 베이스 URL 을 동적으로 조회. env 우선, 없으면 ngrok API 자동 탐색.
+
+    60초 캐시. ngrok 재시작 시에도 환경변수 따로 안 바꿔도 됨.
+    """
+    import time as _time
+    now = _time.time()
+    if now < _public_url_cache.get("expires", 0):
+        return _public_url_cache.get("url", "")
+
+    env = os.getenv("SCAMGUARDIAN_PUBLIC_URL", "").strip().rstrip("/")
+    url = env
+    if not url:
+        try:
+            import json as _json
+            import urllib.request as _ureq
+            with _ureq.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=1) as resp:
+                data = _json.loads(resp.read().decode())
+                for t in data.get("tunnels", []):
+                    pu = (t.get("public_url") or "").strip()
+                    if pu.startswith("https"):
+                        url = pu.rstrip("/")
+                        break
+        except Exception:
+            pass
+
+    _public_url_cache["url"] = url
+    _public_url_cache["expires"] = now + 60
+    return url
+
+# 사용자 발화 중 "그냥 분석 결과만 보내줘" 류로 컨텍스트 수집을 강제 종료할 신호
+_KAKAO_SKIP_PHRASES = {
+    "그냥 분석결과 보내줘",
+    "그냥 분석",
+    "그만 묻고 분석",
+    "건너뛰기",
+    "스킵",
+    "skip",
+}
+
+# 결과확인 동의어 — 정확 매칭 + 부분 매칭으로 폭넓게 인식
+_RESULT_REQUEST_EXACT = {
+    "결과확인", "결과 확인", "결과", "확인",
+}
+_RESULT_REQUEST_SUBSTRINGS = (
+    "결과확인", "결과 확인",
+    "결과 알려", "결과알려", "결과 좀", "결과좀",
+    "결과 보여", "결과보여", "결과 받", "결과받",
+    "결과 봐", "결과봐", "결과 줘", "결과줘",
+    "분석 다됐", "분석다됐", "분석 됐어", "분석됐어",
+    "분석 끝", "분석끝", "분석 결과", "분석결과",
+    "다 됐어", "다됐어", "다 끝났",
+)
+
+
+def _is_result_request(text: str) -> bool:
+    """사용자 발화가 결과 요청인지 판별. '결과확인' 외에 자연 표현도 폭넓게 인식."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s in _RESULT_REQUEST_EXACT:
+        return True
+    return any(p in s for p in _RESULT_REQUEST_SUBSTRINGS)
+
+# user_id → 상태 dict (구조는 _new_job_state 참조)
 _pending_jobs: dict[str, dict] = {}
+# 멀티 스레드/태스크에서 _pending_jobs 동시 수정 방지
+_jobs_lock = threading.Lock()
+# asyncio bg task 가 GC 되지 않도록 보관
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """asyncio bg task 를 등록하고 GC 방지를 위해 참조를 보관한다."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+def _new_job_state(
+    *,
+    source: str,
+    input_type: kakao_formatter.InputType,
+) -> dict[str, Any]:
+    import time as _time
+    return {
+        "status": "running",          # 결과확인 polling 호환: running/done/error
+        "phase": "collecting_context", # collecting_context/analyzing/done/error
+        "result": None,
+        "input_type": input_type,
+        "source": source,
+        "chat_history": [],            # list[ContextTurn]
+        "stt_done": False,
+        "stt_result": None,
+        "context_done": False,
+        "user_context": None,
+        "analyzing_started": False,
+        # 병렬 1차 분석 + 최종 합본 (refine) 관련
+        "result_ready_announced": False,  # 1차 결과 도착을 사용자에게 알렸는지
+        "done_notice_sent": False,         # 채팅 중 "분석 끝났어요" 안내를 한 번 띄웠는지
+        "refine_started": False,           # 최종 합본 분석 시작했는지
+        "refined": False,                  # 최종 합본 완료
+        "started_at": _time.time(),
+        "finished_at": None,
+        "error": None,
+    }
+
+
+def _cleanup_expired_result_tokens() -> None:
+    import time
+    now = time.time()
+    expired = [t for t, e in _result_tokens.items() if e.get("expires_at", 0) < now]
+    for t in expired:
+        del _result_tokens[t]
+
+
+def _issue_result_token(
+    *,
+    result: dict[str, Any],
+    user_context: dict[str, Any] | None,
+    input_type: kakao_formatter.InputType,
+    user_id: str | None,
+    chat_history: list[Any] | None = None,
+) -> tuple[str, str | None]:
+    """결과 상세 토큰 발급 + 공개 URL 반환. URL 은 SCAMGUARDIAN_PUBLIC_URL 미설정 시 None."""
+    import secrets
+    import time
+    _cleanup_expired_result_tokens()
+    token = secrets.token_urlsafe(16)
+    _result_tokens[token] = {
+        "result": result,
+        "user_context": user_context,
+        "input_type": input_type.value if hasattr(input_type, "value") else str(input_type),
+        "expires_at": time.time() + _RESULT_TOKEN_TTL,
+        "user_id": user_id,
+        "chat_history": [
+            {"role": getattr(t, "role", ""), "message": getattr(t, "message", "")}
+            for t in (chat_history or [])
+        ],
+    }
+    base = _get_public_base_url()
+    url = f"{base}/result/{token}" if base else None
+
+    # 어드민 라벨링 세션이 풀 컨텍스트(대화/사용자정보)를 보도록 DB 에 머지
+    run_id = (result or {}).get("analysis_run_id")
+    if run_id and repository.persistence_enabled():
+        try:
+            chat_dump = [
+                {"role": getattr(t, "role", ""), "message": getattr(t, "message", "")}
+                for t in (chat_history or [])
+            ]
+            partial = {}
+            if user_context:
+                partial["user_context"] = user_context
+            if chat_dump:
+                partial["chat_history"] = chat_dump
+            if partial:
+                repository.merge_run_metadata(run_id, partial)
+        except Exception as exc:
+            logging.getLogger("token").warning(
+                "metadata merge 실패 (run_id=%s): %s", run_id, exc,
+            )
+
+    return token, url
 
 
 def _cleanup_expired_jobs() -> None:
     import time
     now = time.time()
-    expired = [
-        uid for uid, job in _pending_jobs.items()
-        if job["status"] != "running" and (now - (job.get("finished_at") or now)) > _KAKAO_JOB_TTL
-    ]
-    for uid in expired:
-        del _pending_jobs[uid]
+    with _jobs_lock:
+        expired = [
+            uid for uid, job in _pending_jobs.items()
+            if job["status"] != "running" and (now - (job.get("finished_at") or now)) > _KAKAO_JOB_TTL
+        ]
+        for uid in expired:
+            del _pending_jobs[uid]
 
 
 async def _kakao_callback_task(
@@ -370,7 +580,14 @@ async def _kakao_callback_task(
             asyncio.to_thread(_kakao_run_pipeline, source, use_llm),
             timeout=_KAKAO_CALLBACK_TIMEOUT,
         )
-        result = kakao_formatter.format_result(report_dict, input_type)
+        # callback 모드도 자세히 보기 토큰 발급
+        _, _result_url = _issue_result_token(
+            result=report_dict,
+            user_context=None,
+            input_type=input_type,
+            user_id=None,
+        )
+        result = kakao_formatter.format_result(report_dict, input_type, result_url=_result_url)
         log.info(
             "callback 분석 완료:\n"
             "  scam_type: %s\n"
@@ -411,48 +628,568 @@ async def _kakao_callback_task(
     await asyncio.to_thread(_post)
 
 
-async def _kakao_poll_task(
+# ──────────────────────────────────
+# 컨텍스트 대화 + 병렬 STT 흐름 (폴링 모드 + 멀티턴)
+# ──────────────────────────────────
+
+
+def _kakao_transcribe_only(source: str) -> stt_module.TranscriptResult:
+    """STT 만 단독 수행. 별도 스레드에서 실행."""
+    return stt_module.transcribe(source)
+
+
+def _kakao_analyze_with_context(
+    source: str,
+    transcript_result: stt_module.TranscriptResult,
+    user_context: dict[str, Any] | None,
+    input_type: kakao_formatter.InputType,
+) -> dict[str, Any]:
+    """precomputed_transcript + user_context 로 Phase 2-5 분석 수행."""
+    pipeline = ScamGuardianPipeline()
+    report = pipeline.analyze(
+        source,
+        skip_verification=False,
+        use_llm=True,
+        use_rag=False,
+        precomputed_transcript=transcript_result,
+        user_context=user_context,
+    )
+    report_dict = report.to_dict()
+    report_dict["transcript_text"] = (
+        pipeline.last_transcript_result.text
+        if pipeline.last_transcript_result is not None
+        else source
+    )
+    if user_context:
+        report_dict["user_context"] = user_context
+    _persist_run(
+        pipeline,
+        AnalyzeRequest(
+            source=source,
+            skip_verification=False,
+            use_llm=True,
+            use_rag=False,
+        ),
+        source,
+        report_dict,
+        user_context=user_context,
+    )
+    return report_dict
+
+
+async def _async_maybe_trigger_analyze(user_id: str) -> None:
+    """STT 가 끝났으면 1차 분석을 곧바로 백그라운드에서 시작한다.
+
+    채팅(컨텍스트 수집)은 병렬로 계속 진행되고,
+    사용자 답변은 분석 완료 후 refine 단계에서 LLM 에 prior 로 합쳐진다.
+    """
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return
+        if job.get("status") == "error":
+            return
+        if not job.get("stt_done"):
+            return
+        if job.get("analyzing_started"):
+            return
+        job["analyzing_started"] = True
+        # phase 는 collecting_context 로 유지 — 채팅은 계속됨
+        source = job["source"]
+        input_type = job["input_type"]
+        transcript = job["stt_result"]
+
+    # 1차 분석은 user_context 없이 수행
+    await _kakao_analyze_only_task(user_id, source, input_type, transcript, None)
+
+
+async def _kakao_refine_text_task(
+    user_id: str,
+    transcript_text: str,
+    scam_type: str,
+    user_context: dict[str, Any],
+) -> None:
+    """최종 합본 분석: 1차 분석 결과 + 사용자 채팅 답변을 LLM 에 prior 로 주입해 reasoning 보강.
+
+    Serper 검증 / 분류 / 엔티티 추출은 본문만 보니 결과 동일 → 재호출하지 않는다.
+    Claude API 1회 추가 비용 (~5–10s) 으로 사용자 답변을 분석에 반영.
+    """
+    from pipeline import llm_assessor
+
+    log = logging.getLogger("kakao_refine")
+    log.info("최종 합본 분석 시작: user=%s scam_type=%s", user_id[:12], scam_type)
+    try:
+        new_unified = await asyncio.to_thread(
+            llm_assessor.analyze_unified,
+            transcript_text, scam_type, user_context,
+        )
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is None:
+                return
+            if job.get("result"):
+                # 보강된 LLM assessment 로 교체 (summary/reasoning 갱신)
+                job["result"]["llm_assessment"] = new_unified.assessment.to_dict()
+                # LLM 이 다른 스캠 유형 제안하면 적용
+                if new_unified.scam_type_suggestion is not None:
+                    new_type = new_unified.scam_type_suggestion.scam_type
+                    if new_type and new_type != job["result"].get("scam_type"):
+                        job["result"]["scam_type"] = new_type
+                        job["result"]["scam_type_reason"] = new_unified.scam_type_suggestion.reason
+            job["refined"] = True
+            # DB 에 refine 후 LLM assessment 도 메타데이터로 같이 보존
+            run_id_for_db = (job.get("result") or {}).get("analysis_run_id")
+        log.info("최종 합본 분석 완료: user=%s", user_id[:12])
+        if run_id_for_db and repository.persistence_enabled():
+            try:
+                repository.merge_run_metadata(run_id_for_db, {
+                    "refined_llm_assessment": new_unified.assessment.to_dict(),
+                })
+            except Exception as exc:
+                log.warning("refine metadata merge 실패: %s", exc)
+    except Exception as exc:
+        import traceback
+        log.error(
+            "최종 합본 실패: user=%s err=%s\n%s",
+            user_id[:12], exc, traceback.format_exc(),
+        )
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is not None:
+                job["refined"] = True  # 실패해도 무한 재시도 방지
+
+
+async def _kakao_stt_only_task(user_id: str, source: str) -> None:
+    """STT 만 백그라운드에서 수행. 끝나면 trigger 체크."""
+    import time
+
+    log = logging.getLogger("kakao_stt")
+    log.info("STT 시작: user=%s source=%s", user_id[:12], source[:80])
+    try:
+        transcript = await asyncio.wait_for(
+            asyncio.to_thread(_kakao_transcribe_only, source),
+            timeout=_KAKAO_POLL_TIMEOUT,
+        )
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is None:
+                return
+            job["stt_done"] = True
+            job["stt_result"] = transcript
+        log.info("STT 완료: user=%s len=%s", user_id[:12], len(transcript.text))
+    except Exception as exc:
+        import traceback
+        log.error(
+            "STT 실패: user=%s err=%s\n%s",
+            user_id[:12], exc, traceback.format_exc(),
+        )
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is None:
+                return
+            job["status"] = "error"
+            job["phase"] = "error"
+            job["error"] = exc
+            job["finished_at"] = time.time()
+        return
+
+    await _async_maybe_trigger_analyze(user_id)
+
+
+async def _kakao_analyze_only_task(
     user_id: str,
     source: str,
     input_type: kakao_formatter.InputType,
-    use_llm: bool = True,
+    transcript: stt_module.TranscriptResult,
+    user_context: dict[str, Any] | None,
 ) -> None:
-    """폴링 모드: 백그라운드에서 파이프라인을 실행하고 결과를 _pending_jobs에 저장한다."""
-    import logging
+    """Phase 2-5 만 백그라운드에서 수행. STT 결과 / user_context 사용."""
     import time
 
-    log = logging.getLogger("kakao_poll")
-    log.info("폴링 분석 시작: user=%s type=%s source=%s", user_id[:12], input_type.value, source[:80])
-
+    log = logging.getLogger("kakao_analyze")
+    log.info(
+        "분석 시작: user=%s type=%s ctx_turns=%s",
+        user_id[:12], input_type.value,
+        (user_context or {}).get("turn_count", 0),
+    )
     try:
         report_dict = await asyncio.wait_for(
-            asyncio.to_thread(_kakao_run_pipeline, source, use_llm),
+            asyncio.to_thread(
+                _kakao_analyze_with_context,
+                source, transcript, user_context, input_type,
+            ),
             timeout=_KAKAO_POLL_TIMEOUT,
         )
-        _pending_jobs[user_id] = {
-            "status": "done",
-            "result": report_dict,
-            "input_type": input_type,
-            "started_at": _pending_jobs.get(user_id, {}).get("started_at", time.time()),
-            "finished_at": time.time(),
-        }
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is None:
+                return
+            job["status"] = "done"
+            # phase 는 collecting_context 유지 — 사용자 채팅을 끊지 않음.
+            # phase 를 done 으로 바꾸지 않으면 사용자가 '결과확인' 누를 때까지
+            # _kakao_handle_context_answer 가 계속 다음 질문을 생성한다.
+            job["result"] = report_dict
+            job["finished_at"] = time.time()
         log.info(
-            "폴링 분석 완료: user=%s risk=%s/100 (%s)",
+            "분석 완료(채팅 계속): user=%s risk=%s/100 (%s)",
             user_id[:12],
             report_dict.get("total_score", "?"),
             report_dict.get("risk_level", "?"),
         )
     except Exception as exc:
         import traceback
-        log.error("폴링 분석 실패: user=%s error=%s\n%s", user_id[:12], exc, traceback.format_exc())
-        _pending_jobs[user_id] = {
-            "status": "error",
-            "result": None,
-            "error": exc,
-            "input_type": input_type,
-            "started_at": _pending_jobs.get(user_id, {}).get("started_at", time.time()),
-            "finished_at": time.time(),
-        }
+        log.error(
+            "분석 실패: user=%s err=%s\n%s",
+            user_id[:12], exc, traceback.format_exc(),
+        )
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is None:
+                return
+            job["status"] = "error"
+            job["phase"] = "error"
+            job["error"] = exc
+            job["finished_at"] = time.time()
+
+
+async def _kakao_start_context_collection(
+    user_id: str,
+    source: str,
+    input_type: kakao_formatter.InputType,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    """첫 입력 (TEXT/URL/VIDEO/FILE) 수신 → STT 시작 + 컨텍스트 첫 질문 응답.
+
+    TEXT 는 STT 가 패스스루이므로 즉시 stt_done 처리.
+    URL/VIDEO/FILE 은 STT 를 백그라운드로 돌린다.
+    """
+    log = logging.getLogger("kakao_ctx")
+
+    with _jobs_lock:
+        _pending_jobs[user_id] = _new_job_state(source=source, input_type=input_type)
+
+    if input_type == kakao_formatter.InputType.TEXT:
+        # TEXT 는 STT 가 패스스루 — 즉시 처리하고 1차 분석 백그라운드 시작.
+        # 사용자 답변은 채팅 누적 → 1차 완료 후 사용자 다음 메시지에 announce + refine.
+        try:
+            transcript = stt_module.transcribe(source)
+            with _jobs_lock:
+                job = _pending_jobs.get(user_id)
+                if job is not None:
+                    job["stt_done"] = True
+                    job["stt_result"] = transcript
+            # stt_done 세팅됐으니 trigger 가 1차 분석을 백그라운드로 시작
+            _spawn_bg(_async_maybe_trigger_analyze(user_id))
+        except Exception as exc:
+            log.error("TEXT passthrough 실패: %s", exc)
+            with _jobs_lock:
+                job = _pending_jobs.get(user_id)
+                if job is not None:
+                    job["status"] = "error"
+                    job["phase"] = "error"
+                    job["error"] = exc
+    else:
+        # URL/VIDEO/FILE — STT 백그라운드 시작. STT 완료 후 자동으로 1차 분석 트리거.
+        background_tasks.add_task(_kakao_stt_only_task, user_id, source)
+
+    # 첫 질문은 webhook 응답 전에 동기적으로 받아야 함.
+    # TEXT 의 경우 본문이 즉시 사용 가능 → Claude 가 본문 단서를 짚어가며 첫 질문
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        first_transcript_text: str | None = None
+        if job is not None and job.get("stt_result") is not None:
+            first_transcript_text = job["stt_result"].text
+    try:
+        first_turn = await asyncio.to_thread(
+            context_chat.next_turn, input_type.value, [], first_transcript_text,
+        )
+    except Exception as exc:
+        log.error("첫 질문 생성 실패: %s", exc, exc_info=True)
+        # 폴백: 컨텍스트 즉시 종료, STT 결과 기다림
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+            if job is not None:
+                job["context_done"] = True
+                job["user_context"] = None
+        _spawn_bg(_async_maybe_trigger_analyze(user_id))
+        return kakao_formatter.format_context_done_waiting(stt_done=False)
+
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return kakao_formatter.format_error(
+                kakao_formatter.ErrorCode.UNKNOWN, "세션이 사라졌습니다.",
+            )
+        job["chat_history"].append(
+            context_chat.ContextTurn(role="bot", message=first_turn.message)
+        )
+        if first_turn.is_done:
+            # 첫 턴부터 DONE 은 드물지만 — 컨텍스트 종료 처리
+            job["context_done"] = True
+            job["user_context"] = context_chat.summarize_for_pipeline(job["chat_history"])
+            stt_done = job["stt_done"]
+        else:
+            stt_done = None  # 아직 ASK 상태
+
+    if first_turn.is_done:
+        _spawn_bg(_async_maybe_trigger_analyze(user_id))
+        return kakao_formatter.format_context_done_waiting(stt_done=bool(stt_done))
+
+    return kakao_formatter.format_question(
+        first_turn.message, is_first_turn=True, input_type=input_type,
+    )
+
+
+async def _kakao_handle_context_answer(
+    user_id: str,
+    utterance: str,
+) -> dict[str, Any]:
+    """수집 중 사용자 답변 도착 → Claude 다음 액션 결정 → 응답."""
+    log = logging.getLogger("kakao_ctx")
+
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return kakao_formatter.format_no_job()
+        input_type = job["input_type"]
+        # 사용자 답변 추가 (저장 시점에 길이 제한)
+        user_turn = context_chat.ContextTurn(
+            role="user",
+            message=utterance[: context_chat.USER_ANSWER_MAX_CHARS],
+        )
+        job["chat_history"].append(user_turn)
+        history = list(job["chat_history"])
+        # STT 가 끝났으면 본문 텍스트도 함께 넘겨 Claude 가 본문 단서로 다음 질문 생성
+        transcript_text = (
+            job["stt_result"].text if job.get("stt_result") is not None else None
+        )
+
+    try:
+        next_action = await asyncio.to_thread(
+            context_chat.next_turn, input_type.value, history, transcript_text,
+        )
+    except Exception as exc:
+        log.error("Claude next_turn 실패 → DONE 폴백: %s", exc, exc_info=True)
+        next_action = context_chat.NextAction(
+            action="DONE",
+            message="알려주신 내용 잘 받았어요. 분석 결과 곧 알려드릴게요.",
+            reasoning=f"claude_error: {exc}",
+        )
+
+    # 1차 분석이 채팅 도중에 끝났으면 사용자에게 한 번 알려줌 (1회만)
+    notify_done = False
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return kakao_formatter.format_no_job()
+        if (
+            job.get("status") == "done"
+            and not job.get("done_notice_sent")
+            and not next_action.is_done
+        ):
+            notify_done = True
+            job["done_notice_sent"] = True
+            next_action = context_chat.NextAction(
+                action="ASK",
+                message=(
+                    next_action.message
+                    + "\n\n💡 참고로 분석은 끝났어요. "
+                    + "더 알려주실 게 있으면 답해주시고, "
+                    + "결과를 보시려면 '결과확인'을 누르거나 '결과 알려줘'라고 해주세요."
+                ),
+                reasoning=next_action.reasoning,
+            )
+        job["chat_history"].append(
+            context_chat.ContextTurn(role="bot", message=next_action.message)
+        )
+        if next_action.is_done:
+            job["context_done"] = True
+            job["user_context"] = context_chat.summarize_for_pipeline(job["chat_history"])
+            stt_done = job["stt_done"]
+        else:
+            stt_done = None
+
+    if next_action.is_done:
+        _spawn_bg(_async_maybe_trigger_analyze(user_id))
+        return kakao_formatter.format_context_done_waiting(stt_done=bool(stt_done))
+
+    if notify_done:
+        log.info("→ 분석 완료 안내 동봉: user=%s", user_id[:12])
+
+    return kakao_formatter.format_question(
+        next_action.message, is_first_turn=False, input_type=input_type,
+    )
+
+
+def _user_ctx_for_display(job: dict[str, Any]) -> dict[str, Any] | None:
+    """결과 카드에 보여줄 user_context — 우선 저장된 값, 없으면 chat_history 에서 즉석 요약."""
+    ctx = job.get("user_context")
+    if ctx is not None:
+        return ctx
+    history = job.get("chat_history") or []
+    if not history:
+        return None
+    return context_chat.summarize_for_pipeline(history)
+
+
+async def _handle_done_state(
+    user_id: str,
+    background_tasks: BackgroundTasks,
+    utterance: str | None = None,
+) -> dict[str, Any]:
+    """status=done 상태에서 사용자 메시지/결과확인 도착 시 처리.
+
+    - 첫 알림: announce + 답변 있으면 refine 트리거
+    - 이미 알림: refine 진행 중이면 still_running, refined 면 결과 반환
+
+    utterance 가 주어지면 알림 직전 chat_history 에 캡처해 refine 에 반영.
+    """
+    log = logging.getLogger("kakao_done")
+
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return kakao_formatter.format_no_job()
+
+        # 첫 알림 직전이라면 사용자의 마지막 발화도 chat_history 에 담아 refine 에 반영
+        if (
+            utterance
+            and not job.get("result_ready_announced", False)
+        ):
+            job["chat_history"].append(
+                context_chat.ContextTurn(
+                    role="user",
+                    message=utterance[: context_chat.USER_ANSWER_MAX_CHARS],
+                )
+            )
+
+        announced = job.get("result_ready_announced", False)
+        refine_started = job.get("refine_started", False)
+        refined = job.get("refined", False)
+        has_answers = any(
+            getattr(t, "role", None) == "user"
+            for t in job.get("chat_history", [])
+        )
+
+        if not announced:
+            # 첫 알림 — 이 순간부터 채팅 중단, refine/결과 폴링 모드로 전환
+            job["result_ready_announced"] = True
+            job["phase"] = "result_requested"
+            if has_answers and not refine_started:
+                # refine 트리거
+                job["refine_started"] = True
+                transcript_text = (
+                    job["stt_result"].text
+                    if job.get("stt_result") is not None
+                    else job.get("source", "")
+                )
+                user_ctx = _user_ctx_for_display(job) or {}
+                scam_type = job["result"].get("scam_type", "")
+                trigger_refine = True
+            else:
+                # 답변 없음 → 1차 결과 그대로 반환 + 잡 정리 + 토큰 발급
+                _, url = _issue_result_token(
+                    result=job["result"],
+                    user_context=_user_ctx_for_display(job),
+                    input_type=job["input_type"],
+                    user_id=user_id,
+                    chat_history=job.get("chat_history") or [],
+                )
+                result = kakao_formatter.format_result(
+                    job["result"], job["input_type"],
+                    user_context=_user_ctx_for_display(job),
+                    result_url=url,
+                )
+                _pending_jobs.pop(user_id, None)
+                return result
+
+            # announce 응답 (lock 밖에서 schedule)
+        elif refine_started and not refined:
+            return kakao_formatter.format_refining_in_progress()
+        elif refined:
+            _, url = _issue_result_token(
+                result=job["result"],
+                user_context=_user_ctx_for_display(job),
+                input_type=job["input_type"],
+                user_id=user_id,
+                chat_history=job.get("chat_history") or [],
+            )
+            result = kakao_formatter.format_result(
+                job["result"], job["input_type"],
+                user_context=_user_ctx_for_display(job),
+                result_url=url,
+            )
+            _pending_jobs.pop(user_id, None)
+            return result
+        else:
+            # 폴백: announced 인데 refine 없음 (대부분 이미 위에서 처리)
+            _, url = _issue_result_token(
+                result=job["result"],
+                user_context=_user_ctx_for_display(job),
+                input_type=job["input_type"],
+                user_id=user_id,
+                chat_history=job.get("chat_history") or [],
+            )
+            result = kakao_formatter.format_result(
+                job["result"], job["input_type"],
+                user_context=_user_ctx_for_display(job),
+                result_url=url,
+            )
+            _pending_jobs.pop(user_id, None)
+            return result
+
+    # 첫 알림 + refine 트리거 case
+    log.info("→ 결과 준비 완료 → announce + refine 트리거: user=%s", user_id[:12])
+    background_tasks.add_task(
+        _kakao_refine_text_task,
+        user_id, transcript_text, scam_type, user_ctx,
+    )
+    return kakao_formatter.format_result_ready_announce(has_refine=True)
+
+
+async def _kakao_force_skip_context(user_id: str) -> dict[str, Any]:
+    """사용자가 '그냥 분석결과 보내줘' 같은 신호 → 컨텍스트 강제 종료."""
+    with _jobs_lock:
+        job = _pending_jobs.get(user_id)
+        if job is None:
+            return kakao_formatter.format_no_job()
+        if job.get("status") == "error":
+            del _pending_jobs[user_id]
+            error_code = _classify_error(job.get("error") or Exception())
+            return kakao_formatter.format_error(error_code)
+        if job.get("status") == "done":
+            _, url = _issue_result_token(
+                result=job["result"],
+                user_context=_user_ctx_for_display(job),
+                input_type=job["input_type"],
+                user_id=user_id,
+                chat_history=job.get("chat_history") or [],
+            )
+            result = kakao_formatter.format_result(
+                job["result"], job["input_type"],
+                user_context=_user_ctx_for_display(job),
+                result_url=url,
+            )
+            del _pending_jobs[user_id]
+            return result
+        # collecting_context 또는 analyzing 중
+        already_analyzing = job.get("analyzing_started", False)
+        if job.get("phase") == "collecting_context":
+            job["context_done"] = True
+            if job.get("user_context") is None:
+                job["user_context"] = context_chat.summarize_for_pipeline(
+                    job["chat_history"]
+                )
+            stt_done = job["stt_done"]
+        else:
+            stt_done = job["stt_done"]
+
+    if already_analyzing:
+        # TEXT 즉시 병렬 모드 — 분석이 이미 돌고 있음. 결과 기다리기만 하면 됨
+        return kakao_formatter.format_still_running()
+
+    _spawn_bg(_async_maybe_trigger_analyze(user_id))
+    return kakao_formatter.format_context_done_waiting(stt_done=stt_done)
 
 
 @app.post("/webhook/kakao")
@@ -460,12 +1197,14 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     """
     카카오 오픈빌더 Skill Webhook 엔드포인트.
 
-    입력 유형을 자동 감지하여 분기 처리:
-    - 텍스트 → 즉시 분석 (callback 있으면 백그라운드)
-    - URL/영상 링크 → callback 필수, 다운로드+STT+분석
-    - 파일/영상 업로드 → callback 필수, STT+분석
+    분기 흐름:
+    - 도움말 / 결과확인 / 스킵 같은 특수 명령 우선 처리
+    - 진행 중 job 이 있으면 답변 또는 busy 처리 (멀티턴 컨텍스트 수집)
+    - 신규 입력:
+      - callbackUrl 있음 → 단발 callback 모드 (컨텍스트 수집 없음)
+      - URL/영상 + callback 없음 → 컨텍스트 수집 + 병렬 STT 시작
+      - 텍스트 → 즉시 동기 분석
     """
-    import logging
     log = logging.getLogger("kakao_webhook")
     EC = kakao_formatter.ErrorCode
     InputType = kakao_formatter.InputType
@@ -485,44 +1224,122 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         str(body.get("action", {}).get("params", {}))[:200],
     )
 
-    import time
-
     user_request = body.get("userRequest", {})
     utterance: str = (user_request.get("utterance") or "").strip()
     callback_url: str = (user_request.get("callbackUrl") or "").strip()
     action_params: dict = body.get("action", {}).get("params", {})
     user_id: str = (user_request.get("user", {}).get("id") or "").strip()
 
-    if not utterance or utterance in ("새로 분석하기", "시작", "처음", "사용법"):
-        log.info("→ 도움말 응답 반환")
+    # ── 특수 명령: 빈 메시지 = welcome (즉답) ──
+    if not utterance:
+        log.info("→ welcome 응답 반환 (빈 메시지)")
+        return kakao_formatter.format_welcome()
+    # ── 특수 명령: 사용법 (대화 중에도 escape 가능, 즉답) ──
+    if utterance in ("사용법", "도움말", "help", "?"):
+        log.info("→ 사용법 응답 반환 (특수 명령)")
         return kakao_formatter.format_help()
 
-    # ── '결과확인' 폴링 ──
-    if utterance == "결과확인":
+    # ── 특수 명령: 분석 초기화 — 진행 중 잡 정리하고 새로 시작 ──
+    if utterance in ("분석 초기화", "초기화", "리셋", "reset"):
+        had_job = False
+        if user_id:
+            with _jobs_lock:
+                had_job = user_id in _pending_jobs
+                _pending_jobs.pop(user_id, None)
+        log.info(
+            "→ 분석 초기화: user=%s had_job=%s",
+            user_id[:12] if user_id else "?", had_job,
+        )
+        return kakao_formatter.format_reset(had_active_job=had_job)
+
+    # ── 특수 명령: 결과확인 (자연 표현 동의어 포함) ──
+    # - collecting_context: 사용자가 종료 의사 표명 → 컨텍스트 강제 종료 + 분석 트리거
+    # - analyzing: 폴링
+    # - done/error: 결과/에러 반환
+    if _is_result_request(utterance):
         _cleanup_expired_jobs()
-        job = _pending_jobs.get(user_id)
-        log.info("→ 결과확인 요청: user=%s job=%s", user_id[:12] if user_id else "?", job and job.get("status"))
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+        log.info(
+            "→ 결과확인 요청: user=%s status=%s phase=%s",
+            user_id[:12] if user_id else "?",
+            job and job.get("status"),
+            job and job.get("phase"),
+        )
         if job is None:
             return kakao_formatter.format_no_job()
-        if job["status"] == "running":
-            return kakao_formatter.format_still_running()
-        if job["status"] == "error":
-            del _pending_jobs[user_id]
+        if job.get("status") == "error":
+            with _jobs_lock:
+                _pending_jobs.pop(user_id, None)
             error_code = _classify_error(job.get("error") or Exception())
             return kakao_formatter.format_error(error_code)
-        # done
-        result = kakao_formatter.format_result(job["result"], job["input_type"])
-        del _pending_jobs[user_id]
-        return result
+        if job.get("status") == "done":
+            return await _handle_done_state(user_id, background_tasks)
+        # running 상태에서 collecting_context 면 강제 종료 신호로 해석
+        if job.get("phase") == "collecting_context":
+            log.info("→ 결과확인 = 컨텍스트 강제 종료 신호로 해석")
+            return await _kakao_force_skip_context(user_id)
+        # analyzing 중이면 일반 폴링
+        return kakao_formatter.format_still_running()
 
+    # ── 특수 명령: 컨텍스트 수집 강제 종료 ──
+    if utterance in _KAKAO_SKIP_PHRASES and user_id:
+        log.info("→ 스킵 신호 수신: user=%s", user_id[:12])
+        with _jobs_lock:
+            has_job = user_id in _pending_jobs
+        if has_job:
+            return await _kakao_force_skip_context(user_id)
+        return kakao_formatter.format_no_job()
+
+    # ── 입력 감지 ──
     source, input_type = _kakao_detect_input(utterance, action_params)
     is_heavy = input_type in (InputType.URL, InputType.VIDEO, InputType.FILE)
+    log.info(
+        "입력 감지: type=%s, heavy=%s, source=%s",
+        input_type.value, is_heavy, source[:80],
+    )
 
-    log.info("입력 감지: type=%s, heavy=%s, source=%s", input_type.value, is_heavy, source[:80])
+    # ── 진행 중 job 처리 (callbackUrl 없는 폴링/멀티턴 모드 한정) ──
+    if user_id and not callback_url:
+        with _jobs_lock:
+            job = _pending_jobs.get(user_id)
+        if job is not None:
+            phase = job.get("phase")
+            status = job.get("status")
+            if status == "error":
+                with _jobs_lock:
+                    _pending_jobs.pop(user_id, None)
+                error_code = _classify_error(job.get("error") or Exception())
+                return kakao_formatter.format_error(error_code)
+            if status == "done":
+                # 1차 분석은 끝났지만 phase 가 collecting_context 면 사용자가 아직 채팅 중 →
+                # 결과 발표하지 말고 다음 질문 계속. 사용자가 명시적으로 '결과확인' 누를 때 announce.
+                if phase == "collecting_context":
+                    log.info(
+                        "→ 분석 완료 후에도 채팅 계속: user=%s (사용자가 결과확인 안 함)",
+                        user_id[:12],
+                    )
+                    return await _kakao_handle_context_answer(user_id, utterance)
+                # 그 외(예: refining 중에 사용자가 텍스트 입력) → 안내
+                return await _handle_done_state(user_id, background_tasks, utterance=utterance)
+            # running
+            if is_heavy:
+                # 진행 중인데 새 영상/URL → 거절
+                log.info("→ busy: 진행 중 job 있음, 새 영상 거절")
+                return kakao_formatter.format_busy()
+            if phase == "collecting_context":
+                # 답변으로 처리
+                log.info("→ 컨텍스트 답변 처리: user=%s", user_id[:12])
+                return await _kakao_handle_context_answer(user_id, utterance)
+            # analyzing 중에 텍스트 입력 → 진행 중 안내
+            return kakao_formatter.format_still_running()
 
-    # ── callbackUrl이 있으면: 무조건 callback 모드 ──
+    # ── callbackUrl 있으면: 단발 callback 모드 (컨텍스트 수집 없음) ──
     if callback_url:
-        log.info("→ callback 모드: 백그라운드 분석 시작, callbackUrl=%s", callback_url[:80])
+        log.info(
+            "→ callback 모드: 백그라운드 분석 시작, callbackUrl=%s",
+            callback_url[:80],
+        )
         msg = kakao_formatter.format_analyzing(input_type)
         background_tasks.add_task(
             _kakao_callback_task, source, callback_url, input_type, True,
@@ -535,40 +1352,45 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         log.info("→ 즉시 응답: %s", str(resp)[:200])
         return resp
 
-    # ── callbackUrl 없음, heavy 입력 → 폴링 모드 ──
+    # ── callbackUrl 없음, 무거운 입력 → 컨텍스트 수집 시작 ──
     if is_heavy:
         if not user_id:
-            log.warning("→ user_id 없음, 폴링 불가 → CALLBACK_REQUIRED 에러")
+            log.warning("→ user_id 없음, 컨텍스트 수집 불가 → CALLBACK_REQUIRED")
             return kakao_formatter.format_error(EC.CALLBACK_REQUIRED)
-        log.info("→ 폴링 모드: user=%s type=%s", user_id[:12], input_type.value)
-        _pending_jobs[user_id] = {
-            "status": "running",
-            "result": None,
-            "input_type": input_type,
-            "started_at": time.time(),
-            "finished_at": None,
-        }
-        background_tasks.add_task(_kakao_poll_task, user_id, source, input_type, True)
-        return kakao_formatter.format_queued(input_type)
-
-    # 텍스트: 동기 모드 (4.5초 타임아웃 가드)
-    log.info("→ 동기 모드: 텍스트 분석 시작 (4.5s 타임아웃)")
-    try:
-        report_dict = await asyncio.wait_for(
-            asyncio.to_thread(_kakao_run_pipeline, source, True),
-            timeout=4.5,
+        log.info(
+            "→ 컨텍스트 수집 모드 시작: user=%s type=%s",
+            user_id[:12], input_type.value,
         )
-        result = kakao_formatter.format_result(report_dict, InputType.TEXT)
-        log.info("→ 동기 분석 완료: risk=%s", report_dict.get("risk_level", "?"))
-        log.info("→ 응답: %s", str(result)[:300])
-        return result
-    except asyncio.TimeoutError:
-        log.warning("→ 동기 분석 타임아웃 (4.5s 초과)")
-        return kakao_formatter.format_error(EC.TIMEOUT)
-    except Exception as exc:
-        log.error("→ 동기 처리 실패: %s", exc)
-        error_code = _classify_error(exc)
-        return kakao_formatter.format_error(error_code, detail=str(exc))
+        return await _kakao_start_context_collection(
+            user_id, source, input_type, background_tasks,
+        )
+
+    # ── 텍스트: 의도 분류 → 분기 ──
+    # Claude Haiku 가 메시지를 보고 GREETING/HELP/CONTENT/ANALYZE_NO_CONTENT/CHAT 분류
+    # (짧고 명확한 인사·사용법은 keyword fast-path 로 즉답)
+    intent = await asyncio.to_thread(context_chat.classify_intent, source)
+    log.info("→ TEXT intent: %s", intent)
+
+    if intent == context_chat.INTENT_GREETING:
+        return kakao_formatter.format_welcome()
+    if intent == context_chat.INTENT_HELP:
+        return kakao_formatter.format_help()
+    if intent == context_chat.INTENT_ANALYZE_NO_CONTENT:
+        return kakao_formatter.format_ask_for_content(reason="analyze")
+    if intent == context_chat.INTENT_CHAT:
+        return kakao_formatter.format_ask_for_content(reason="chat")
+
+    # CONTENT (default) — 본문이 들어왔다고 판단 → 컨텍스트 수집 모드 시작
+    if not user_id:
+        log.warning("→ TEXT user_id 없음, 컨텍스트 수집 불가 → CALLBACK_REQUIRED")
+        return kakao_formatter.format_error(EC.CALLBACK_REQUIRED)
+    log.info(
+        "→ TEXT 컨텍스트 수집 모드 시작: user=%s len=%s",
+        user_id[:12], len(source),
+    )
+    return await _kakao_start_context_collection(
+        user_id, source, input_type, background_tasks,
+    )
 
 
 @app.post("/api/analyze")
@@ -718,9 +1540,8 @@ class ClaimRunRequest(BaseModel):
 async def admin_claim_run(run_id: str, payload: ClaimRunRequest) -> dict[str, Any]:
     try:
         _require_db()
-        if not payload.labeler.strip():
-            raise HTTPException(status_code=400, detail="labeler 이름을 입력해주세요.")
-        ok = await asyncio.to_thread(repository.claim_run, run_id, payload.labeler.strip())
+        labeler = payload.labeler.strip() or "Admin"
+        ok = await asyncio.to_thread(repository.claim_run, run_id, labeler)
         if not ok:
             raise HTTPException(status_code=409, detail="다른 검수자가 이미 작업 중입니다.")
         return {"ok": True}
@@ -799,13 +1620,15 @@ async def admin_save_annotation(run_id: str, payload: HumanAnnotationRequest) ->
         if run is None:
             raise HTTPException(status_code=404, detail="해당 run을 찾을 수 없습니다.")
 
+        # 검수자 이름 미입력 시 기본 'Admin'
+        labeler = (payload.labeler or "").strip() or "Admin"
         annotation = await asyncio.to_thread(
             repository.upsert_human_annotation,
             run_id=run_id,
             scam_type_gt=payload.scam_type_gt,
             entities_gt=payload.entities_gt,
             triggered_flags_gt=payload.triggered_flags_gt,
-            labeler=payload.labeler,
+            labeler=labeler,
             transcript_corrected_text=payload.transcript_corrected_text,
             stt_quality=payload.stt_quality,
             notes=payload.notes,

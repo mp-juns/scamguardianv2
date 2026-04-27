@@ -305,6 +305,31 @@ def save_analysis_run(
     return run_id
 
 
+def merge_run_metadata(run_id: str, partial: dict[str, Any]) -> None:
+    """기존 metadata 와 partial 을 머지. SQLite/Postgres 라우팅."""
+    if not partial:
+        return
+    if get_db_backend() == "sqlite":
+        sqlite_repository.merge_run_metadata(run_id, partial)
+        return
+    _ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT metadata FROM analysis_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return
+        current = row["metadata"] or {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(partial)
+        conn.execute(
+            "UPDATE analysis_runs SET metadata = %s WHERE id = %s",
+            (Jsonb(current), run_id),
+        )
+
+
 def save_transcript_embedding(run_id: str, embedding: list[float], model_name: str) -> None:
     if get_db_backend() == "sqlite":
         sqlite_repository.save_transcript_embedding(run_id, embedding, model_name)

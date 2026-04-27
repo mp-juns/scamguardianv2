@@ -12,6 +12,10 @@ OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 
 CONDA_ENV="${CONDA_ENV:-capstone}"
 ENABLE_FUNNEL="${ENABLE_FUNNEL:-true}"
+ENABLE_NGROK="${ENABLE_NGROK:-true}"
+NGROK_BIN="${NGROK_BIN:-$HOME/bin/ngrok}"
+NGROK_DOMAIN="${NGROK_DOMAIN:-}"  # 예약 도메인 있으면 지정, 없으면 매번 랜덤
+NGROK_API="http://127.0.0.1:4040/api/tunnels"
 
 echo "[start] root=$ROOT_DIR"
 echo "[start] logs=$LOG_DIR"
@@ -32,9 +36,11 @@ echo "[start] stopping previous processes..."
 kill_matches "uvicorn api_server:app"
 kill_matches "next-server"
 kill_matches "ollama serve"
+kill_matches "ngrok http"
 kill_port "$BACKEND_PORT"
 kill_port "$FRONTEND_PORT"
 kill_port "$OLLAMA_PORT"
+kill_port 4040
 
 sleep 0.5
 
@@ -61,9 +67,44 @@ if [[ "$ENABLE_FUNNEL" == "true" ]] && command -v tailscale >/dev/null 2>&1; the
   tailscale funnel status 2>/dev/null || true
 fi
 
+# 카카오 오픈빌더는 .ts.net 도메인을 거부하므로 ngrok 으로 보조 터널 제공
+NGROK_PUBLIC_URL=""
+if [[ "$ENABLE_NGROK" == "true" ]] && [[ -x "$NGROK_BIN" ]]; then
+  echo "[start] starting ngrok tunnel (frontend:$FRONTEND_PORT)..."
+  if [[ -n "$NGROK_DOMAIN" ]]; then
+    nohup "$NGROK_BIN" http "$FRONTEND_PORT" --domain="$NGROK_DOMAIN" --log=stdout \
+      >"$LOG_DIR/ngrok.log" 2>&1 &
+  else
+    nohup "$NGROK_BIN" http "$FRONTEND_PORT" --log=stdout \
+      >"$LOG_DIR/ngrok.log" 2>&1 &
+  fi
+  # ngrok 로컬 API 가 뜰 때까지 최대 5초 대기
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sS -m 1 "$NGROK_API" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  NGROK_PUBLIC_URL="$(curl -sS -m 2 "$NGROK_API" 2>/dev/null \
+    | python -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    urls=[t["public_url"] for t in d.get("tunnels",[]) if t.get("public_url","").startswith("https")]
+    print(urls[0] if urls else "")
+except Exception:
+    print("")' 2>/dev/null)"
+  if [[ -n "$NGROK_PUBLIC_URL" ]]; then
+    echo "[start] ngrok up: $NGROK_PUBLIC_URL"
+    echo "[start] kakao webhook URL: ${NGROK_PUBLIC_URL}/webhook/kakao"
+  else
+    echo "[start] ngrok 시작은 했지만 public URL 조회 실패. $LOG_DIR/ngrok.log 확인."
+  fi
+elif [[ "$ENABLE_NGROK" == "true" ]]; then
+  echo "[start] ENABLE_NGROK=true 지만 $NGROK_BIN 가 없음 — ngrok 스킵"
+fi
+
 echo "[start] done."
 echo "[start] tail logs:"
 echo "  tail -f \"$LOG_DIR/ollama.log\""
 echo "  tail -f \"$LOG_DIR/backend.log\""
 echo "  tail -f \"$LOG_DIR/frontend.log\""
+echo "  tail -f \"$LOG_DIR/ngrok.log\""
 

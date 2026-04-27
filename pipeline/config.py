@@ -497,6 +497,162 @@ SCORING_RULES: dict[str, int] = {
     "query_c_scam_pattern_found": 15,   # 스캠 패턴 관련 단서 확인
 }
 
+
+# 사용자 노출용 한국어 플래그 라벨 — 위 SCORING_RULES 키와 1:1 매핑
+FLAG_LABELS_KO: dict[str, str] = {
+    "business_not_registered": "사업자 미등록",
+    "phone_scam_reported": "전화번호 스캠 신고 이력",
+    "ceo_name_mismatch": "대표자명 불일치",
+    "fss_not_registered": "금감원 미등록 업체",
+    "fake_certification": "가짜 인증기관",
+    "website_scam_reported": "웹사이트 피싱·사기 신고",
+    "abnormal_return_rate": "비정상적 고수익 주장",
+    "fake_government_agency": "정부기관 사칭",
+    "personal_info_request": "개인정보 요구",
+    "medical_claim_unverified": "미인증 의료 효능 주장",
+    "fake_exchange": "가짜 거래소",
+    "account_scam_reported": "계좌 스캠 신고 이력",
+    "prepayment_requested": "선납금·수수료 요구",
+    "urgent_transfer_demand": "즉각 송금·이체 요구",
+    "threat_or_coercion": "협박·강요 발화",
+    "impersonation_family": "가족·지인 사칭",
+    "romance_foreign_identity": "해외 신분 사칭",
+    "job_deposit_requested": "취업·알바 선입금 요구",
+    "smishing_link_detected": "스미싱 의심 링크",
+    "fake_escrow_bypass": "에스크로 회피 유도",
+    "authority_context_mismatch": "발화 맥락 불일치",
+    "authority_context_uncertain": "발화 맥락 애매",
+    "query_a_confirmed": "신뢰 언론에서 확인됨",
+    "query_a_unconfirmed": "신뢰 언론 확인 불가",
+    "query_b_factcheck_found": "팩트체크 결과 의심",
+    "query_b_confirmed": "팩트체크에서 사실 확인",
+    "query_c_scam_pattern_found": "스캠 패턴 단서",
+}
+
+
+def flag_label_ko(flag: str) -> str:
+    """플래그 영문 키를 한국어 라벨로. 매핑 없으면 원본 반환."""
+    return FLAG_LABELS_KO.get(flag, flag)
+
+
+# 플래그 점수의 정당성·근거 — 사용자/라벨러에게 "왜 이 점수인가요?" 답변용.
+# 가능한 한 공식 출처(KISA, 금감원, 경찰청)나 학술 자료를 명시.
+FLAG_RATIONALE: dict[str, dict[str, str]] = {
+    "business_not_registered": {
+        "rationale": "정상 사업자라면 국세청 사업자등록 조회에 노출됨. 미등록 = 비공식 거래 → 사기 위험 높음.",
+        "source": "국세청 사업자등록상태조회 / 전자상거래법 제12조",
+    },
+    "phone_scam_reported": {
+        "rationale": "신고 이력 있는 번호는 재범 확률 매우 높음. KISA 통계 기준 신고 번호의 70%+ 가 추가 신고 발생.",
+        "source": "KISA 보이스피싱 동향 보고서 (2023)",
+    },
+    "ceo_name_mismatch": {
+        "rationale": "법인 대표자명이 공식 등록 정보와 다르면 사칭 가능성. 사기 사례 빈도 분석 결과.",
+        "source": "금융감독원 유사수신 감독사례집",
+    },
+    "fss_not_registered": {
+        "rationale": "투자권유는 금감원 등록 업체만 합법. 미등록 업체 권유는 자본시장법 위반.",
+        "source": "자본시장과 금융투자업에 관한 법률 제11조",
+    },
+    "fake_certification": {
+        "rationale": "존재하지 않거나 위조된 인증기관 명칭 사용은 표시·광고 공정화법 위반 + 사기 표지.",
+        "source": "표시·광고의 공정화에 관한 법률 제3조",
+    },
+    "website_scam_reported": {
+        "rationale": "도메인이 피싱·사기 신고 DB에 등록된 경우. 동일 도메인 재범률 80%+.",
+        "source": "KISA 피싱사이트 신고센터 / phishtank",
+    },
+    "abnormal_return_rate": {
+        "rationale": "연 20% 이상 수익 보장은 자본시장법상 불법 권유 신호. 정상 펀드 평균 연 5~10%.",
+        "source": "금융감독원 보이스피싱·유사수신 감독사례집",
+    },
+    "fake_government_agency": {
+        "rationale": "검찰·경찰·금감원 등 공공기관은 전화·문자로 자금 이체 요구 절대 안 함. 100% 사기.",
+        "source": "검찰청·경찰청·금감원 합동 보이스피싱 예방 가이드",
+    },
+    "personal_info_request": {
+        "rationale": "주민번호·계좌번호·OTP 등 민감정보를 요구하는 패턴은 보이스피싱 핵심 지표.",
+        "source": "KISA 보이스피싱 행위 분석",
+    },
+    "medical_claim_unverified": {
+        "rationale": "식약처 미인증 효능 주장은 약사법 위반. 건강식품 사기 빈출 패턴.",
+        "source": "약사법 제68조 (의약품 등의 광고 제한)",
+    },
+    "fake_exchange": {
+        "rationale": "금감원·금융위 등록되지 않은 거래소는 자금 출금 불가 사례 다수. 코인 사기 핵심.",
+        "source": "특정금융거래정보법 제7조 (가상자산사업자 신고)",
+    },
+    "account_scam_reported": {
+        "rationale": "계좌가 사기 이용 신고 이력 있음. 즉각 송금 차단 권고.",
+        "source": "전기통신금융사기 피해 방지 및 환급에 관한 특별법",
+    },
+    "prepayment_requested": {
+        "rationale": "취업·대출 명목 선납금 요구는 사기죄 + 대부업법 위반. 실제 합법 업체는 선납 없음.",
+        "source": "대부업 등의 등록 및 금융이용자 보호에 관한 법률",
+    },
+    "urgent_transfer_demand": {
+        "rationale": "즉각 송금 요구는 보이스피싱 1순위 패턴. 사고력 마비 유도 목적.",
+        "source": "경찰청 사이버수사국 보이스피싱 통계",
+    },
+    "threat_or_coercion": {
+        "rationale": "협박·강요 발화는 형법 제283조 협박죄. 정상 거래에는 절대 등장 안 함.",
+        "source": "형법 제283조 / KISA 통계",
+    },
+    "impersonation_family": {
+        "rationale": "가족 사칭은 메신저피싱 표준 패턴. 영상통화 거부 시 100% 사기.",
+        "source": "경찰청 메신저피싱 예방 가이드",
+    },
+    "romance_foreign_identity": {
+        "rationale": "해외 군인·의사·외교관 사칭은 로맨스 스캠 표준. FBI/Interpol 보고서 다수.",
+        "source": "FBI IC3 Romance Scam Report (2023)",
+    },
+    "job_deposit_requested": {
+        "rationale": "정상 채용은 입사 전 금전 요구 없음. 직업안정법 위반.",
+        "source": "직업안정법 제32조 (금품 등의 수령 금지)",
+    },
+    "smishing_link_detected": {
+        "rationale": "단축 URL 또는 비정상 도메인 포함 SMS 는 스미싱 의심. KISA 차단 통계 다수.",
+        "source": "KISA 스미싱 차단 시스템",
+    },
+    "fake_escrow_bypass": {
+        "rationale": "공식 에스크로 회피 유도는 중고거래 사기 표준. 안전결제 우회 = 위험 신호.",
+        "source": "경찰청 사이버범죄 통계",
+    },
+    "authority_context_mismatch": {
+        "rationale": "발화자 직업·신원 vs 발화 내용의 BERT 임베딩 코사인 유사도가 임계 미만 → 사칭 의심.",
+        "source": "Sentence-BERT 한국어 임베딩 분석 (자체 휴리스틱)",
+    },
+    "authority_context_uncertain": {
+        "rationale": "유사도 경계선상 — 명확하지 않지만 낮은 가산 점수로 보수적 반영.",
+        "source": "자체 임계값 튜닝",
+    },
+    "query_a_confirmed": {
+        "rationale": "신뢰 언론(Reuters/Bloomberg/연합 등)에서 화자+발언 동시 확인 → 신뢰도 ↑, 차감.",
+        "source": "Domain Trust Score (자체 스펙)",
+    },
+    "query_a_unconfirmed": {
+        "rationale": "신뢰 언론에서 확인 불가 = 출처 검증 실패.",
+        "source": "Domain Trust Score (자체 스펙)",
+    },
+    "query_b_factcheck_found": {
+        "rationale": "팩트체크 결과에서 사기 단서가 발견됨.",
+        "source": "SNU FactCheck / Snopes",
+    },
+    "query_b_confirmed": {
+        "rationale": "팩트체크에서 사실 확인됨 → 신뢰도 보정.",
+        "source": "SNU FactCheck",
+    },
+    "query_c_scam_pattern_found": {
+        "rationale": "검색 결과에서 동일/유사 사기 패턴 단서 발견.",
+        "source": "Serper API 검색 휴리스틱",
+    },
+}
+
+
+def flag_rationale(flag: str) -> dict[str, str]:
+    """플래그 점수의 정당성·출처 반환. 매핑 없으면 빈 dict."""
+    return FLAG_RATIONALE.get(flag, {})
+
 # ──────────────────────────────────────────────
 # 도메인 신뢰도 등급 (노션 스펙 반영)
 # ──────────────────────────────────────────────

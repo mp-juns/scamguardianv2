@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 로컬 DB / 인증서 / 테스트 스크래치 (2025-04-28 정리)
+.scamguardian/scamguardian.sqlite3
+.scamguardian/*.db
+*.tail*.crt
+*.tail*.key
+testing_script.txt

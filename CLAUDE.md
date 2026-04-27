@@ -74,8 +74,10 @@ python scripts/batch_ingest.py --dry-run
 | `SCAMGUARDIAN_PERSIST_RUNS` | 분석 결과 DB 저장 여부 | `false` |
 | `SCAMGUARDIAN_DATABASE_URL` | Postgres 연결 문자열 | (없으면 SQLite 사용) |
 | `SERPER_API_KEY` | 교차 검증용 Google 검색 API | 필수 (검증 활성 시) |
-| `ANTHROPIC_API_KEY` | LLM 보조 판정 + AI 초안 라벨링에 사용 | **필수** (`use_llm=True` 시) |
-| `ANTHROPIC_MODEL` | Claude 모델 | `claude-sonnet-4-6` |
+| `ANTHROPIC_API_KEY` | LLM 보조 판정 + AI 초안 라벨링 + 컨텍스트 수집 챗봇 + 의도 분류 | **필수** |
+| `ANTHROPIC_MODEL` | Claude 메인 분석 모델 | `claude-sonnet-4-6` |
+| `ANTHROPIC_HAIKU_MODEL` | 컨텍스트 챗봇 + 의도 분류 모델 | `claude-haiku-4-5-20251001` |
+| `SCAMGUARDIAN_PUBLIC_URL` | 결과 상세 페이지 베이스 URL (없으면 ngrok 자동 발견) | (없음) |
 | `OPENAI_API_KEY` | OpenAI Whisper API 키 | 없으면 로컬 Whisper 사용 |
 | `SCAMGUARDIAN_CORS_ORIGINS` | 허용 CORS 오리진 (콤마 구분) | `http://localhost:3000,...` |
 | `SERPER_MAX_CONCURRENT` | Serper API 동시 호출 수 | `3` |
@@ -151,16 +153,17 @@ Phase 5: 스코어링
 
 | 파일 | 역할 | 핵심 함수/클래스 |
 |------|------|----------------|
-| `runner.py` | 전체 파이프라인 오케스트레이터 | `ScamGuardianPipeline.analyze()` |
+| `runner.py` | 전체 파이프라인 오케스트레이터 | `ScamGuardianPipeline.analyze(source, ..., precomputed_transcript, user_context)` |
 | `stt.py` | 음성→텍스트 변환 | `transcribe(source)` → `TranscriptResult` |
 | `classifier.py` | 스캠 유형 분류 | `classify(text)` → `ClassificationResult` |
 | `extractor.py` | 엔티티 추출 | `extract(text, scam_type)` → `list[Entity]` |
 | `verifier.py` | Serper API 교차검증 | `verify(entities, scam_type)` → `list[VerificationResult]` |
 | `rag.py` | 유사 사례 벡터 검색 | `retrieve_similar_runs(embedding, k)` |
-| `llm_assessor.py` | Claude API 보조 판정 | `analyze_unified(text, scam_type)` → `UnifiedLLMResult`, `assess()` / `suggest_scam_type()` (레거시) |
+| `llm_assessor.py` | Claude API 보조 판정 | `analyze_unified(text, scam_type, user_context)` → `UnifiedLLMResult` |
 | `scorer.py` | 플래그 합산 → 점수/레벨 | `score(verification_results, ...)` → `ScamReport` |
-| `config.py` | 스캠 유형·플래그·점수 규칙 정의 | `SCORING_RULES`, `RISK_LEVELS`, `get_runtime_scam_taxonomy()` |
-| `kakao_formatter.py` | ScamReport → 카카오 챗봇 응답 JSON | `format_result(report, input_type)`, `format_error(code, detail)` |
+| `config.py` | 스캠 유형·플래그·점수·라벨·근거 정의 | `SCORING_RULES`, `FLAG_LABELS_KO`, `FLAG_RATIONALE`, `RISK_LEVELS` |
+| `kakao_formatter.py` | ScamReport → 카카오 응답 JSON | `format_result()`, `format_question()`, `format_welcome()`, `format_reset()`, `format_result_ready_announce()` |
+| `context_chat.py` | 카카오 챗봇 컨텍스트 수집 + 의도 분류 | `next_turn(input_type, history, transcript_text)`, `classify_intent(utterance)`, `summarize_for_pipeline()` |
 | `claude_labeler.py` | 라벨링 초안 자동 생성 | `generate_draft(transcript, ...)` |
 | `eval.py` | 예측 vs 정답 라벨 비교 | `evaluate_annotated_runs(records)` |
 
@@ -187,45 +190,75 @@ Phase 5: 스코어링
 
 ### 카카오톡 챗봇 웹훅 (`/webhook/kakao`)
 
-카카오 오픈빌더 Skill 엔드포인트. 입력 유형을 자동 감지(`_kakao_detect_input()`)하여 분기 처리:
+카카오 오픈빌더 Skill 엔드포인트. **컨텍스트 수집 멀티턴 + 병렬 분석 + 1.5-pass refine** 흐름.
 
-#### 입력 감지 로직
+#### 입력 감지 + 의도 분류
 
-`_kakao_detect_input(utterance, action_params)` → `(source, InputType)`:
+`_kakao_detect_input()` → `(source, InputType)`: action.params 확인 → utterance URL → TEXT.
 
-1. `action.params`에서 `video`/`file`/`video_url`/`attachment` 키 확인 → `VIDEO` 또는 `FILE`
-2. utterance 전체가 URL → `URL`
-3. utterance 안에 URL 포함 → `URL` (URL 부분 추출)
-4. 그 외 → `TEXT`
+**TEXT 입력은 추가로 `context_chat.classify_intent()`로 의도 분류** (Claude Haiku, fast-path 우선):
+- `GREETING` → format_welcome
+- `HELP` → format_help
+- `CONTENT` → 컨텍스트 수집 모드 시작 (긴 텍스트는 fast-path, LLM 호출 X)
+- `ANALYZE_NO_CONTENT` → "분석할 내용 보여주세요" 응답
+- `CHAT` → "어떤 일이세요? 보내주시면 살펴볼게요" 응답
 
-#### 입력 유형별 처리
+#### 컨텍스트 수집 + 병렬 분석 (모든 입력 유형 공통)
 
-| 입력 유형 | callbackUrl 있음 | callbackUrl 없음 |
-|-----------|------------------|-------------------|
-| `TEXT` | 비동기 callback 분석 | 동기 분석 (4.5초 타임아웃) |
-| `URL` | 비동기 callback (STT+분석) | 폴링 모드: 즉시 "분석 시작" 응답 후 백그라운드 실행 |
-| `VIDEO`/`FILE` | 비동기 callback (STT+분석) | 폴링 모드: 즉시 "분석 시작" 응답 후 백그라운드 실행 |
+```
+사용자가 콘텐츠 보냄 (TEXT/URL/VIDEO/FILE)
+   ├─ 1차 분석 백그라운드 시작 (TEXT 즉시 / URL/영상은 STT 후)
+   └─ 첫 질문 즉답 (Claude 호출 없는 static Q1, 응답 ~50ms)
+         "📩 받았어요! 🔍 분석 시작했어요. 그 동안 정보 좀 여쭤볼게요"
 
-#### 폴링 모드 흐름 (callbackUrl 없을 때)
+사용자 답변 ↔ 봇이 본문 단서 짚어가며 능동 질문 (Q2부터 Claude Haiku, 1~3s)
+   - context_chat.next_turn(input_type, history, transcript_text) 호출
+   - Claude는 본문 + 누적 대화 모두 보고 다음 질문 생성
 
-1. 사용자가 URL/영상 전송 → 즉시 "분석 시작됨, '결과확인' 입력하세요" 응답
-2. 서버에서 `_pending_jobs[user_id]`에 상태 저장하며 백그라운드 파이프라인 실행
-3. 사용자가 `결과확인` 입력:
-   - `running` → "아직 분석 중입니다" 응답 (quick reply로 재확인 유도)
-   - `done` → 결과 카드 반환 후 job 삭제
-   - `error` → 에러 메시지 반환 후 job 삭제
-   - 없음 → "진행 중인 분석 없음" 안내
-- `user_id`: `userRequest.user.id`로 사용자 식별 (없으면 CALLBACK_REQUIRED 에러 폴백)
-- job TTL: 완료 후 10분(`_KAKAO_JOB_TTL`), 최대 대기 10분(`_KAKAO_POLL_TIMEOUT`)
+[1차 분석 백그라운드에서 완료] — phase 는 collecting_context 유지, 사용자에게 알리지 않음
+   - 사용자 다음 답변에 "💡 분석은 끝났어요. '결과확인'을 누르거나 '결과 알려줘' 라고 해주세요" 자동 부착 (1회만)
 
-#### 유형별 응답 포맷
+사용자가 결과 요청 (`결과확인` / `결과 알려줘` / `분석 다됐어?` 등 자연 표현 인식)
+   → "🎉 분석 완료! 정보 반영해 정리 중" + refine 트리거 (LLM phase만 user_context와 재호출, ~5-10s)
+   → phase 를 result_requested 로 잠금, 채팅 종료
 
-`kakao_formatter.py`가 `InputType`에 따라 다른 카드를 생성:
+[refine 완료]
+사용자 결과확인 다시 누르면
+   → 결과 카드 + "자세한 결과 보기" webLink 버튼 + 잡 정리
+```
 
-- **TEXT**: `💬 텍스트 분석` — 스캠 유형, 플래그, 엔티티
-- **URL**: `🔗 URL/영상 분석` — 위 항목 + 음성 전사(STT) 미리보기 (150자)
-- **VIDEO**: `🎬 업로드 영상 분석` — 위 항목 + STT 미리보기
-- **FILE**: `📎 파일 분석` — 위 항목 + STT 미리보기
+#### 잡 상태 (`_pending_jobs[user_id]`)
+
+| 필드 | 의미 |
+|------|------|
+| `status` | `running` / `done` / `error` |
+| `phase` | `collecting_context` (채팅 가능) / `result_requested` (정리 중) / `error` |
+| `chat_history` | 봇/사용자 발화 시간순 (refine 의 user_context 소스) |
+| `stt_done`, `stt_result` | STT 완료 + TranscriptResult |
+| `analyzing_started` | 1차 분석 트리거됐는지 |
+| `result_ready_announced` | 첫 알림(🎉 완료) 한 번 됐는지 |
+| `done_notice_sent` | 채팅 중 "분석 끝남" 안내 한 번 부착했는지 |
+| `refine_started`, `refined` | 최종 합본 단계 |
+| `result`, `user_context` | 최종 산출물 |
+
+`_jobs_lock` (threading.Lock) 으로 다중 사용자 동시 접속 race 방지. 사용자별 `userRequest.user.id` 키로 격리.
+
+#### 응답 포맷 (`kakao_formatter.py`)
+
+핵심 포맷터:
+- `format_welcome()`: 첫 인사 ("안녕하세요! 어떤 일로 오셨어요?")
+- `format_help()`: 사용법 안내
+- `format_question(question, is_first_turn, input_type)`: 챗봇 질문 (intro + 본문)
+- `format_ask_for_content(reason)`: ANALYZE_NO_CONTENT/CHAT 응답
+- `format_result(report, input_type, user_context, result_url)`: 최종 결과 카드 + webLink
+- `format_result_ready_announce(has_refine)`: 🎉 완료 알림
+- `format_refining_in_progress()`: 정리 중 폴링 응답
+- `format_reset(had_active_job)`: 분석 초기화 응답
+- `format_busy()`: 진행 중인데 새 영상 보냈을 때 거절
+
+**플래그는 모두 한국어 라벨**로 표시: `flag_label_ko()` (FLAG_LABELS_KO 27종 매핑).
+
+**모든 응답에 동일 퀵 리플라이 두 개**: `사용법` / `분석 초기화`.
 
 #### 에러 처리 시스템
 
@@ -255,23 +288,47 @@ Phase 5: 스코어링
 - 스킬 서버 주소: Tailscale Funnel (`https://scamguardian.tail7e5dfc.ts.net/webhook/kakao`) 또는 ngrok 터널 사용
 - **참고**: 카카오 오픈빌더에서 Tailscale `.ts.net` 도메인 접속이 불안정할 수 있음. ngrok 권장: `~/bin/ngrok http 3100`
 
+### 결과 상세 페이지 (공개) + 토큰 (`/result/[token]`)
+
+카카오 카드의 "자세한 결과 보기" 버튼 → 1시간 유효 토큰 기반 공개 페이지.
+
+- 토큰 발급: `_issue_result_token()` (api_server.py) — `secrets.token_urlsafe(16)`, 메모리 저장 (`_result_tokens`)
+- TTL: `_RESULT_TOKEN_TTL = 3600` (1시간)
+- 공개 URL 베이스: `_get_public_base_url()` — env(`SCAMGUARDIAN_PUBLIC_URL`) 우선, 없으면 ngrok 로컬 API(`127.0.0.1:4040`) 자동 발견 (60초 캐시)
+- 백엔드 엔드포인트: `GET /api/result/{token}` → result + user_context + chat_history + flag_rationale + expires_at
+- 프론트: `apps/web/src/app/result/[token]/page.tsx` — Tailwind, 서버 컴포넌트
+- 섹션: 위험도 배지 / AI 요약 / 사용자 제공 정보(fuchsia 강조) / 점수 산정 방식(합산식 + 등급 테이블 + 플래그별 근거·출처) / 발동 플래그 상세 / 추출 엔티티 / 입력 본문(접기) / 챗봇 대화 전체(접기) / 만료 안내
+
+### 플래그 점수 정당성 (`pipeline/config.py:FLAG_RATIONALE`)
+
+각 플래그 점수의 근거 + 출처 매핑 (27종). 결과 페이지에서 "왜 이 점수?" 답변용.
+
+예:
+- `abnormal_return_rate` → "연 20% 이상 수익 보장은 자본시장법상 불법 권유 신호" / 금융감독원 유사수신 감독사례집
+- `urgent_transfer_demand` → "즉각 송금 요구는 보이스피싱 1순위 패턴" / 경찰청 사이버수사국 통계
+- `fake_government_agency` → "공공기관은 전화·문자로 자금 이체 요구 절대 안 함. 100% 사기" / 검찰청·경찰청·금감원 합동 가이드
+
 ### 어드민 라벨링 흐름
 
 ```
 /admin (큐 리스트)
   ├─ GET /api/admin/runs/list      미완료·진행중·완료 필터링, claimed_by 표시
-  ├─ POST /api/admin/runs/{id}/claim  검수자 이름으로 claim (30분 TTL, 충돌 시 409)
+  ├─ POST /api/admin/runs/{id}/claim  검수자 이름 (미입력 시 "Admin" 기본)
   └─ GET /api/admin/metrics        per_labeler 통계 + needs_review 목록
 
 /admin/[runId] (에디터)
-  ├─ GET /api/admin/runs/{id}      run 상세 + 기존 annotation
-  ├─ POST /api/admin/runs/{id}/ai-draft   Claude API로 라벨링 초안 생성 (claude_labeler.py)
-  └─ POST /api/admin/runs/{id}/annotations  정답 upsert
+  ├─ GET /api/admin/runs/{id}      run 상세 + metadata + 기존 annotation
+  ├─ POST /api/admin/runs/{id}/ai-draft   Claude API로 라벨링 초안 생성
+  └─ POST /api/admin/runs/{id}/annotations  정답 upsert (labeler 미입력 시 "Admin")
 ```
 
 - `AdminRunEditor.tsx`: 예측값을 초기값으로 표시, 정답이 있으면 덮어쓰기
-- AI 초안은 별도 fuchsia 섹션에 표시 → "초안 전체 적용" 버튼으로 폼에 덮어쓰기
+- AI 초안은 fuchsia 섹션에 표시 → "초안 전체 적용" 버튼으로 폼에 덮어쓰기
 - 저장된 엔티티/플래그에 `source: "ai-draft"` 태깅
+- **풀 컨텍스트 노출** (라벨링 정확도 ↑):
+  - `metadata.user_context.qa_pairs` — 사용자가 챗봇과 나눈 Q&A 페어 (fuchsia 섹션)
+  - `metadata.chat_history` — 봇/사용자 발화 시간순 전체 (펼치기/접기)
+  - 카카오 결과 토큰 발급/refine 완료 시점에 `repository.merge_run_metadata()` 로 DB 보존
 
 ### 라벨링 품질 관리 (`pipeline/eval.py`)
 

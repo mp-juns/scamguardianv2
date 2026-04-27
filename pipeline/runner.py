@@ -170,6 +170,8 @@ class ScamGuardianPipeline:
         skip_verification: bool = False,
         use_llm: bool = False,
         use_rag: bool = False,
+        precomputed_transcript: stt.TranscriptResult | None = None,
+        user_context: dict[str, Any] | None = None,
     ) -> ScamReport:
         """
         전체 분석 파이프라인을 실행한다.
@@ -177,7 +179,9 @@ class ScamGuardianPipeline:
         Args:
             source: YouTube URL, 로컬 파일 경로, 또는 텍스트
             skip_verification: True이면 Serper API 검증 단계를 건너뜀 (테스트용)
-            use_llm: True이면 Ollama 기반 보조 판정을 추가 수행
+            use_llm: True이면 Claude 기반 보조 판정을 추가 수행
+            precomputed_transcript: 외부에서 미리 STT 한 결과. 있으면 Phase 1 스킵.
+            user_context: 챗봇 대화로 모은 사용자 제보 dict (Phase 3 LLM 에 prior 로 주입)
 
         Returns:
             ScamReport 객체
@@ -198,11 +202,21 @@ class ScamGuardianPipeline:
         )
 
         # ════════════════════════════════
-        # Phase 1: STT
+        # Phase 1: STT (precomputed_transcript 있으면 스킵)
         # ════════════════════════════════
-        print("[Phase 1] STT 처리 중...")
-        print(f"      → 입력: {source[:80]}{'…' if len(source) > 80 else ''}")
-        transcript = self.transcribe(source)
+        if precomputed_transcript is not None:
+            print("[Phase 1] STT 스킵 (precomputed_transcript 사용)")
+            transcript = precomputed_transcript
+            self.last_transcript_result = transcript
+            self._log_step(
+                "STT",
+                pipeline_start,  # 0 ms 로 기록되도 무방
+                {"source_type": transcript.source_type, "text_length": len(transcript.text), "precomputed": True},
+            )
+        else:
+            print("[Phase 1] STT 처리 중...")
+            print(f"      → 입력: {source[:80]}{'…' if len(source) > 80 else ''}")
+            transcript = self.transcribe(source)
         text = transcript.text
         preview = text[:100] + "…" if len(text) > 100 else text
         print(f"      ← 결과: {transcript.source_type} | {len(text)}자")
@@ -236,7 +250,9 @@ class ScamGuardianPipeline:
             return self.extract(text, classification.scam_type)
 
         def _task_llm_unified():
-            return llm_assessor.analyze_unified(text, classification.scam_type)
+            return llm_assessor.analyze_unified(
+                text, classification.scam_type, user_context=user_context,
+            )
 
         def _task_rag():
             return self.retrieve_similar_cases(text, classification.scam_type)
