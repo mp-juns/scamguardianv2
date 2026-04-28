@@ -166,6 +166,16 @@ def _call_claude(
     )
     elapsed = time.time() - t0
     raw = message.content[0].text
+    try:
+        from platform_layer import cost as _cost
+        _cost.record_claude(
+            model,
+            int(getattr(message.usage, "input_tokens", 0) or 0),
+            int(getattr(message.usage, "output_tokens", 0) or 0),
+            action="context_chat.next_turn",
+        )
+    except Exception:
+        pass
     print(f"    [ContextChat] ← {len(raw)}자 ({elapsed:.1f}s)")
     return _parse_json(raw)
 
@@ -314,6 +324,16 @@ def classify_intent(utterance: str) -> str:
         )
         elapsed = time.time() - t0
         raw = message.content[0].text
+        try:
+            from platform_layer import cost as _cost
+            _cost.record_claude(
+                model,
+                int(getattr(message.usage, "input_tokens", 0) or 0),
+                int(getattr(message.usage, "output_tokens", 0) or 0),
+                action="context_chat.classify_intent",
+            )
+        except Exception:
+            pass
         parsed = _parse_json(raw)
         intent = str(parsed.get("intent", "")).strip().upper()
         print(f"    [Intent] ← {intent} ({elapsed:.1f}s)")

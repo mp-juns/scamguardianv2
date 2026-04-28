@@ -145,13 +145,19 @@ def _vt_request(method: str, path: str, **kwargs) -> requests.Response:
     headers = kwargs.pop("headers", {}) or {}
     headers["x-apikey"] = key
     _rate_limit_acquire()
-    return requests.request(
+    resp = requests.request(
         method,
         f"{VT_API_BASE}{path}",
         headers=headers,
         timeout=VT_TIMEOUT,
         **kwargs,
     )
+    try:
+        from platform_layer import cost as _cost
+        _cost.record_virustotal(1, action=f"{method} {path}")
+    except Exception:
+        pass
+    return resp
 
 
 # ──────────────────────────────────

@@ -102,6 +102,53 @@ def init_db() -> None:
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs(created_at DESC)",
+        # ── v3 platform: API key + cost ledger + request log ──
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            key_hash TEXT NOT NULL UNIQUE,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            monthly_quota INTEGER NOT NULL DEFAULT 1000,
+            rpm_limit INTEGER NOT NULL DEFAULT 30,
+            monthly_usd_quota REAL NOT NULL DEFAULT 5.0,
+            status TEXT NOT NULL DEFAULT 'active',
+            usage_total INTEGER NOT NULL DEFAULT 0,
+            usage_month INTEGER NOT NULL DEFAULT 0,
+            usage_month_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cost_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            request_id TEXT,
+            api_key_id TEXT,
+            provider TEXT NOT NULL,
+            action TEXT NOT NULL,
+            units REAL NOT NULL,
+            usd_amount REAL NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cost_events_created_at ON cost_events(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_cost_events_api_key ON cost_events(api_key_id)",
+        """
+        CREATE TABLE IF NOT EXISTS request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            api_key_id TEXT,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            error TEXT,
+            extra TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_request_log_created_at ON request_log(created_at DESC)",
     ]
 
     with _connect() as conn:
@@ -111,6 +158,14 @@ def init_db() -> None:
         for col, col_type in [("claimed_by", "TEXT"), ("claimed_at", "TEXT")]:
             try:
                 conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+        # v3 platform: api_keys 마이그레이션 (이미 있으면 무시)
+        for col, col_type in [
+            ("monthly_usd_quota", "REAL NOT NULL DEFAULT 5.0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE api_keys ADD COLUMN {col} {col_type}")
             except sqlite3.OperationalError:
                 pass
         conn.commit()
@@ -827,4 +882,277 @@ def search_similar_annotated_runs(
 
     results.sort(key=lambda item: item["distance"])
     return results[:limit]
+
+
+# ──────────────────────────────────
+# v3 platform: API key + cost ledger + request log
+# ──────────────────────────────────
+def _month_key(iso: str) -> str:
+    return iso[:7]  # "YYYY-MM"
+
+
+def create_api_key(
+    *,
+    label: str,
+    key_hash: str,
+    monthly_quota: int = 1000,
+    rpm_limit: int = 30,
+    monthly_usd_quota: float = 5.0,
+) -> dict[str, Any]:
+    init_db()
+    key_id = uuid.uuid4().hex[:16]
+    now = _now_iso()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO api_keys (id, key_hash, label, created_at, monthly_quota, rpm_limit, monthly_usd_quota, status, usage_total, usage_month, usage_month_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, 0, ?)
+            """,
+            (key_id, key_hash, label, now, monthly_quota, rpm_limit, monthly_usd_quota, _month_key(now)),
+        )
+    return {
+        "id": key_id,
+        "label": label,
+        "monthly_quota": monthly_quota,
+        "rpm_limit": rpm_limit,
+        "monthly_usd_quota": monthly_usd_quota,
+        "status": "active",
+        "created_at": now,
+    }
+
+
+def get_monthly_usd_for_key(key_id: str) -> float:
+    """이번 달 누적 USD 비용. cost_events 에서 같은 month 의 합."""
+    init_db()
+    now = _now_iso()
+    month_prefix = _month_key(now)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(usd_amount), 0) AS total FROM cost_events WHERE api_key_id = ? AND substr(created_at, 1, 7) = ?",
+            (key_id, month_prefix),
+        ).fetchone()
+    return float(row["total"] or 0)
+
+
+def get_api_key_by_hash(key_hash: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,)
+        ).fetchone()
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
+
+
+def list_api_keys(limit: int = 100) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, label, created_at, last_used_at, monthly_quota, rpm_limit, status, usage_total, usage_month, usage_month_at FROM api_keys ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{k: r[k] for k in r.keys()} for r in rows]
+
+
+def revoke_api_key(key_id: str) -> bool:
+    init_db()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE api_keys SET status = 'revoked' WHERE id = ?",
+            (key_id,),
+        )
+        return cur.rowcount > 0
+
+
+def touch_api_key_usage(key_id: str) -> dict[str, Any] | None:
+    """호출 1건 기록 — usage_total/month 증가, last_used_at 갱신."""
+    init_db()
+    now = _now_iso()
+    month = _month_key(now)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT monthly_quota, usage_month, usage_month_at, status FROM api_keys WHERE id = ?",
+            (key_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] != "active":
+            return {"status": row["status"], "remaining_month": 0}
+        if row["usage_month_at"] != month:
+            conn.execute(
+                "UPDATE api_keys SET usage_month = 1, usage_month_at = ?, usage_total = usage_total + 1, last_used_at = ? WHERE id = ?",
+                (month, now, key_id),
+            )
+            usage_month = 1
+        else:
+            conn.execute(
+                "UPDATE api_keys SET usage_month = usage_month + 1, usage_total = usage_total + 1, last_used_at = ? WHERE id = ?",
+                (now, key_id),
+            )
+            usage_month = row["usage_month"] + 1
+        return {
+            "status": "active",
+            "monthly_quota": row["monthly_quota"],
+            "usage_month": usage_month,
+            "remaining_month": max(0, row["monthly_quota"] - usage_month),
+        }
+
+
+def insert_cost_event(
+    *,
+    request_id: str | None,
+    api_key_id: str | None,
+    provider: str,
+    action: str,
+    units: float,
+    usd_amount: float,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO cost_events (created_at, request_id, api_key_id, provider, action, units, usd_amount, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _now_iso(),
+                request_id,
+                api_key_id,
+                provider,
+                action,
+                float(units),
+                float(usd_amount),
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def aggregate_costs(*, days: int = 30) -> dict[str, Any]:
+    """provider × api_key 별 USD 합계 + 일별 추이."""
+    init_db()
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _connect() as conn:
+        by_provider = conn.execute(
+            "SELECT provider, COUNT(*) AS calls, SUM(units) AS units, SUM(usd_amount) AS usd FROM cost_events WHERE created_at >= ? GROUP BY provider ORDER BY usd DESC",
+            (cutoff,),
+        ).fetchall()
+        by_key = conn.execute(
+            """
+            SELECT
+              ce.api_key_id,
+              ak.label,
+              COUNT(*) AS calls,
+              SUM(ce.usd_amount) AS usd
+            FROM cost_events ce
+            LEFT JOIN api_keys ak ON ak.id = ce.api_key_id
+            WHERE ce.created_at >= ?
+            GROUP BY ce.api_key_id
+            ORDER BY usd DESC
+            LIMIT 50
+            """,
+            (cutoff,),
+        ).fetchall()
+        daily = conn.execute(
+            "SELECT substr(created_at, 1, 10) AS day, SUM(usd_amount) AS usd, COUNT(*) AS calls FROM cost_events WHERE created_at >= ? GROUP BY day ORDER BY day",
+            (cutoff,),
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) AS calls, SUM(usd_amount) AS usd FROM cost_events WHERE created_at >= ?",
+            (cutoff,),
+        ).fetchone()
+    return {
+        "total": {"calls": total["calls"] or 0, "usd": float(total["usd"] or 0)},
+        "by_provider": [{k: r[k] for k in r.keys()} for r in by_provider],
+        "by_key": [{k: r[k] for k in r.keys()} for r in by_key],
+        "daily": [{k: r[k] for k in r.keys()} for r in daily],
+        "since": cutoff,
+    }
+
+
+def insert_request_log(
+    *,
+    request_id: str,
+    api_key_id: str | None,
+    method: str,
+    path: str,
+    status: int,
+    latency_ms: int,
+    error: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO request_log (created_at, request_id, api_key_id, method, path, status, latency_ms, error, extra)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _now_iso(),
+                request_id,
+                api_key_id,
+                method,
+                path,
+                int(status),
+                int(latency_ms),
+                error,
+                json.dumps(extra or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def request_log_recent(limit: int = 100) -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, request_id, api_key_id, method, path, status, latency_ms, error FROM request_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{k: r[k] for k in r.keys()} for r in rows]
+
+
+def request_log_summary(*, hours: int = 24) -> dict[str, Any]:
+    """최근 N시간 요청 통계 — 총 건수, 에러율, p50/p95 지연."""
+    init_db()
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _connect() as conn:
+        total = (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM request_log WHERE created_at >= ?", (cutoff,)
+            ).fetchone()["n"]
+            or 0
+        )
+        errors = (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM request_log WHERE created_at >= ? AND status >= 500",
+                (cutoff,),
+            ).fetchone()["n"]
+            or 0
+        )
+        latencies = [
+            r["latency_ms"]
+            for r in conn.execute(
+                "SELECT latency_ms FROM request_log WHERE created_at >= ? ORDER BY latency_ms",
+                (cutoff,),
+            ).fetchall()
+        ]
+        by_path = conn.execute(
+            "SELECT path, COUNT(*) AS n, AVG(latency_ms) AS avg_ms FROM request_log WHERE created_at >= ? GROUP BY path ORDER BY n DESC LIMIT 20",
+            (cutoff,),
+        ).fetchall()
+    p50 = latencies[len(latencies) // 2] if latencies else 0
+    p95 = latencies[int(len(latencies) * 0.95)] if latencies else 0
+    return {
+        "total": total,
+        "errors": errors,
+        "error_rate": (errors / total) if total else 0.0,
+        "p50_ms": p50,
+        "p95_ms": p95,
+        "by_path": [{k: r[k] for k in r.keys()} for r in by_path],
+        "since_hours": hours,
+    }
 

@@ -86,6 +86,11 @@ def _serper_search(query: str, num_results: int = 5) -> dict:
         )
         resp.raise_for_status()
         data = resp.json()
+        try:
+            from platform_layer import cost as _cost
+            _cost.record_serper(1, action="verifier.search")
+        except Exception:
+            pass
         elapsed = time.time() - t0
         hits = len(data.get("organic", []))
         top_titles = [item.get("title", "")[:40] for item in data.get("organic", [])[:2]]

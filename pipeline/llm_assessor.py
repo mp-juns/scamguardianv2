@@ -137,6 +137,16 @@ def _call_claude(prompt: str, max_tokens: int = 512) -> dict[str, Any]:
     elapsed = _time.time() - t0
     raw = message.content[0].text
     usage = getattr(message, "usage", None)
+    try:
+        from platform_layer import cost as _cost
+        _cost.record_claude(
+            model,
+            int(getattr(usage, "input_tokens", 0) or 0),
+            int(getattr(usage, "output_tokens", 0) or 0),
+            action="llm_assessor.analyze_unified",
+        )
+    except Exception:
+        pass
     usage_str = ""
     if usage:
         usage_str = f", 토큰: in={usage.input_tokens}/out={usage.output_tokens}"

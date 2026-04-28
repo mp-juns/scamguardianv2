@@ -267,6 +267,16 @@ def generate_draft(
         system="당신은 한국어 사기 탐지 라벨러입니다. JSON만 반환하세요.",
         messages=[{"role": "user", "content": prompt}],
     )
+    try:
+        from platform_layer import cost as _cost
+        _cost.record_claude(
+            model,
+            int(getattr(message.usage, "input_tokens", 0) or 0),
+            int(getattr(message.usage, "output_tokens", 0) or 0),
+            action="claude_labeler.generate_draft",
+        )
+    except Exception:
+        pass
 
     # 첫 text 블록을 찾는다 (extended thinking 등 비-텍스트 블록 대비)
     raw = ""

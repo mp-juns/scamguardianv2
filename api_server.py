@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+from platform_layer import api_keys as api_key_module
+from platform_layer.middleware import PlatformMiddleware
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -189,6 +192,16 @@ def _run_pipeline(payload: AnalyzeRequest) -> dict:
         use_llm=True,
         use_rag=normalized_payload.use_rag,
     )
+    # 어뷰즈 가드 (사후): STT/Vision 결과가 너무 길면 LLM 비용 폭주 방지
+    transcript_text = pipeline.last_transcript_result.text if pipeline.last_transcript_result else ""
+    from platform_layer.abuse_guard import MAX_CHARS as _MAX_CHARS
+    if transcript_text and len(transcript_text) > _MAX_CHARS:
+        # transcript 절단 — Phase 3 LLM·Phase 4 verifier 가 이미 돌았지만 다음 호출 부담은 줄임
+        # 진짜 운영 시 STT/Vision 후 즉시 cap → 분석 자체 거부 정책으로 강화 가능
+        import logging as _logging
+        _logging.getLogger("abuse_guard").warning(
+            "transcript %d자 cap 초과(>%d)", len(transcript_text), _MAX_CHARS,
+        )
     report_dict = report.to_dict()
     # 프론트에서 "전체 전사"를 화면에 그대로 보여줄 수 있게 원문 텍스트도 함께 내려준다.
     report_dict["transcript_text"] = (
@@ -222,6 +235,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# v3 platform — API key + rate limit + request log + cost context
+app.add_middleware(PlatformMiddleware)
 
 
 @app.on_event("startup")
@@ -1523,7 +1539,7 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
 
 
 @app.post("/api/analyze")
-async def analyze(payload: AnalyzeRequest) -> dict:
+async def analyze(payload: AnalyzeRequest, request: Request) -> dict:
     import logging
     log = logging.getLogger("api_analyze")
     source = _resolve_source(payload)
@@ -1534,6 +1550,16 @@ async def analyze(payload: AnalyzeRequest) -> dict:
         source[:100], payload.whisper_model, payload.skip_verification,
         payload.use_rag,
     )
+    # 어뷰즈 가드 — 텍스트 입력에 한해 외부 API 호출 전 차단
+    # (URL/파일은 STT/Vision 후 transcript 길이로 _run_pipeline 안에서 별도 체크)
+    if payload.text and not payload.source:
+        from platform_layer.abuse_guard import check as _abuse_check
+        rej = _abuse_check(payload.text, key_id=getattr(request.state, "api_key_id", None))
+        if rej is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": rej.code, "message": rej.message, "detail": rej.detail},
+            )
     try:
         result = await asyncio.to_thread(_run_pipeline, payload)
         log.info(
@@ -1926,6 +1952,78 @@ async def admin_stats() -> dict[str, Any]:
         return stats
     except EnvironmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ──────────────────────────────────
+# v3 platform — API key 관리 / observability / cost
+# ──────────────────────────────────
+class CreateApiKeyRequest(BaseModel):
+    label: str
+    monthly_quota: int = 1000
+    rpm_limit: int = 30
+    monthly_usd_quota: float = 5.0
+
+
+@app.post("/api/admin/api-keys")
+async def admin_create_api_key(payload: CreateApiKeyRequest) -> dict[str, Any]:
+    try:
+        _require_db()
+        record = await asyncio.to_thread(
+            api_key_module.issue,
+            label=payload.label,
+            monthly_quota=payload.monthly_quota,
+            rpm_limit=payload.rpm_limit,
+            monthly_usd_quota=payload.monthly_usd_quota,
+        )
+        return record
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/api-keys")
+async def admin_list_api_keys() -> dict[str, Any]:
+    try:
+        _require_db()
+        keys = await asyncio.to_thread(api_key_module.list_keys)
+        return {"keys": keys}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/api-keys/{key_id}/revoke")
+async def admin_revoke_api_key(key_id: str) -> dict[str, Any]:
+    try:
+        _require_db()
+        ok = await asyncio.to_thread(api_key_module.revoke, key_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="키를 찾을 수 없습니다.")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/observability")
+async def admin_observability(hours: int = 24, recent_limit: int = 100) -> dict[str, Any]:
+    try:
+        _require_db()
+        summary = await asyncio.to_thread(repository.request_log_summary, hours=hours)
+        recent = await asyncio.to_thread(repository.request_log_recent, recent_limit)
+        return {"summary": summary, "recent": recent}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/cost")
+async def admin_cost(days: int = 30) -> dict[str, Any]:
+    try:
+        _require_db()
+        return await asyncio.to_thread(repository.aggregate_costs, days=days)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

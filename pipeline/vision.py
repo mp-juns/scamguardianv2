@@ -182,6 +182,16 @@ def _call_vision(
         system=VISION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
+    try:
+        from platform_layer import cost as _cost
+        _cost.record_claude(
+            model,
+            int(getattr(message.usage, "input_tokens", 0) or 0),
+            int(getattr(message.usage, "output_tokens", 0) or 0),
+            action="vision.ocr",
+        )
+    except Exception:
+        pass
     text_parts: list[str] = []
     for block in message.content:
         text = getattr(block, "text", None)
