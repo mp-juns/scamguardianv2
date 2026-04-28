@@ -251,6 +251,20 @@ def transcribe(
             source_type="text",
         )
 
+    # v3 Phase 1: 이미지·PDF 는 vision OCR 로 라우팅
+    if _is_file(source):
+        from pipeline import vision as _vision
+        if _vision.supported(source):
+            if logger:
+                logger(f"[Phase 1] vision OCR 라우팅: {Path(source).suffix}")
+            result = _vision.transcribe(source)
+            return TranscriptResult(
+                text=result.text,
+                language="ko",
+                segments=[],
+                source_type=result.source_type,
+            )
+
     # STT 함수 선택
     _do_stt = _transcribe_with_claude if backend == "claude" else _transcribe_with_openai_api
 

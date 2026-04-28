@@ -1,0 +1,7 @@
+# Fine-tuning 전용 의존성 — 기본 requirements.txt 외 추가로 필요한 패키지
+peft>=0.10.0
+datasets>=2.18.0
+evaluate>=0.4.1
+accelerate>=0.27.0
+seqeval>=1.2.2
+scikit-learn>=1.3.0

@@ -23,6 +23,8 @@ class InputType(str, Enum):
     URL = "url"
     VIDEO = "video"
     FILE = "file"
+    IMAGE = "image"   # v3 — 사진·캡쳐
+    PDF = "pdf"       # v3 — PDF 문서
 
 
 # ──────────────────────────────────
@@ -195,6 +197,8 @@ def _build_result_card(
         InputType.URL: "🔗 URL/영상 분석",
         InputType.VIDEO: "🎬 업로드 영상 분석",
         InputType.FILE: "📎 파일 분석",
+        InputType.IMAGE: "🖼 이미지 분석",
+        InputType.PDF: "📄 PDF 분석",
     }
     type_label = type_labels.get(input_type, "분석")
 
@@ -275,6 +279,31 @@ def _build_user_context_block(user_context: dict[str, Any] | None) -> dict[str, 
     return {"simpleText": {"text": "\n".join(lines)}}
 
 
+def _build_safety_warning_block(report: dict[str, Any]) -> dict[str, Any] | None:
+    """v3 Phase 0 안전성 결과 — malicious/suspicious 일 때만 최상단 경고 블록 생성."""
+    safety = report.get("safety_check") or {}
+    level = (safety.get("threat_level") or "").lower()
+    if level not in ("malicious", "suspicious"):
+        return None
+    detections = int(safety.get("detections") or 0)
+    total = int(safety.get("total_engines") or 0)
+    cats = safety.get("threat_categories") or []
+    target_kind = safety.get("target_kind", "")
+    kind_label = "URL" if target_kind == "url" else "파일"
+    icon = "🚨" if level == "malicious" else "⚠️"
+    if level == "malicious":
+        head = f"{icon} 위험! 이 {kind_label}은 악성으로 확인됐어요."
+    else:
+        head = f"{icon} 주의: 이 {kind_label}에 일부 의심 신호가 있어요."
+    lines = [head]
+    if total:
+        lines.append(f"VirusTotal {detections}/{total} 엔진 탐지")
+    if cats:
+        lines.append("탐지 카테고리: " + ", ".join(map(str, cats[:3])))
+    lines.append("절대 클릭·실행하지 마시고 발신자에게 답하지 마세요.")
+    return {"simpleText": {"text": "\n".join(lines)}}
+
+
 def format_result(
     report: dict[str, Any],
     input_type: InputType = InputType.TEXT,
@@ -285,9 +314,14 @@ def format_result(
 
     result_url 이 주어지면 카드에 '자세한 결과 보기' webLink 버튼 + 안내 텍스트 추가.
     """
-    outputs: list[dict[str, Any]] = [
-        _build_result_card(report, input_type, result_url=result_url)
-    ]
+    outputs: list[dict[str, Any]] = []
+
+    safety_block = _build_safety_warning_block(report)
+    if safety_block:
+        # 위험 신호는 카드보다 먼저 — 사용자 눈에 가장 먼저 들어오도록
+        outputs.append(safety_block)
+
+    outputs.append(_build_result_card(report, input_type, result_url=result_url))
 
     user_block = _build_user_context_block(user_context)
     if user_block:
@@ -339,6 +373,8 @@ def format_analyzing(input_type: InputType = InputType.TEXT) -> dict[str, Any]:
         InputType.URL: "🔍 영상 다운로드 및 분석 중입니다...\n음성 인식(STT) 후 사기 여부를 판별합니다.",
         InputType.VIDEO: "🎬 업로드된 영상을 분석 중입니다...\n음성 인식(STT) 후 사기 여부를 판별합니다.",
         InputType.FILE: "📎 파일을 분석 중입니다...",
+        InputType.IMAGE: "🖼 이미지를 분석 중입니다...\nOCR + 시각 단서를 같이 봅니다.",
+        InputType.PDF: "📄 PDF를 분석 중입니다...\n페이지별로 OCR + 시각 단서를 추출합니다.",
     }
     return msgs.get(input_type, msgs[InputType.TEXT])
 
@@ -350,6 +386,8 @@ def format_queued(input_type: InputType = InputType.URL) -> dict[str, Any]:
         InputType.VIDEO: "🎬 영상 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
         InputType.FILE: "📎 파일 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
         InputType.TEXT: "🔍 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.IMAGE: "🖼 이미지 분석을 시작했습니다.\nOCR 후 사기 여부를 판별합니다.\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.PDF: "📄 PDF 분석을 시작했습니다.\n페이지 OCR 후 사기 여부를 판별합니다.\n완료되면 '결과확인'을 입력해 주세요.",
     }
     return {
         "version": "2.0",
@@ -506,17 +544,20 @@ def format_question(
     """
     outputs: list[dict[str, Any]] = []
     if is_first_turn:
-        if input_type in (InputType.URL, InputType.VIDEO, InputType.FILE):
-            # 영상/URL: STT + 1차 분석이 백그라운드로 돌고 있고, 채팅으로 정보 수집
+        if input_type in (InputType.URL, InputType.VIDEO, InputType.FILE, InputType.IMAGE, InputType.PDF):
+            # 영상/URL/이미지/PDF: vision/STT + 1차 분석이 백그라운드로 돌고 있고, 채팅으로 정보 수집
             kind = {
                 InputType.URL: "🔗 영상",
                 InputType.VIDEO: "🎬 영상",
                 InputType.FILE: "📎 파일",
+                InputType.IMAGE: "🖼 이미지",
+                InputType.PDF: "📄 PDF",
             }.get(input_type, "영상")
+            # 이미지/PDF 는 vision OCR 라 더 빠름
+            duration = "10초 정도" if input_type in (InputType.IMAGE, InputType.PDF) else "1~3분"
             intro = (
-                f"{kind} 받았어요! 🔍 분석을 시작했어요 (1~3분 걸려요).\n"
+                f"{kind} 받았어요! 🔍 분석을 시작했어요 ({duration} 걸려요).\n"
                 "그 동안 분석 정확도를 높일 정보 몇 가지 여쭤볼게요.\n"
-                "⏱ 의심 구간(예: \"1분 30초쯤\")을 알려주시면 더 정확해요.\n"
                 "분석이 끝나면 다음 메시지에서 '🎉 완료' 알림과 함께 정리해드릴게요."
             )
         else:

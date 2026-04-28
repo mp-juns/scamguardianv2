@@ -56,6 +56,7 @@ class ScamReport:
     all_verifications: list[dict[str, Any]] = field(default_factory=list)
     llm_assessment: dict[str, Any] | None = None
     rag_context: dict[str, Any] | None = None
+    safety_check: dict[str, Any] | None = None  # v3 Phase 0 결과
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +89,7 @@ class ScamReport:
             "verification_count": len(self.all_verifications),
             "llm_assessment": self.llm_assessment,
             "rag_context": self.rag_context,
+            "safety_check": self.safety_check,
         }
 
     def summary(self) -> str:
@@ -211,6 +213,7 @@ def score(
     scam_type_source: str = "classifier",
     scam_type_reason: str = "",
     classifier_original: ClassificationResult | None = None,
+    safety_result: Any = None,
 ) -> ScamReport:
     """
     검증 결과를 종합하여 최종 스캠 리포트를 생성한다.
@@ -230,6 +233,33 @@ def score(
 
     # 중복 플래그 방지: 같은 flag는 한 번만 가산
     seen_flags: set[str] = set()
+
+    # v3 Phase 0: 안전성 자동 플래그
+    if safety_result is not None and getattr(safety_result, "threat_level", None) is not None:
+        kind = getattr(safety_result, "target_kind", "")
+        level = getattr(safety_result, "threat_level").value if hasattr(getattr(safety_result, "threat_level"), "value") else str(safety_result.threat_level)
+        if level == "malicious":
+            flag = "malware_detected" if kind == "file" else "phishing_url_confirmed"
+        elif level == "suspicious":
+            flag = "suspicious_file_signal" if kind == "file" else "suspicious_url_signal"
+        else:
+            flag = None
+        if flag:
+            seen_flags.add(flag)
+            delta = SCORING_RULES.get(flag, 0)
+            total += delta
+            cats = getattr(safety_result, "threat_categories", []) or []
+            evidence = [
+                f"VirusTotal: {safety_result.detections}/{safety_result.total_engines} 엔진 악성 탐지",
+                *cats[:2],
+            ]
+            triggered.append(FlagDetail(
+                flag=flag,
+                description=f"[Phase 0 안전성] VT 다중 엔진 {level} 판정",
+                score_delta=delta,
+                evidence=evidence,
+                source="safety",
+            ))
 
     for vr in verification_results:
         if not vr.triggered:
@@ -301,4 +331,5 @@ def score(
         all_verifications=[vr.to_dict() for vr in verification_results],
         llm_assessment=llm_assessment.to_dict() if llm_assessment is not None else None,
         rag_context=rag_context,
+        safety_check=safety_result.to_dict() if safety_result is not None and hasattr(safety_result, "to_dict") else None,
     )

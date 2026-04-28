@@ -41,6 +41,19 @@ type LLMAssessment = {
   error?: string;
 };
 
+type SafetyCheckDict = {
+  target_kind?: string;
+  target?: string;
+  scanner?: string;
+  threat_level?: string;  // safe | suspicious | malicious | unknown
+  detections?: number;
+  suspicious?: number;
+  total_engines?: number;
+  threat_categories?: string[];
+  permalink?: string | null;
+  error?: string | null;
+};
+
 type ReportDict = {
   scam_type?: string;
   classification_confidence?: number;
@@ -54,6 +67,7 @@ type ReportDict = {
   entities?: EntityDict[];
   triggered_flags?: FlagDict[];
   llm_assessment?: LLMAssessment | null;
+  safety_check?: SafetyCheckDict | null;
 };
 
 type QAPair = { question?: string; answer?: string };
@@ -160,6 +174,56 @@ export default async function ResultPage({ params }: PageProps) {
           </div>
           <p className="text-xs text-slate-500">{fmtExpires(expires_at)} · {inputLabel}</p>
         </header>
+
+        {/* v3 Phase 0 안전성 경고 — malicious/suspicious 일 때 최상단 prominent */}
+        {(() => {
+          const sc = result.safety_check;
+          if (!sc) return null;
+          const level = (sc.threat_level ?? "").toLowerCase();
+          if (level !== "malicious" && level !== "suspicious") return null;
+          const isMal = level === "malicious";
+          const styles = isMal
+            ? "border-red-500 bg-red-950/40 text-red-100"
+            : "border-amber-500 bg-amber-950/30 text-amber-100";
+          const icon = isMal ? "🚨" : "⚠️";
+          const targetLabel = sc.target_kind === "url" ? "URL" : "파일";
+          const head = isMal
+            ? `${icon} 위험! 이 ${targetLabel}은 악성으로 확인됐어요`
+            : `${icon} 주의: 이 ${targetLabel}에 일부 의심 신호가 있어요`;
+          return (
+            <section className={`rounded-2xl border p-6 shadow-lg ${styles}`}>
+              <div className="text-lg font-bold">{head}</div>
+              <p className="mt-2 text-sm opacity-90">
+                VirusTotal {sc.detections ?? 0}/{sc.total_engines ?? 0} 엔진이 위험 판정.
+                {sc.target_kind === "url"
+                  ? " 클릭하지 마시고 차단·신고를 권장합니다."
+                  : " 실행하지 마시고 즉시 삭제하세요."}
+              </p>
+              {sc.threat_categories && sc.threat_categories.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {sc.threat_categories.slice(0, 5).map((c, i) => (
+                    <span
+                      key={i}
+                      className="rounded-full border border-current/40 bg-black/20 px-2 py-0.5 text-xs"
+                    >
+                      {c}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {sc.permalink && (
+                <a
+                  href={sc.permalink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-3 inline-block text-xs underline opacity-80 hover:opacity-100"
+                >
+                  VirusTotal 상세 리포트 →
+                </a>
+              )}
+            </section>
+          );
+        })()}
 
         {/* 위험도 배지 */}
         <section className={`rounded-2xl border p-6 shadow-lg ${riskColor}`}>

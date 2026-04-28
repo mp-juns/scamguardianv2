@@ -22,8 +22,11 @@ from pipeline.config import (
     MODELS,
     get_runtime_scam_taxonomy,
 )
+from pipeline import active_models
 
 _classifier = None
+_finetuned = None
+_finetuned_path: str | None = None
 
 
 def _resolve_local_hf_snapshot(model_id: str) -> str | None:
@@ -64,6 +67,51 @@ def _get_classifier():
     return _classifier
 
 
+def _get_finetuned() -> dict | None:
+    """`/admin/training` 에서 활성화된 분류기 체크포인트가 있으면 task-specific
+    pipeline 을 반환. 없거나 무효 경로면 None.
+
+    반환 dict 키:
+        pipe : transformers Pipeline (text-classification)
+        path : 체크포인트 디렉토리
+        labels : id→label 매핑 (모델 config 에서 추출)
+    """
+    global _finetuned, _finetuned_path
+    path = active_models.get_active_path("classifier")
+    if path is None:
+        if _finetuned_path is not None:
+            # 직전엔 활성이었지만 비활성화 됨 → 캐시 비우기
+            _finetuned = None
+            _finetuned_path = None
+        return None
+    if _finetuned is not None and _finetuned_path == path:
+        return _finetuned
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+        model = AutoModelForSequenceClassification.from_pretrained(path, local_files_only=True)
+        pipe = hf_pipeline(
+            "text-classification",
+            model=model,
+            tokenizer=tokenizer,
+            device="cpu",
+            top_k=None,        # 모든 라벨 점수 반환
+            truncation=True,
+            max_length=512,
+        )
+    except Exception as exc:
+        print(f"[분류] fine-tuned 모델 로드 실패({path}): {exc} — zero-shot 으로 fallback")
+        _finetuned = None
+        _finetuned_path = None
+        return None
+
+    id2label = getattr(model.config, "id2label", {}) or {}
+    labels = {int(k): str(v) for k, v in id2label.items()} if id2label else {}
+    _finetuned = {"pipe": pipe, "path": path, "labels": labels}
+    _finetuned_path = path
+    return _finetuned
+
+
 def _compute_keyword_boost(text: str) -> dict[str, float]:
     """텍스트 내 키워드 매칭 비율로 각 스캠 유형의 부스트/감점을 계산한다."""
     text_lower = text.lower()
@@ -81,8 +129,16 @@ def _compute_keyword_boost(text: str) -> dict[str, float]:
 def classify(text: str) -> ClassificationResult:
     """
     STT 텍스트를 입력받아 스캠 유형을 분류한다.
-    NLI 스코어 + 키워드 부스팅을 결합하여 최종 판정한다.
+
+    1) `/admin/training` 에서 fine-tuned 분류기가 활성화돼 있으면 task-specific
+       multi-class 분류 결과를 직접 사용 (키워드 부스팅·NLI hypothesis 없이도
+       도메인 특화 정확도가 더 높음).
+    2) 없으면 기존 zero-shot NLI + 키워드 부스팅 흐름.
     """
+    finetuned = _get_finetuned()
+    if finetuned is not None:
+        return _classify_finetuned(text, finetuned)
+
     clf = _get_classifier()
     taxonomy = get_runtime_scam_taxonomy()
 
@@ -130,4 +186,36 @@ def classify(text: str) -> ClassificationResult:
         confidence=all_scores[top_type],
         all_scores=all_scores,
         is_uncertain=all_scores[top_type] < CLASSIFICATION_THRESHOLD,
+    )
+
+
+def _classify_finetuned(text: str, finetuned: dict) -> ClassificationResult:
+    """fine-tuned 분류기로 직접 multi-class 분류."""
+    pipe = finetuned["pipe"]
+    truncated = text[:2000]
+    raw = pipe(truncated, truncation=True)
+    # raw 형태: top_k=None 일 때 [[{label, score}, ...]] (배치 차원)
+    if isinstance(raw, list) and raw and isinstance(raw[0], list):
+        items = raw[0]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = [raw]
+
+    all_scores: dict[str, float] = {}
+    for item in items:
+        label = str(item.get("label", "")).strip()
+        score = float(item.get("score", 0.0))
+        if label:
+            all_scores[label] = score
+
+    if not all_scores:
+        return ClassificationResult(scam_type="", confidence=0.0, is_uncertain=True)
+
+    top = max(all_scores.items(), key=lambda x: x[1])
+    return ClassificationResult(
+        scam_type=top[0],
+        confidence=top[1],
+        all_scores=all_scores,
+        is_uncertain=top[1] < CLASSIFICATION_THRESHOLD,
     )

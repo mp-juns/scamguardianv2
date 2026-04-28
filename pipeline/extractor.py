@@ -118,19 +118,40 @@ class Entity:
         }
 
 
+_gliner_loaded_path: str | None = None
+
+
+def _resolve_gliner_source() -> str:
+    """`/admin/training` 활성 체크포인트가 있으면 그 경로, 없으면 기본 base."""
+    from pipeline import active_models
+    return active_models.get_active_path("gliner") or MODELS["gliner"]
+
+
 def _get_model() -> GLiNER | None:
-    global _gliner_model, _gliner_load_error
+    global _gliner_model, _gliner_load_error, _gliner_loaded_path
+
+    desired = _resolve_gliner_source()
+
+    # 활성 모델이 바뀌었으면 재로드
+    if _gliner_model is not None and _gliner_loaded_path != desired:
+        _gliner_model = None
+        _gliner_load_error = None
+
     if _gliner_model is not None:
         return _gliner_model
-    if _gliner_load_error is not None:
+    if _gliner_load_error is not None and _gliner_loaded_path == desired:
         return None
-    if _gliner_model is None:
-        try:
-            _gliner_model = GLiNER.from_pretrained(MODELS["gliner"])
-        except Exception as exc:
-            _gliner_load_error = exc
-            print(f"[추출] GLiNER 로드 실패, 규칙 기반 추출로 계속 진행합니다: {exc}")
-            return None
+
+    try:
+        _gliner_model = GLiNER.from_pretrained(desired)
+        _gliner_loaded_path = desired
+        if desired != MODELS["gliner"]:
+            print(f"[추출] fine-tuned GLiNER 사용: {desired}")
+    except Exception as exc:
+        _gliner_load_error = exc
+        _gliner_loaded_path = desired
+        print(f"[추출] GLiNER 로드 실패({desired}), 규칙 기반 추출로 계속 진행합니다: {exc}")
+        return None
     return _gliner_model
 
 

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from pipeline import classifier, extractor, llm_assessor, rag, scorer, stt, verifier
+from pipeline import classifier, extractor, llm_assessor, rag, safety, scorer, stt, verifier
 from pipeline.config import CLASSIFICATION_THRESHOLD
 from pipeline.config import RAG_TOP_K, SCORING_RULES
 from pipeline.scorer import ScamReport
@@ -194,12 +194,82 @@ class ScamGuardianPipeline:
         self.last_llm_assessment = None
         self.last_similar_cases = []
         self.last_report = None
+        self.last_safety_result: safety.SafetyResult | None = None
         pipeline_start = time.time()
         effective_use_rag = use_llm and use_rag
         self._debug(
             "analyze() 시작: "
             f"skip_verification={skip_verification}, use_llm={use_llm}, use_rag={effective_use_rag}"
         )
+
+        # ════════════════════════════════
+        # Phase 0 (v3): 안전성 필터 — URL/파일이면 VirusTotal 스캔
+        # ════════════════════════════════
+        safety_result: safety.SafetyResult | None = None
+        if precomputed_transcript is None:
+            phase0_start = time.time()
+            try:
+                if stt._is_youtube_url(source) or source.startswith(("http://", "https://")):
+                    print("[Phase 0] URL 안전성 검사 중 (VirusTotal)...")
+                    safety_result = safety.scan_url(source)
+                else:
+                    src_path = source if source else None
+                    if src_path and len(src_path) < 1024 and "/" in src_path:
+                        from pathlib import Path as _Path
+                        if _Path(src_path).exists() and _Path(src_path).is_file():
+                            print("[Phase 0] 파일 안전성 검사 중 (VirusTotal)...")
+                            safety_result = safety.scan_file(src_path)
+            except Exception as exc:  # noqa: BLE001 — 안전성은 죽으면 안 됨
+                print(f"[Phase 0] 검사 실패(무시): {exc}")
+                safety_result = None
+            if safety_result is not None:
+                self.last_safety_result = safety_result
+                self._log_step(
+                    "Safety",
+                    phase0_start,
+                    {
+                        "threat_level": safety_result.threat_level.value,
+                        "detections": safety_result.detections,
+                        "total_engines": safety_result.total_engines,
+                    },
+                )
+                level = safety_result.threat_level.value
+                icon = "🚨" if level == "malicious" else ("⚠️" if level == "suspicious" else "✅")
+                print(
+                    f"      ← {icon} {level} | 탐지 {safety_result.detections}/{safety_result.total_engines} | "
+                    f"카테고리: {', '.join(safety_result.threat_categories[:3]) or '없음'}"
+                )
+
+        # 악성 파일 확정 시 fast-path: STT/분류기가 바이너리에서 죽거나 노이즈 분류하지 않게
+        # 즉시 safety 결과만으로 보고서 생성. policy (b) 의 "분석은 진행" 은 텍스트
+        # 첨부가 같이 있을 때만 의미 있으므로 단독 악성 파일은 빠르게 막는다.
+        if (
+            safety_result is not None
+            and safety_result.is_malicious
+            and safety_result.target_kind == "file"
+            and precomputed_transcript is None
+        ):
+            print("[fast-path] 악성 파일 확정 — STT/분류 skip, safety 결과만으로 보고")
+            transcript = stt.TranscriptResult(text="", source_type="file")
+            self.last_transcript_result = transcript
+            empty_classification = classifier.ClassificationResult(
+                scam_type="메신저 피싱",
+                confidence=0.0,
+                all_scores={},
+                is_uncertain=True,
+            )
+            self.last_classification = empty_classification
+            report = scorer.score(
+                verification_results=[],
+                classification=empty_classification,
+                entities=[],
+                source=source,
+                transcript="",
+                safety_result=safety_result,
+            )
+            self.last_report = report
+            self._log_step("전체", pipeline_start)
+            return report
 
         # ════════════════════════════════
         # Phase 1: STT (precomputed_transcript 있으면 스킵)
@@ -378,6 +448,7 @@ class ScamGuardianPipeline:
             scam_type_source=scam_type_source,
             scam_type_reason=scam_type_reason,
             classifier_original=classifier_original,
+            safety_result=safety_result,
         )
 
         total_ms = (time.time() - pipeline_start) * 1000

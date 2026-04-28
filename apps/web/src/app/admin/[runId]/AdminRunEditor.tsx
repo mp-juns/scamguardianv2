@@ -105,6 +105,8 @@ function makeId() {
 
 const VIDEO_SUFFIXES = new Set([".mp4", ".mov", ".webm", ".mkv"]);
 const AUDIO_SUFFIXES = new Set([".mp3", ".m4a", ".wav", ".ogg", ".aac"]);
+const IMAGE_SUFFIXES = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]);
+const PDF_SUFFIXES = new Set([".pdf"]);
 
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
@@ -660,6 +662,8 @@ export default function AdminRunEditor({ runId }: { runId: string }) {
         const suffix = (media?.suffix ?? "").toLowerCase();
         const isVideo = VIDEO_SUFFIXES.has(suffix);
         const isAudio = AUDIO_SUFFIXES.has(suffix);
+        const isImage = IMAGE_SUFFIXES.has(suffix);
+        const isPdf = PDF_SUFFIXES.has(suffix);
         const ytEmbed = sourceLooksLikeUrl && isYoutubeUrl(inputSource)
           ? youtubeEmbedUrl(inputSource)
           : null;
@@ -723,6 +727,19 @@ export default function AdminRunEditor({ runId }: { runId: string }) {
                   />
                 ) : isAudio ? (
                   <audio controls preload="metadata" src={mediaUrl} className="w-full" />
+                ) : isImage ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={mediaUrl}
+                    alt={media?.original_filename ?? "uploaded image"}
+                    className="max-h-[600px] w-full rounded-xl border border-white/10 bg-slate-950/40 object-contain"
+                  />
+                ) : isPdf ? (
+                  <iframe
+                    src={mediaUrl}
+                    title="PDF 미리보기"
+                    className="h-[80vh] w-full rounded-xl border border-white/10 bg-slate-950/40"
+                  />
                 ) : (
                   <div className="rounded-xl border border-white/10 bg-slate-950/40 px-4 py-3 text-xs text-slate-400">
                     이 형식({suffix || "?"})은 브라우저 미리보기를 지원하지 않을 수 있어요. 다운로드 후 확인해 주세요.

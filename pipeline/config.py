@@ -486,6 +486,16 @@ SCORING_RULES: dict[str, int] = {
     "fake_escrow_bypass": 15,           # 직거래·가짜 에스크로 유도
 
     # ──────────────────────────────────────────────
+    # v3 Phase 0: 안전성 필터 (VirusTotal 자동 트리거)
+    # 악성 단독으로도 '매우 위험(71+)' 등급 직행 — 다중 안티바이러스 합의 신호는
+    # 다른 어떤 휴리스틱보다 강하므로 점수도 가장 높게 책정.
+    # ──────────────────────────────────────────────
+    "malware_detected": 80,             # 파일이 VT 에서 악성으로 다중 탐지
+    "phishing_url_confirmed": 75,       # URL 이 VT 에서 피싱/악성으로 다중 탐지
+    "suspicious_file_signal": 25,       # 파일이 VT 에서 일부 엔진만 의심 (low confidence)
+    "suspicious_url_signal": 25,        # URL 이 VT 에서 일부 엔진만 의심
+
+    # ──────────────────────────────────────────────
     # 노션 다음 단계: BERT 유사도/쿼리 A-B-C 플래그
     # ──────────────────────────────────────────────
     "authority_context_mismatch": 15,   # 화자 프로파일 vs 발화 맥락 의미 불일치
@@ -520,6 +530,10 @@ FLAG_LABELS_KO: dict[str, str] = {
     "job_deposit_requested": "취업·알바 선입금 요구",
     "smishing_link_detected": "스미싱 의심 링크",
     "fake_escrow_bypass": "에스크로 회피 유도",
+    "malware_detected": "악성코드 탐지",
+    "phishing_url_confirmed": "피싱 URL 확인",
+    "suspicious_file_signal": "의심 파일 신호",
+    "suspicious_url_signal": "의심 URL 신호",
     "authority_context_mismatch": "발화 맥락 불일치",
     "authority_context_uncertain": "발화 맥락 애매",
     "query_a_confirmed": "신뢰 언론에서 확인됨",
@@ -629,6 +643,22 @@ FLAG_RATIONALE: dict[str, dict[str, str]] = {
     "fake_escrow_bypass": {
         "rationale": "공식 에스크로 회피 유도는 중고거래 사기 표준. 안전결제 우회 = 위험 신호. 가격 할인 명분으로 정상 절차 무력화 — Stajano & Wilson 의 'Distraction' 원칙.",
         "source": "경찰청 사이버범죄 통계 / 한국인터넷진흥원 중고거래 사기 동향 / Stajano & Wilson (2011) Principle 1: Distraction",
+    },
+    "malware_detected": {
+        "rationale": "VirusTotal 다중 안티바이러스 엔진(보통 70+개)이 첨부 파일을 악성코드로 탐지. 30점은 단독으로 '매우 위험' 등급 직행 — 메신저 피싱의 결정적 증거.",
+        "source": "VirusTotal Public API v3 / NIST SP 800-83 Guide to Malware Incident Prevention",
+    },
+    "phishing_url_confirmed": {
+        "rationale": "VirusTotal 의 URL 분석에서 다중 엔진이 피싱·악성으로 분류. APWG·Google Safe Browsing·PhishTank 등 다중 출처 합의 신호.",
+        "source": "VirusTotal URL Scan / APWG Phishing Activity Trends Report / Google Safe Browsing Transparency Report",
+    },
+    "suspicious_file_signal": {
+        "rationale": "일부 엔진만 의심으로 판정 (false positive 가능성 잔존). 확정적 차단보단 사용자에게 주의 환기 목적의 보조 가산점.",
+        "source": "VirusTotal API / 자체 임계값 설계",
+    },
+    "suspicious_url_signal": {
+        "rationale": "URL 이 일부 엔진에서만 의심 — 신생 도메인이거나 평판 낮은 호스팅. 다른 신호와 결합 시 결정적 단서.",
+        "source": "VirusTotal URL Scan / APWG 신생 피싱 도메인 통계",
     },
     "authority_context_mismatch": {
         "rationale": "발화자 직업·신원 vs 발화 내용의 SBERT 임베딩 코사인 유사도가 임계 미만 → 사칭 의심. 의미적 일관성 분석 기법.",

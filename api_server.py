@@ -327,6 +327,20 @@ _URL_RE = re.compile(r"https?://\S+")
 _YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
 
 
+_IMAGE_URL_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp)(\?|$)", re.IGNORECASE)
+_PDF_URL_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
+
+
+def _classify_url_input(url: str) -> kakao_formatter.InputType:
+    """URL 확장자 보고 IMAGE/PDF/URL 구분."""
+    InputType = kakao_formatter.InputType
+    if _IMAGE_URL_RE.search(url):
+        return InputType.IMAGE
+    if _PDF_URL_RE.search(url):
+        return InputType.PDF
+    return InputType.URL
+
+
 def _kakao_detect_input(
     utterance: str, action_params: dict
 ) -> tuple[str, kakao_formatter.InputType]:
@@ -336,29 +350,78 @@ def _kakao_detect_input(
     """
     InputType = kakao_formatter.InputType
 
-    # 1) action.params에서 파일/영상 URL (카카오 파일 전송)
-    for key in ("video", "file", "video_url", "attachment"):
+    # 1) action.params 의 파일/영상/이미지/PDF URL (카카오 파일 전송)
+    #    카카오 오픈빌더 블록의 파라미터 이름 — 모두 동등하게 처리하되 키워드로 우선 분류.
+    for key in (
+        "image", "picture", "photo",  # 이미지
+        "pdf", "document",            # PDF/문서
+        "video", "video_url",         # 영상
+        "file", "attachment",         # 일반 파일 (확장자 보고 재분류)
+    ):
         val = action_params.get(key)
+        url = ""
         if isinstance(val, str) and val.startswith("http"):
-            kind = InputType.VIDEO if "video" in key else InputType.FILE
-            return val, kind
-        if isinstance(val, dict):
-            url = val.get("url", "")
-            if url.startswith("http"):
-                kind = InputType.VIDEO if "video" in key else InputType.FILE
-                return url, kind
+            url = val
+        elif isinstance(val, dict):
+            v = val.get("url", "")
+            if isinstance(v, str) and v.startswith("http"):
+                url = v
+        if not url:
+            continue
+        if key in ("image", "picture", "photo"):
+            return url, InputType.IMAGE
+        if key in ("pdf", "document"):
+            return url, InputType.PDF
+        if key in ("video", "video_url"):
+            return url, InputType.VIDEO
+        # file/attachment — URL 확장자 보고 분기
+        kind = _classify_url_input(url)
+        if kind in (InputType.IMAGE, InputType.PDF):
+            return url, kind
+        return url, InputType.FILE
 
-    # 2) utterance 전체가 URL
-    if _URL_RE.match(utterance):
-        return utterance, InputType.URL
-
-    # 3) utterance 안에 URL이 포함된 경우
+    # 2) utterance 전체 또는 일부가 URL — 둘 다 첫 매칭 URL 만 사용
     url_match = _URL_RE.search(utterance)
     if url_match:
-        return url_match.group(0), InputType.URL
+        url = url_match.group(0)
+        return url, _classify_url_input(url)
 
     # 4) 순수 텍스트
     return utterance, InputType.TEXT
+
+
+def _kakao_materialize_url(url: str, suffix_hint: str = "") -> str:
+    """카카오 CDN 등의 HTTP URL 을 로컬 파일로 다운로드하고 경로 반환.
+
+    이미지/PDF 처럼 우리 vision 파이프라인이 로컬 파일 경로를 기대하는 경우 사용.
+    저장 위치: .scamguardian/uploads/kakao/{uuid}{suffix}
+    """
+    import uuid as _uuid
+    log = logging.getLogger("kakao_dl")
+
+    suffix = suffix_hint
+    if not suffix:
+        # URL 끝에서 확장자 추출 시도
+        path = url.split("?", 1)[0]
+        idx = path.rfind(".")
+        if idx > 0 and len(path) - idx <= 6:
+            suffix = path[idx:]
+    if not suffix:
+        suffix = ".bin"
+
+    target_dir = Path(".scamguardian") / "uploads" / "kakao"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{_uuid.uuid4().hex}{suffix}"
+
+    resp = requests.get(url, stream=True, timeout=30)
+    resp.raise_for_status()
+    with target.open("wb") as fp:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                fp.write(chunk)
+    log.info("카카오 미디어 다운로드 완료: %s → %s (%d bytes)",
+             url[:80], target.name, target.stat().st_size)
+    return str(target)
 
 
 def _kakao_run_pipeline(source: str, use_llm: bool = False) -> dict:
@@ -1338,11 +1401,32 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
 
     # ── 입력 감지 ──
     source, input_type = _kakao_detect_input(utterance, action_params)
-    is_heavy = input_type in (InputType.URL, InputType.VIDEO, InputType.FILE)
+    is_heavy = input_type in (
+        InputType.URL, InputType.VIDEO, InputType.FILE, InputType.IMAGE, InputType.PDF,
+    )
     log.info(
         "입력 감지: type=%s, heavy=%s, source=%s",
         input_type.value, is_heavy, source[:80],
     )
+
+    # ── v3 Phase 1: 이미지/PDF 는 카카오 CDN URL → 로컬 파일 다운로드 후 vision 라우팅 ──
+    if input_type in (InputType.IMAGE, InputType.PDF) and source.startswith("http"):
+        try:
+            suffix_hint = ".pdf" if input_type == InputType.PDF else ""
+            local_path = await asyncio.to_thread(
+                _kakao_materialize_url, source, suffix_hint,
+            )
+            log.info(
+                "→ 카카오 미디어 로컬 저장: %s → %s",
+                input_type.value, Path(local_path).name,
+            )
+            source = local_path
+        except Exception as exc:
+            log.error("카카오 미디어 다운로드 실패: %s", exc, exc_info=True)
+            return kakao_formatter.format_error(
+                kakao_formatter.ErrorCode.UNKNOWN,
+                f"파일 다운로드 실패: {exc}",
+            )
 
     # ── 진행 중 job 처리 (callbackUrl 없는 폴링/멀티턴 모드 한정) ──
     if user_id and not callback_url:
@@ -1507,40 +1591,52 @@ async def analyze_upload(
         if tmp_path.stat().st_size == 0:
             raise HTTPException(status_code=400, detail="업로드된 파일이 비어 있습니다(0 bytes).")
 
-        # Whisper 디코딩 호환성을 위해 먼저 wav(16k mono)로 추출한다.
-        # 영상 컨테이너/코덱에 따라 whisper.load_audio가 0-length로 읽히는 케이스를 방지한다.
-        extract = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(tmp_path),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-f",
-                "wav",
-                str(wav_path),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if extract.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="업로드된 파일에서 오디오를 추출하지 못했습니다. 다른 파일(코덱)로 시도해주세요.",
+        # v3 Phase 1: 이미지·PDF 는 vision OCR 라우팅 — ffmpeg 단계 skip
+        from pipeline import vision as _vision_mod
+        is_visual = _vision_mod.supported(tmp_path)
+        if is_visual:
+            payload = AnalyzeRequest(
+                source=str(tmp_path),
+                whisper_model=whisper_model,
+                skip_verification=skip_verification,
+                use_llm=True,
+                use_rag=use_rag,
             )
+        else:
+            # Whisper 디코딩 호환성을 위해 먼저 wav(16k mono)로 추출한다.
+            # 영상 컨테이너/코덱에 따라 whisper.load_audio가 0-length로 읽히는 케이스를 방지한다.
+            extract = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(tmp_path),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-f",
+                    "wav",
+                    str(wav_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if extract.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="업로드된 파일에서 오디오를 추출하지 못했습니다. 다른 파일(코덱)로 시도해주세요.",
+                )
 
-        payload = AnalyzeRequest(
-            source=str(wav_path),
-            whisper_model=whisper_model,
-            skip_verification=skip_verification,
-            use_llm=True,
-            use_rag=use_rag,
-        )
+            payload = AnalyzeRequest(
+                source=str(wav_path),
+                whisper_model=whisper_model,
+                skip_verification=skip_verification,
+                use_llm=True,
+                use_rag=use_rag,
+            )
         result = await asyncio.to_thread(_run_pipeline, payload)
 
         # 라벨링 검증을 위해 원본 업로드 파일을 run_id 기반 영구 경로에 보존한다.
@@ -1829,6 +1925,117 @@ async def admin_stats() -> dict[str, Any]:
         stats = await asyncio.to_thread(repository.get_dashboard_stats)
         return stats
     except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ──────────────────────────────────
+# v3 학습 세션 관리 endpoints
+# ──────────────────────────────────
+class StartTrainingRequest(BaseModel):
+    model: str                        # "classifier" | "gliner"
+    epochs: int = 3
+    batch_size: int = 8
+    lora: bool = False
+    extra_jsonl: str | None = None
+    val_ratio: float = 0.1
+    seed: int = 17
+    base_model: str | None = None
+
+
+@app.get("/api/admin/training/data-stats")
+async def admin_training_data_stats() -> dict[str, Any]:
+    """현재 라벨링 데이터 통계 — 라벨 분포, 학습 가능 여부."""
+    try:
+        from training import data as tdata
+        cls = await asyncio.to_thread(tdata.load_classifier_dataset)
+        gli = await asyncio.to_thread(tdata.load_gliner_dataset)
+        return {
+            "classifier": {
+                "total": len(cls),
+                "labels": tdata.label_distribution(cls),
+            },
+            "gliner": {
+                "total": len(gli),
+                "total_entities": sum(len(e.ner) for e in gli),
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/training/sessions")
+async def admin_training_start(payload: StartTrainingRequest) -> dict[str, Any]:
+    try:
+        from training import sessions as tsess
+        params = tsess.SessionParams(
+            model=payload.model,
+            epochs=payload.epochs,
+            batch_size=payload.batch_size,
+            lora=payload.lora,
+            extra_jsonl=payload.extra_jsonl,
+            val_ratio=payload.val_ratio,
+            seed=payload.seed,
+            base_model=payload.base_model,
+        )
+        info = await asyncio.to_thread(tsess.start_session, params)
+        return info
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/training/sessions")
+async def admin_training_list(limit: int = 50) -> dict[str, Any]:
+    try:
+        from training import sessions as tsess
+        items = await asyncio.to_thread(tsess.list_sessions, limit)
+        return {"sessions": items, "active_models": tsess.get_active_models()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/training/sessions/{session_id}")
+async def admin_training_detail(session_id: str) -> dict[str, Any]:
+    try:
+        from training import sessions as tsess
+        info = await asyncio.to_thread(tsess.get_session, session_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+        metrics = await asyncio.to_thread(tsess.read_metrics, session_id, 500)
+        log_tail = await asyncio.to_thread(tsess.read_log_tail, session_id, 8000)
+        return {"session": info, "metrics": metrics, "log_tail": log_tail}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/training/sessions/{session_id}/cancel")
+async def admin_training_cancel(session_id: str) -> dict[str, Any]:
+    try:
+        from training import sessions as tsess
+        ok = await asyncio.to_thread(tsess.cancel_session, session_id)
+        if not ok:
+            raise HTTPException(status_code=409, detail="취소할 수 없는 상태입니다.")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/training/sessions/{session_id}/activate")
+async def admin_training_activate(session_id: str) -> dict[str, Any]:
+    try:
+        from training import sessions as tsess
+        result = await asyncio.to_thread(tsess.activate_session, session_id)
+        return {"ok": True, **result}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

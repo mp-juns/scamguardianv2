@@ -1,0 +1,30 @@
+import Link from "next/link";
+
+import TrainingClient from "./TrainingClient";
+
+export const dynamic = "force-dynamic";
+
+export default function TrainingPage() {
+  return (
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top,#111827_0%,#020617_60%,#000000_100%)] px-4 py-8 text-slate-100 sm:px-6">
+      <div className="mx-auto w-full max-w-6xl space-y-6">
+        <header className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="text-sm text-slate-400">ScamGuardian Admin</p>
+            <h1 className="text-3xl font-semibold text-white">🧪 Fine-tuning</h1>
+            <p className="mt-2 text-sm text-slate-400">
+              라벨 데이터로 분류기·NER 모델을 도메인 특화 학습합니다. 학습은 백그라운드 프로세스로 실행되며 메트릭은 실시간 폴링됩니다.
+            </p>
+          </div>
+          <Link
+            href="/admin/training/about"
+            className="rounded-2xl border border-cyan-400/30 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 transition hover:bg-cyan-500/20"
+          >
+            📖 어떻게 동작하나? →
+          </Link>
+        </header>
+        <TrainingClient />
+      </div>
+    </main>
+  );
+}
