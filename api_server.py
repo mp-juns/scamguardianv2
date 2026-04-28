@@ -348,8 +348,12 @@ _PDF_URL_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
 
 
 def _wrap_with_soft_warning(response: dict, info: dict | None) -> dict:
-    """짧은 메시지 누적 위반 시 응답 최상단에 경고 simpleText 부착."""
-    if not info or info.get("count", 0) <= 0 or info.get("blocked"):
+    """짧은 메시지 누적 위반 시 응답 최상단에 경고 simpleText 부착.
+
+    첫 번째(count=1) 는 무시 — 정상 인사로 통과시킴.
+    두 번째(count>=2) 부터 경고 prepend.
+    """
+    if not info or info.get("count", 0) < 2 or info.get("blocked"):
         return response
     from platform_layer import abuse_guard as _ag
     count = info["count"]
@@ -1581,6 +1585,14 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     # ── 텍스트: 의도 분류 → 분기 ──
     # Claude Haiku 가 메시지를 보고 GREETING/HELP/CONTENT/ANALYZE_NO_CONTENT/CHAT 분류
     # (짧고 명확한 인사·사용법은 keyword fast-path 로 즉답)
+    # [어뷰즈 가드] 짧은 메시지 누적 2회 이상이면 Haiku 호출 skip — 어뷰저 무료 LLM 통로 차단
+    if soft_warn_info and soft_warn_info.get("count", 0) >= 2:
+        log.info(
+            "→ Haiku skip (soft warn count=%d) → welcome 직접 반환",
+            soft_warn_info["count"],
+        )
+        return _wrap_with_soft_warning(kakao_formatter.format_welcome(), soft_warn_info)
+
     intent = await asyncio.to_thread(context_chat.classify_intent, source)
     log.info("→ TEXT intent: %s", intent)
 

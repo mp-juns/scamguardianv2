@@ -62,7 +62,12 @@ def test_anonymous_no_block_tracking():
 
 
 def test_track_short_message_passes_but_counts():
-    """'안녕' 같은 짧은 인사는 통과하지만 user_id 별로 누적된다."""
+    """'안녕' 같은 짧은 인사는 통과하지만 user_id 별로 누적된다.
+
+    1번째: count=1 (경고 X — 1번째는 정상 인사)
+    2번째~3번째: count=2,3 (경고 prepend — 호출자 책임)
+    4번째: count=4 → blocked=True
+    """
     from platform_layer import abuse_guard as ag
     user = "kakao_user_short"
     # 1~3회: count 증가, blocked=False
@@ -75,6 +80,25 @@ def test_track_short_message_passes_but_counts():
     info = ag.track_short_message(user, "안녕")
     assert info["blocked"] is True
     assert ag.block_status(user)[0] is True
+
+
+def test_wrap_with_soft_warning_skips_first():
+    """첫 호출(count=1)에는 wrap 안 함 — 정상 인사로 보이게."""
+    from api_server import _wrap_with_soft_warning
+    from pipeline import kakao_formatter
+
+    base = kakao_formatter.format_welcome()
+    base_outputs = len(base["template"]["outputs"])
+
+    # count=1 → wrap 안 됨
+    out = _wrap_with_soft_warning(base, {"count": 1, "blocked": False})
+    assert len(out["template"]["outputs"]) == base_outputs
+
+    # count=2 → 경고 prepend
+    base2 = kakao_formatter.format_welcome()
+    out = _wrap_with_soft_warning(base2, {"count": 2, "blocked": False})
+    assert len(out["template"]["outputs"]) == base_outputs + 1
+    assert "2/3" in out["template"]["outputs"][0]["simpleText"]["text"]
 
 
 def test_track_short_message_skips_long_text():
