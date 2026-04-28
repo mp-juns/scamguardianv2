@@ -108,13 +108,30 @@ _QUICK_REPLY_RESET = {
     "messageText": "분석 초기화",
 }
 
-# 모든 응답에 동일한 두 버튼 — 사용법 / 분석 초기화
-_DEFAULT_QUICK_REPLIES: list[dict[str, str]] = [_QUICK_REPLY_HELP, _QUICK_REPLY_RESET]
+_QUICK_REPLY_RESULT_CHECK = {
+    "label": "결과확인",
+    "action": "message",
+    "messageText": "결과확인",
+}
+
+# 결과확인 버튼이 우선 노출돼야 하는 phase — 사용자가 결과를 기다리는 상황
+_PHASES_WITH_RESULT_CHECK = frozenset({
+    "polling",
+    "analyzing",
+    "busy",
+    "collecting_context",
+})
 
 
 def quick_replies(phase: str = "default") -> list[dict[str, str]]:
-    """phase 인자는 호환용 — 어떤 phase 든 동일한 [사용법, 분석 초기화] 반환."""
-    return list(_DEFAULT_QUICK_REPLIES)
+    """phase 별 퀵 리플라이 반환.
+
+    분석 결과를 기다리는 phase(폴링/refining/대기 등)에서는 결과확인 버튼을 우선 노출한다.
+    그 외 phase 에서는 [사용법, 분석 초기화] 두 개만 반환한다.
+    """
+    if phase in _PHASES_WITH_RESULT_CHECK:
+        return [_QUICK_REPLY_RESULT_CHECK, _QUICK_REPLY_HELP, _QUICK_REPLY_RESET]
+    return [_QUICK_REPLY_HELP, _QUICK_REPLY_RESET]
 
 
 def _risk_icon(level: str) -> str:

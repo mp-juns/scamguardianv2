@@ -19,6 +19,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -243,6 +244,50 @@ def startup() -> None:
 @app.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/methodology")
+def get_methodology() -> dict[str, Any]:
+    """위험도 점수 산정 방식 메타 정보. /methodology 페이지가 호출."""
+    from pipeline import config as pcfg
+
+    flags: list[dict[str, Any]] = []
+    for key, score_delta in pcfg.SCORING_RULES.items():
+        info = pcfg.FLAG_RATIONALE.get(key, {})
+        flags.append({
+            "flag": key,
+            "label_ko": pcfg.FLAG_LABELS_KO.get(key, key),
+            "score_delta": score_delta,
+            "rationale": info.get("rationale", ""),
+            "source": info.get("source", ""),
+        })
+    flags.sort(key=lambda x: (-x["score_delta"], x["flag"]))
+
+    risk_bands: list[dict[str, Any]] = []
+    prev_threshold = -1
+    for threshold, level, description in pcfg.RISK_LEVELS:
+        risk_bands.append({
+            "min": prev_threshold + 1,
+            "max": threshold if threshold < 999 else 100,
+            "level": level,
+            "description": description,
+        })
+        prev_threshold = threshold
+
+    return {
+        "flags": flags,
+        "risk_bands": risk_bands,
+        "weights": {
+            "llm_flag_score_ratio": pcfg.LLM_FLAG_SCORE_RATIO,
+            "llm_entity_merge_threshold": pcfg.LLM_ENTITY_MERGE_THRESHOLD,
+            "llm_flag_score_threshold": pcfg.LLM_FLAG_SCORE_THRESHOLD,
+            "llm_scam_type_override_threshold": pcfg.LLM_SCAM_TYPE_OVERRIDE_THRESHOLD,
+            "classification_threshold": pcfg.CLASSIFICATION_THRESHOLD,
+            "gliner_threshold": pcfg.GLINER_THRESHOLD,
+            "keyword_boost_weight": pcfg.KEYWORD_BOOST_WEIGHT,
+        },
+        "models": pcfg.MODELS,
+    }
 
 
 @app.get("/api/result/{token}")
@@ -1452,6 +1497,7 @@ async def analyze_upload(
     )
     tmp_path = Path(tmp_handle.name)
     wav_path = tmp_path.with_suffix(".wav")
+    media_persisted = False
     try:
         with tmp_handle:
             if file.file is None:
@@ -1495,16 +1541,47 @@ async def analyze_upload(
             use_llm=True,
             use_rag=use_rag,
         )
-        return await asyncio.to_thread(_run_pipeline, payload)
+        result = await asyncio.to_thread(_run_pipeline, payload)
+
+        # 라벨링 검증을 위해 원본 업로드 파일을 run_id 기반 영구 경로에 보존한다.
+        run_id = result.get("analysis_run_id") if isinstance(result, dict) else None
+        media_persisted = False
+        if run_id:
+            try:
+                target_dir = Path(".scamguardian") / "uploads" / str(run_id)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / f"source{suffix or ''}"
+                shutil.move(str(tmp_path), str(target_path))
+                media_persisted = True
+                try:
+                    repository.merge_run_metadata(run_id, {
+                        "media": {
+                            "kind": "uploaded_file",
+                            "original_filename": file.filename,
+                            "stored_path": str(target_path),
+                            "size_bytes": target_path.stat().st_size,
+                            "suffix": suffix or "",
+                        }
+                    })
+                except Exception as exc:
+                    logging.getLogger("upload").warning(
+                        "media metadata merge 실패 (run_id=%s): %s", run_id, exc,
+                    )
+            except Exception as exc:
+                logging.getLogger("upload").warning(
+                    "원본 업로드 파일 보존 실패 (run_id=%s): %s", run_id, exc,
+                )
+        return result
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if not media_persisted:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         try:
             wav_path.unlink(missing_ok=True)
         except Exception:
@@ -1634,6 +1711,59 @@ async def admin_save_annotation(run_id: str, payload: HumanAnnotationRequest) ->
             notes=payload.notes,
         )
         return {"ok": True, "annotation": annotation}
+    except HTTPException:
+        raise
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+_MEDIA_MIME_BY_SUFFIX = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+}
+
+
+_UPLOADS_ROOT = (Path(".scamguardian") / "uploads").resolve()
+
+
+def _resolve_admin_media_path(stored_path_str: str) -> Path:
+    """저장된 미디어 경로가 uploads 디렉토리 안인지 검증 후 반환 (path traversal 방지)."""
+    candidate = Path(stored_path_str).resolve()
+    try:
+        candidate.relative_to(_UPLOADS_ROOT)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="허용되지 않은 경로입니다.") from exc
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="미디어 파일을 찾을 수 없습니다.")
+    return candidate
+
+
+@app.get("/api/admin/runs/{run_id}/media")
+async def admin_get_media(run_id: str) -> FileResponse:
+    """라벨링용으로 보존된 원본 업로드 파일을 스트리밍한다."""
+    try:
+        _require_db()
+        detail = await asyncio.to_thread(repository.get_run_detail, run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="해당 run을 찾을 수 없습니다.")
+        media = (detail["run"].get("metadata") or {}).get("media") or {}
+        stored = media.get("stored_path")
+        if not stored:
+            raise HTTPException(status_code=404, detail="저장된 미디어가 없습니다.")
+        path = _resolve_admin_media_path(stored)
+        suffix = path.suffix.lower()
+        media_type = _MEDIA_MIME_BY_SUFFIX.get(suffix, "application/octet-stream")
+        filename = media.get("original_filename") or path.name
+        return FileResponse(path, media_type=media_type, filename=filename)
     except HTTPException:
         raise
     except EnvironmentError as exc:

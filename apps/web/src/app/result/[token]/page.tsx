@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 
 const API_BASE_URL =
@@ -225,9 +226,17 @@ export default async function ResultPage({ params }: PageProps) {
           const llmSum = llmFlags.reduce((a, b) => a + (b.score_delta ?? 0), 0);
           return (
             <section className="rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
-              <h2 className="mb-3 text-lg font-semibold text-slate-100">
-                📊 점수 산정 방식
-              </h2>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-lg font-semibold text-slate-100">
+                  📊 점수 산정 방식
+                </h2>
+                <Link
+                  href="/methodology"
+                  className="rounded-full border border-slate-600 px-3 py-1 text-xs text-slate-300 transition hover:border-cyan-400/50 hover:text-cyan-200"
+                >
+                  점수 기준 자세히 보기 →
+                </Link>
+              </div>
               <p className="mb-4 text-sm text-slate-400">
                 각 플래그의 점수를 합산해 총 위험도를 산출합니다.
                 LLM 보조 제안 플래그는 가중치 0.5 가 적용돼 절반만 반영됩니다 (맹신 방지).

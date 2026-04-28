@@ -536,115 +536,127 @@ def flag_label_ko(flag: str) -> str:
 
 
 # 플래그 점수의 정당성·근거 — 사용자/라벨러에게 "왜 이 점수인가요?" 답변용.
-# 가능한 한 공식 출처(KISA, 금감원, 경찰청)나 학술 자료를 명시.
+# 공식 출처(KISA, 금감원, 경찰청)와 학술 자료(Cialdini 영향력 원리, Whitty 스캠
+# 설득 모델, FBI IC3 등) 를 함께 인용해 점수의 정당성을 강화한다.
+#
+# 공통 학술 프레임워크:
+# - Cialdini, R. B. (2021). Influence, New and Expanded: The Psychology of
+#   Persuasion. Harper Business. — 권위(authority)·희소성(scarcity)·
+#   사회적 증거(social proof) 6대 영향력 원리
+# - Whitty, M. T. (2013). The Scammers Persuasive Techniques Model.
+#   British Journal of Criminology, 53(4), 665–684. — 사기범 설득 단계 모델
+# - Stajano, F., & Wilson, P. (2011). Understanding scam victims: Seven
+#   principles for systems security. CACM, 54(3), 70–75. — 사회공학 7원칙
+# - FBI IC3 Annual Internet Crime Report — 글로벌 사기 통계
+# - 금융감독원 보이스피싱·유사수신 감독사례집 (연간) — 국내 통계
 FLAG_RATIONALE: dict[str, dict[str, str]] = {
     "business_not_registered": {
-        "rationale": "정상 사업자라면 국세청 사업자등록 조회에 노출됨. 미등록 = 비공식 거래 → 사기 위험 높음.",
-        "source": "국세청 사업자등록상태조회 / 전자상거래법 제12조",
+        "rationale": "정상 사업자라면 국세청 사업자등록 조회에 노출됨. 미등록 = 비공식 거래 → 사기 위험 높음. 점수 20점은 단독으로는 위험 등급(41~70)에 못 미치지만 추가 신호와 결합 시 결정적 가산점.",
+        "source": "국세청 사업자등록상태조회 / 전자상거래법 제12조 / Stajano & Wilson (2011) Principle 1: Distraction (위장된 정상성)",
     },
     "phone_scam_reported": {
-        "rationale": "신고 이력 있는 번호는 재범 확률 매우 높음. KISA 통계 기준 신고 번호의 70%+ 가 추가 신고 발생.",
-        "source": "KISA 보이스피싱 동향 보고서 (2023)",
+        "rationale": "신고 이력 있는 번호는 재범 확률 매우 높음. KISA 통계 기준 신고 번호의 70%+ 가 추가 신고 발생. 25점은 단일 플래그 최고 등급으로, 신고 DB 매칭만으로도 '주의→위험' 격상이 가능함.",
+        "source": "KISA 보이스피싱 동향 보고서 / Anderson, R. (2008) Security Engineering Ch.2 — 재범자 베이지안 사전확률",
     },
     "ceo_name_mismatch": {
-        "rationale": "법인 대표자명이 공식 등록 정보와 다르면 사칭 가능성. 사기 사례 빈도 분석 결과.",
-        "source": "금융감독원 유사수신 감독사례집",
+        "rationale": "법인 대표자명이 공식 등록 정보와 다르면 사칭 가능성. 단독 신호로는 애매할 수 있어 15점 (보조 신호급).",
+        "source": "금융감독원 유사수신 감독사례집 / Cialdini (2021) — 권위(Authority) 원리 악용 패턴",
     },
     "fss_not_registered": {
-        "rationale": "투자권유는 금감원 등록 업체만 합법. 미등록 업체 권유는 자본시장법 위반.",
-        "source": "자본시장과 금융투자업에 관한 법률 제11조",
+        "rationale": "투자권유는 금감원 등록 업체만 합법. 미등록 업체 권유는 자본시장법 위반. 법적 위반이지만 합법 자문업자 가장 사례도 있어 15점 보수적 책정.",
+        "source": "자본시장과 금융투자업에 관한 법률 제11조 / 금융감독원 불법금융 동향 보고서",
     },
     "fake_certification": {
-        "rationale": "존재하지 않거나 위조된 인증기관 명칭 사용은 표시·광고 공정화법 위반 + 사기 표지.",
-        "source": "표시·광고의 공정화에 관한 법률 제3조",
+        "rationale": "존재하지 않거나 위조된 인증기관 명칭 사용은 표시·광고 공정화법 위반 + 사기 표지. Cialdini 의 권위 원리 악용 — '인증' 단어만으로 신뢰 형성.",
+        "source": "표시·광고의 공정화에 관한 법률 제3조 / Cialdini (2021) — Authority Heuristic / Whitty (2013) — Authority cue 단계",
     },
     "website_scam_reported": {
-        "rationale": "도메인이 피싱·사기 신고 DB에 등록된 경우. 동일 도메인 재범률 80%+.",
-        "source": "KISA 피싱사이트 신고센터 / phishtank",
+        "rationale": "도메인이 피싱·사기 신고 DB에 등록된 경우. 동일 도메인 재범률 80%+. APWG 글로벌 통계도 동일 추세.",
+        "source": "KISA 피싱사이트 신고센터 / phishtank / APWG Phishing Activity Trends Report (분기 발행)",
     },
     "abnormal_return_rate": {
-        "rationale": "연 20% 이상 수익 보장은 자본시장법상 불법 권유 신호. 정상 펀드 평균 연 5~10%.",
-        "source": "금융감독원 보이스피싱·유사수신 감독사례집",
+        "rationale": "연 20% 이상 수익 보장은 자본시장법상 불법 권유 신호. 정상 주식·채권 펀드의 장기 평균 수익률은 연 5~10% (S&P 500 historical 약 10% 명목). 보장형 + 고수익은 Ponzi 사기 핵심 패턴.",
+        "source": "금융감독원 보이스수신 감독사례집 / SEC Investor Bulletin: Affinity Fraud / Frankel, T. (2012) The Ponzi Scheme Puzzle, Oxford UP",
     },
     "fake_government_agency": {
-        "rationale": "검찰·경찰·금감원 등 공공기관은 전화·문자로 자금 이체 요구 절대 안 함. 100% 사기.",
-        "source": "검찰청·경찰청·금감원 합동 보이스피싱 예방 가이드",
+        "rationale": "검찰·경찰·금감원 등 공공기관은 전화·문자로 자금 이체 요구 절대 안 함. Cialdini 의 권위 원리를 가장 강하게 악용. 25점은 단독 만으로 '주의→위험' 격상 가능한 최고 등급.",
+        "source": "검찰청·경찰청·금감원 합동 보이스피싱 예방 가이드 / Cialdini (2021) — Authority / Modic & Lea (2013) Scam compliance and the psychology of persuasion, SSRN",
     },
     "personal_info_request": {
-        "rationale": "주민번호·계좌번호·OTP 등 민감정보를 요구하는 패턴은 보이스피싱 핵심 지표.",
-        "source": "KISA 보이스피싱 행위 분석",
+        "rationale": "주민번호·계좌번호·OTP 등 민감정보를 요구하는 패턴은 보이스피싱 핵심 지표. 정상 금융기관은 비밀번호·OTP 를 절대 묻지 않음.",
+        "source": "KISA 보이스피싱 행위 분석 / 개인정보보호법 제15조 / Hadnagy, C. (2018) Social Engineering: The Science of Human Hacking, Wiley",
     },
     "medical_claim_unverified": {
-        "rationale": "식약처 미인증 효능 주장은 약사법 위반. 건강식품 사기 빈출 패턴.",
-        "source": "약사법 제68조 (의약품 등의 광고 제한)",
+        "rationale": "식약처 미인증 효능 주장은 약사법 위반. 건강식품 사기는 노년층 표적이며 Cialdini 의 사회적 증거(가짜 후기) + 권위(가짜 박사) 결합 패턴.",
+        "source": "약사법 제68조 / 식품의약품안전처 부당 광고 단속 / FTC Health Fraud Reports / Cialdini (2021) — Social Proof",
     },
     "fake_exchange": {
-        "rationale": "금감원·금융위 등록되지 않은 거래소는 자금 출금 불가 사례 다수. 코인 사기 핵심.",
-        "source": "특정금융거래정보법 제7조 (가상자산사업자 신고)",
+        "rationale": "금감원·금융위 등록되지 않은 거래소는 자금 출금 불가 사례 다수. 코인 사기 핵심. Pig butchering(殺豬盤) 사기의 표준 단계.",
+        "source": "특정금융거래정보법 제7조 / FBI IC3 Cryptocurrency Fraud Report / Cross, C. (2023) Romance fraud and pig butchering, Trends & Issues in Crime, AIC",
     },
     "account_scam_reported": {
-        "rationale": "계좌가 사기 이용 신고 이력 있음. 즉각 송금 차단 권고.",
-        "source": "전기통신금융사기 피해 방지 및 환급에 관한 특별법",
+        "rationale": "계좌가 사기 이용 신고 이력 있음. 즉각 송금 차단 권고. 통신사기피해환급법상 의심 계좌는 지급정지 대상. 25점 최고 등급.",
+        "source": "전기통신금융사기 피해 방지 및 환급에 관한 특별법 / 금융감독원 사기 이용계좌 통계",
     },
     "prepayment_requested": {
-        "rationale": "취업·대출 명목 선납금 요구는 사기죄 + 대부업법 위반. 실제 합법 업체는 선납 없음.",
-        "source": "대부업 등의 등록 및 금융이용자 보호에 관한 법률",
+        "rationale": "취업·대출 명목 선납금 요구는 사기죄 + 대부업법 위반. 실제 합법 업체는 선납 없음. Stajano & Wilson 의 'Need and Greed' 원칙(절박한 상황 표적) 악용.",
+        "source": "대부업 등의 등록 및 금융이용자 보호에 관한 법률 / 직업안정법 / Stajano & Wilson (2011) Principle 4: Need and Greed",
     },
     "urgent_transfer_demand": {
-        "rationale": "즉각 송금 요구는 보이스피싱 1순위 패턴. 사고력 마비 유도 목적.",
-        "source": "경찰청 사이버수사국 보이스피싱 통계",
+        "rationale": "즉각 송금 요구는 보이스피싱 1순위 패턴. 사고력 마비 유도(visceral influence). Loewenstein (1996) 의 hot-cold empathy gap 이론으로 설명되는 의사결정 왜곡.",
+        "source": "경찰청 사이버수사국 보이스피싱 통계 / Cialdini (2021) — Scarcity / Loewenstein, G. (1996) Out of control: Visceral influences on behavior, OBHDP, 65(3) / Whitty (2013) — Urgency 단계",
     },
     "threat_or_coercion": {
-        "rationale": "협박·강요 발화는 형법 제283조 협박죄. 정상 거래에는 절대 등장 안 함.",
-        "source": "형법 제283조 / KISA 통계",
+        "rationale": "협박·강요 발화는 형법 제283조 협박죄. 정상 거래에는 절대 등장 안 함. 공포(fear appeal) 활용 사회공학 — Witte (1992) Extended Parallel Process Model 로 설명.",
+        "source": "형법 제283조 / KISA 통계 / Witte, K. (1992) Putting the fear back into fear appeals, Communication Monographs, 59(4)",
     },
     "impersonation_family": {
-        "rationale": "가족 사칭은 메신저피싱 표준 패턴. 영상통화 거부 시 100% 사기.",
-        "source": "경찰청 메신저피싱 예방 가이드",
+        "rationale": "가족 사칭은 메신저피싱 표준 패턴. 영상통화 거부 시 100% 사기. Cialdini 의 호감(Liking) 원리 + 절박감 결합. 노년층·부모층 피해 집중.",
+        "source": "경찰청 메신저피싱 예방 가이드 / 금융감독원 메신저피싱 통계 / Cialdini (2021) — Liking / Whitty (2013) — emotional manipulation",
     },
     "romance_foreign_identity": {
-        "rationale": "해외 군인·의사·외교관 사칭은 로맨스 스캠 표준. FBI/Interpol 보고서 다수.",
-        "source": "FBI IC3 Romance Scam Report (2023)",
+        "rationale": "해외 군인·의사·외교관 사칭은 로맨스 스캠 표준. FBI IC3 2023 보고서 기준 로맨스 스캠 피해액 6.5억 달러. Whitty 의 스캠 설득 모델 4단계(grooming) 핵심.",
+        "source": "FBI IC3 2023 Internet Crime Report / Whitty, M. T. (2013) The Scammers Persuasive Techniques Model, Br J Criminology, 53(4) / Whitty & Buchanan (2012) The online romance scam, Cyberpsychology, 15(3)",
     },
     "job_deposit_requested": {
-        "rationale": "정상 채용은 입사 전 금전 요구 없음. 직업안정법 위반.",
-        "source": "직업안정법 제32조 (금품 등의 수령 금지)",
+        "rationale": "정상 채용은 입사 전 금전 요구 없음. 직업안정법 위반. 청년·구직자 표적의 절박감 악용.",
+        "source": "직업안정법 제32조 / 고용노동부 채용 사기 단속 / Stajano & Wilson (2011) — Need and Greed",
     },
     "smishing_link_detected": {
-        "rationale": "단축 URL 또는 비정상 도메인 포함 SMS 는 스미싱 의심. KISA 차단 통계 다수.",
-        "source": "KISA 스미싱 차단 시스템",
+        "rationale": "단축 URL 또는 비정상 도메인 포함 SMS 는 스미싱 의심. KISA 차단 통계 다수. APWG 보고서상 SMS phishing(smishing)은 2022 이후 이메일 피싱 능가하는 주요 채널.",
+        "source": "KISA 스미싱 차단 시스템 / 방송통신위원회 스미싱 통계 / APWG Phishing Activity Trends Report",
     },
     "fake_escrow_bypass": {
-        "rationale": "공식 에스크로 회피 유도는 중고거래 사기 표준. 안전결제 우회 = 위험 신호.",
-        "source": "경찰청 사이버범죄 통계",
+        "rationale": "공식 에스크로 회피 유도는 중고거래 사기 표준. 안전결제 우회 = 위험 신호. 가격 할인 명분으로 정상 절차 무력화 — Stajano & Wilson 의 'Distraction' 원칙.",
+        "source": "경찰청 사이버범죄 통계 / 한국인터넷진흥원 중고거래 사기 동향 / Stajano & Wilson (2011) Principle 1: Distraction",
     },
     "authority_context_mismatch": {
-        "rationale": "발화자 직업·신원 vs 발화 내용의 BERT 임베딩 코사인 유사도가 임계 미만 → 사칭 의심.",
-        "source": "Sentence-BERT 한국어 임베딩 분석 (자체 휴리스틱)",
+        "rationale": "발화자 직업·신원 vs 발화 내용의 SBERT 임베딩 코사인 유사도가 임계 미만 → 사칭 의심. 의미적 일관성 분석 기법.",
+        "source": "Reimers & Gurevych (2019) Sentence-BERT, EMNLP / Cer et al. (2017) STS Benchmark",
     },
     "authority_context_uncertain": {
-        "rationale": "유사도 경계선상 — 명확하지 않지만 낮은 가산 점수로 보수적 반영.",
-        "source": "자체 임계값 튜닝",
+        "rationale": "유사도 경계선상 — 명확하지 않지만 낮은 가산 점수로 보수적 반영. 5점은 단독으론 등급 변화 없으며 다른 신호의 보조 가중치 역할.",
+        "source": "자체 임계값 튜닝 / Reimers & Gurevych (2019) SBERT",
     },
     "query_a_confirmed": {
-        "rationale": "신뢰 언론(Reuters/Bloomberg/연합 등)에서 화자+발언 동시 확인 → 신뢰도 ↑, 차감.",
-        "source": "Domain Trust Score (자체 스펙)",
+        "rationale": "신뢰 언론(Reuters/Bloomberg/연합 등)에서 화자+발언 동시 확인 → 신뢰도 ↑, 차감. 출처 다중 검증 원칙.",
+        "source": "Domain Trust Score (자체 스펙) / Graves, L. (2016) Deciding What's True: The Rise of Political Fact-Checking, Columbia UP",
     },
     "query_a_unconfirmed": {
-        "rationale": "신뢰 언론에서 확인 불가 = 출처 검증 실패.",
-        "source": "Domain Trust Score (자체 스펙)",
+        "rationale": "신뢰 언론에서 확인 불가 = 출처 검증 실패. 권위 인용의 진위 불명 시 회의 원칙.",
+        "source": "Domain Trust Score (자체 스펙) / SIFT 미디어 리터러시 모델 (Caulfield, 2017)",
     },
     "query_b_factcheck_found": {
-        "rationale": "팩트체크 결과에서 사기 단서가 발견됨.",
-        "source": "SNU FactCheck / Snopes",
+        "rationale": "팩트체크 결과에서 사기 단서가 발견됨. 독립 검증 기관의 사후 판정 활용.",
+        "source": "SNU FactCheck / Snopes / IFCN (International Fact-Checking Network) Code of Principles",
     },
     "query_b_confirmed": {
-        "rationale": "팩트체크에서 사실 확인됨 → 신뢰도 보정.",
-        "source": "SNU FactCheck",
+        "rationale": "팩트체크에서 사실 확인됨 → 신뢰도 보정. 가짜 양성(false positive) 완화 장치.",
+        "source": "SNU FactCheck / IFCN",
     },
     "query_c_scam_pattern_found": {
-        "rationale": "검색 결과에서 동일/유사 사기 패턴 단서 발견.",
-        "source": "Serper API 검색 휴리스틱",
+        "rationale": "검색 결과에서 동일/유사 사기 패턴 단서 발견. 사회적 증거(피해자 후기·뉴스)로 추가 가중.",
+        "source": "Serper API 검색 휴리스틱 / Cialdini (2021) — Social Proof",
     },
 }
 

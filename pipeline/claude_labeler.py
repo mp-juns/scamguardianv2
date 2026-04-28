@@ -64,9 +64,9 @@ def _build_prompt(
 ## 지시사항
 1. scam_type: 허용 목록에서 가장 적합한 것을 선택
 2. entities: 텍스트에서 실제로 언급된 것만 추출. label은 선택한 scam_type의 허용 라벨 중 하나
-3. flags: 텍스트에 명확한 근거가 있을 때만 포함. evidence는 텍스트에서 직접 인용
-4. reasoning: 판단 근거를 2~3문장으로 간결하게 요약
-5. JSON 외 텍스트 절대 금지
+3. flags: 텍스트에 명확한 근거가 있을 때만 포함. evidence는 텍스트에서 직접 인용 (각 evidence 최대 80자, 길면 줄임)
+4. reasoning: 판단 근거를 2~3문장으로 간결하게 요약 (최대 200자)
+5. JSON 외 텍스트 절대 금지. 모든 문자열 안의 큰따옴표는 \" 로 이스케이프
 
 반환 JSON 스키마:
 {{
@@ -82,14 +82,104 @@ def _build_prompt(
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
-    """Claude 응답에서 JSON을 추출한다."""
+    """Claude 응답에서 JSON을 추출한다.
+
+    응답이 max_tokens 등으로 잘려 JSON 끝이 깨졌을 수 있으므로,
+    파싱 실패 시 마지막 닫힌 객체까지만 잘라 재시도한다.
+    """
     # 마크다운 코드블록 제거
     text = re.sub(r"```(?:json)?\s*", "", raw).strip()
-    # 첫 번째 { ... } 블록 추출
+    text = text.rstrip("` \n\r\t")
     match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        return json.loads(match.group(0))
-    return json.loads(text)
+    candidate = match.group(0) if match else text
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    # 잘린 JSON 복구 시도 — 괄호 균형 맞추는 위치까지만 사용
+    repaired = _truncate_to_balanced(candidate)
+    if repaired is not None:
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        "Claude 응답을 JSON으로 파싱하지 못했습니다. "
+        "max_tokens 부족으로 응답이 잘렸을 수 있습니다. "
+        f"raw 응답 미리보기: {raw[:200]!r}"
+    )
+
+
+def _truncate_to_balanced(text: str) -> str | None:
+    """문자열을 앞에서부터 읽어 괄호/문자열이 균형 잡힌 가장 긴 prefix 를 반환.
+
+    잘린 JSON 응답에서 마지막으로 완전히 닫힌 객체/배열까지를 잘라낸다.
+    리스트 끝이 trailing comma 로 깨진 경우도 보정한다.
+    """
+    if not text or text[0] != "{":
+        return None
+
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    last_safe = -1  # 가장 마지막으로 균형 잡힌 위치 (직전까지 유효)
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                break
+            stack.pop()
+            if not stack:
+                last_safe = i  # 최상위 객체가 닫힌 위치
+                break
+        elif ch == "," and len(stack) == 1:
+            # 최상위 객체 안에서 완전한 key:value 페어가 끝난 시점
+            last_safe = i - 1
+
+    if last_safe < 0:
+        return None
+
+    truncated = text[: last_safe + 1].rstrip().rstrip(",")
+    # 남은 열린 괄호를 닫아 본다
+    closers = []
+    in_string = False
+    escape = False
+    stack = []
+    for ch in truncated:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    for opener in reversed(stack):
+        closers.append("}" if opener == "{" else "]")
+    return truncated + "".join(closers)
 
 
 def _sanitize(
@@ -173,11 +263,20 @@ def generate_draft(
 
     message = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=4096,
         system="당신은 한국어 사기 탐지 라벨러입니다. JSON만 반환하세요.",
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw = message.content[0].text
+    # 첫 text 블록을 찾는다 (extended thinking 등 비-텍스트 블록 대비)
+    raw = ""
+    for block in message.content:
+        text = getattr(block, "text", None)
+        if text:
+            raw = text
+            break
+    if not raw:
+        raise ValueError(f"Claude 응답에 텍스트가 없습니다. stop_reason={message.stop_reason}")
+
     result = _parse_response(raw)
     return _sanitize(result, predicted_scam_type)
