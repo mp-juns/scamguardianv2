@@ -10,8 +10,10 @@ ScamGuardian v3 — 한국어 음성·텍스트·이미지·PDF 사기 탐지 AI
 - **Frontend**: Next.js 16 App Router (`apps/web/`) — Next 16은 기존 버전과 API·컨벤션이 다릅니다. `node_modules/next/dist/docs/`를 먼저 확인하세요.
 - **Backend**: FastAPI (`api_server.py`) — 분석·webhook·라벨링·학습 세션·결과 토큰 페이지 모두 한 서버.
 - **Pipeline**: `pipeline/` — **6 phase** (Phase 0 Safety + Phase 1 STT/Vision + Phase 2~5)
+- **Platform layer**: `platform_layer/` — API key·rate limit·cost ledger·observability·abuse_guard middleware
 - **DB**: Postgres(+pgvector) 또는 SQLite, `db/repository.py`가 Facade 역할
 - **v3 신규**: Phase 0 안전성 필터 (VirusTotal), Phase 1 멀티모달 입력 (이미지·PDF vision OCR), Fine-tuning 웹 UI + 자동 swap.
+- **v3.x 신규**: API key 시스템(3중 cap), 비용 추적 ledger, 어뷰즈 가드(짧은 메시지 누적 자동 블록), pytest 테스트.
 
 ## 개발 실행 명령
 
@@ -92,6 +94,12 @@ python scripts/batch_ingest.py --dry-run
 | `VISION_PDF_MAX_PAGES` | PDF 처리 시 최대 페이지 수 | `5` |
 | `VISION_PDF_DPI` | PDF 페이지 렌더 DPI | `150` |
 | `AIHUB_API_KEY` | AI Hub CLI 자동화 (`scripts/aihub.py`) | 학습 데이터 받을 때만 |
+| `ABUSE_SOFT_THRESHOLD` | **v3.x** 어뷰즈 가드 — "짧은 메시지" 자수 임계 | `10` |
+| `ABUSE_WARN_LIMIT` | 짧은 메시지 누적 경고 횟수 | `3` |
+| `ABUSE_BLOCK_DURATION` | 자동 블록 지속 시간(초) | `3600` |
+| `ABUSE_VIOLATION_WINDOW` | 위반 누적 윈도우(초) | `3600` |
+| `ANALYZE_MAX_TEXT_LENGTH` | `/api/analyze` 텍스트 최대 글자 | `5000` |
+| `VIRUSTOTAL_RPM` | VT 분당 호출 한도 (free tier) | `4` |
 
 ## 아키텍처
 
@@ -389,6 +397,43 @@ Phase 5: 스코어링
 - **Backend**: Render (`uvicorn api_server:app --host 0.0.0.0 --port $PORT`)
 - 세부 설정: `DEPLOY.md`, `render.yaml`
 
+## v3.x platform 레이어 (2026-04-29)
+
+### `platform_layer/` 모듈 구조
+
+| 파일 | 역할 |
+|------|------|
+| `api_keys.py` | `sg_<urlsafe>` 발급, sha256 해시 저장, lookup/list/revoke |
+| `pricing.py` | Claude/Whisper/Serper/VirusTotal 가격표 — `claude_cost(model, in, out)` 등 |
+| `cost.py` | contextvars `_REQUEST_ID` / `_API_KEY_ID` + `record_claude/openai_whisper/serper/virustotal` |
+| `rate_limit.py` | per-key RPM 슬라이딩 윈도우 + 월별 호출 quota + 월별 USD cap |
+| `abuse_guard.py` | 길이/반복/gibberish/dup + 위반 누적 자동 블록 + 짧은 메시지 트래커 |
+| `middleware.py` | FastAPI `PlatformMiddleware` — request_id 주입, key 검증, rate limit, request_log |
+
+### DB 추가 테이블 (`db/sqlite_repository.py`)
+
+- `api_keys`: id, key_hash, label, monthly_quota, rpm_limit, monthly_usd_quota, status, usage*
+- `cost_events`: provider × api_key × request × usd_amount ledger
+- `request_log`: 모든 요청 status/latency/error — observability 백본
+
+### 어뷰즈 가드 동작 (카카오 webhook 통합)
+
+각 webhook 진입에서 두 단계 체크:
+1. `block_status(user_id)` — 이미 차단 상태면 `format_abuse_blocked` + `_pending_jobs.pop` (채팅 강제 종료)
+2. `track_short_message(user_id, text)` — 첨부 없는 텍스트 한정. < 10자 시 `record_violation` 호출
+   - count==1: 통과 (1번째 free pass)
+   - count==2~3: 응답에 ⚠️ 경고 prepend (`_wrap_with_soft_warning`)
+   - count==4: blocked=True → 차단 카드 + 1시간 block
+3. count >= 2 면 `classify_intent` (Claude Haiku) **호출 자체 skip** — 어뷰저 무료 LLM 통로 차단
+
+### API 보안 정책
+
+- `/api/analyze`, `/api/analyze-upload` — API key 필수 (`Authorization: Bearer sg_...` 또는 `X-API-Key`)
+- `X-User-Id` 헤더 옵션 — 외부 클라이언트 per-user 어뷰즈 누적
+- `/webhook/kakao` — 카카오 자체 인증 사용, API key skip
+- `/api/admin/*` — 현재 미인증 (TODO 1번 — 어드민 게이팅)
+- Rate limit 초과 시 `429 Retry-After`, BLOCKED 시 `423 Locked`
+
 ## v3 신규 시스템 (2026-04-29)
 
 ### Phase 0 안전성 필터 (`pipeline/safety.py`)
@@ -454,13 +499,39 @@ python scripts/aihub.py download-labels 98 --domain 금융 --dry-run
 - 그 후 기존 `_kakao_start_context_collection()` 흐름 그대로 — `stt.transcribe()` 가 vision 자동 라우팅
 - `format_question` / `format_analyzing` / `format_queued` 모두 IMAGE/PDF 메시지 추가
 
+## 테스트 (`tests/`)
+
+```bash
+pip install pytest
+pytest                    # 46 passed (5초 미만)
+pytest tests/test_abuse_guard.py -v
+```
+
+`tests/conftest.py`:
+- `_isolate_env`: 모든 테스트에 격리된 임시 SQLite path 자동 주입
+- 외부 API key (ANTHROPIC/OPENAI/SERPER/VIRUSTOTAL) 자동 unset — 실수 호출 방지
+
+테스트 모듈 분포:
+- `test_abuse_guard.py` (10) + `test_abuse_block.py` (8)
+- `test_platform_api_keys.py` (5) + `test_platform_usd_cap.py` (3)
+- `test_cost_pricing.py` (4)
+- `test_safety_parser.py` (3) + `test_safety_scoring.py` (4)
+- `test_kakao_detect_input.py` (9)
+
 ## 다음 작업 (TODO)
 
-(2026-04-29 정리 — v3 작업 거의 마무리)
+(2026-04-29 정리 — v3.x platform 마무리)
 
-### 가능한 후속
+### 운영 가능 플랫폼이 되려면 남은 것
 
-1. **AI Hub 데이터 도착 → ingest 스크립트**: `scripts/ingest_aihub.py` — 데이터셋별 라벨 JSON 스키마 보고 우리 JSONL 포맷(text + label/entities) 으로 변환. 실물 데이터 받은 다음에 작성.
+1. **어드민 인증** — `/admin/*` 게이팅 + RBAC. 현재 URL 만 알면 라벨링·키발급·모델활성화 가능.
+2. **데이터 retention 정책** — `.scamguardian/uploads/` 영구 보존 → 30/60/90일 자동 삭제 + 사용자 동의 처리.
+
+### 자잘한 후속
+
+1. **AI Hub 데이터 도착 → ingest 스크립트**: `scripts/ingest_aihub.py` — 데이터셋별 라벨 JSON 스키마 보고 우리 JSONL 포맷(text + label/entities) 으로 변환.
 2. **카카오 webhook 실제 이미지·PDF 테스트**: 합성 포스터 말고 진짜 사기 광고/캡쳐로 vision OCR 정확도 검증.
 3. **active_models 모델 메타 표시**: `/admin/training` 활성 모델 카드에 학습 데이터 양, 마지막 평가 F1 함께 노출.
 4. **GLiNER 학습 보강**: 현재 fit() API 없는 버전 fallback 만 동작. 외부 trainer (urchade/GLiNER 공식 가이드) 통합.
+5. **API 통합 테스트**: 현재 단위 테스트만. FastAPI TestClient 로 `/api/analyze` end-to-end (mock provider) 추가.
+6. **Postgres 마이그레이션**: `api_keys`/`cost_events`/`request_log` 가 SQLite 만 지원. Postgres 환경 운영 시 facade 확장.

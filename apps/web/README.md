@@ -14,6 +14,7 @@ Next.js 16 App Router 기반 웹 어드민 + 결과·methodology·training UI.
 | `/admin/browse` | DB 브라우저 — 검색·필터 |
 | `/admin/training` | **v3** — Fine-tuning 세션 (시작·진행률·활성화) |
 | `/admin/training/about` | **v3** — 모델 역할 + 파이프라인 위치 + 학습 효과 설명 |
+| `/admin/platform` | **v3.x** — API key 발급·revoke + observability(p50/p95) + 비용 대시보드 |
 | `/methodology` | 점수 산정 방식 — 합산식·등급·플래그·학술 출처 |
 | `/result/[token]` | 카카오 카드 "자세한 결과 보기" 페이지 (1시간 토큰) |
 

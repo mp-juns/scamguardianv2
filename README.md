@@ -13,6 +13,9 @@
 - **Fine-tuning 웹 UI**: `/admin/training` — 분류기·GLiNER 학습 세션을 백그라운드 subprocess 로 시작, recharts 로 loss/F1 실시간 그래프, 완료 후 한 클릭으로 파이프라인 swap.
 - **모델 활성화 자동 swap**: 학습 끝나면 `.scamguardian/active_models.json` 갱신 → 다음 분석부터 fine-tuned 모델 사용. 경로 무효 시 base 모델로 자동 fallback.
 - **점수 산정 방식 페이지** (`/methodology`): 합산식·등급·플래그별 정당성·인용 학술 출처(Cialdini, Whitty, Stajano & Wilson 등) 모두 공개.
+- **Platform 레이어** (`/admin/platform`): API key 발급·revoke, RPM/월별 호출/월별 USD 3중 cap, 외부 API 비용(claude·openai·serper·vt) 실시간 ledger, request_log 기반 observability(p50/p95).
+- **어뷰즈 가드**: 길이 cap·반복·gibberish 차단 + 짧은 메시지 누적 트래커. 카카오 user_id 별 3회 경고 후 1시간 자동 블록 + 채팅 강제 종료.
+- **테스트** (pytest): 격리된 SQLite + 외부 API mock 0회로 46 passed (`pytest`).
 
 ## API 우선 설계
 
@@ -37,9 +40,11 @@ Next.js 의 `apps/web/src/app/api/*/route.ts` 들은 모두 `proxyJsonRequest` /
 | `pipeline/vision.py` | v3 — Claude vision OCR (이미지/PDF) |
 | `pipeline/active_models.py` | v3 — 학습된 체크포인트 swap reader |
 | `api_server.py` | FastAPI 엔드포인트 + 카카오 webhook + 결과 토큰 페이지 |
-| `apps/web/` | Next.js 16 App Router 어드민·결과·methodology·training UI |
+| `platform_layer/` | v3.x — API key·rate limit·cost ledger·observability·abuse_guard middleware |
+| `apps/web/` | Next.js 16 App Router 어드민·결과·methodology·training·platform UI |
 | `db/` | SQLite / Postgres(pgvector) 저장소 |
 | `training/` | v3 — 분류기·GLiNER fine-tune 스크립트 + 세션 관리자 |
+| `tests/` | v3.x — pytest 단위·통합 테스트 (46 passed) |
 | `scripts/` | 스택 실행, 배치 인제스트, AI Hub CLI 래퍼 |
 
 ## 빠른 실행
@@ -92,6 +97,12 @@ python run_analysis.py --file ./scam_poster.png   # v3 — 이미지/PDF 도 가
 | `ANTHROPIC_HAIKU_MODEL` | 컨텍스트 챗봇 + 의도 분류 | `claude-haiku-4-5-20251001` |
 | `ANTHROPIC_VISION_MODEL` | v3 — vision OCR 모델 | `claude-sonnet-4-6` |
 | `VIRUSTOTAL_API_KEY` | v3 — URL·파일 안전성 검사 | 없으면 Phase 0 skip |
+| `VIRUSTOTAL_RPM` | VT 분당 호출 한도 | `4` (free tier) |
+| `ABUSE_SOFT_THRESHOLD` | 어뷰즈 가드 — "짧은 메시지" 임계 (자수) | `10` |
+| `ABUSE_WARN_LIMIT` | 짧은 메시지 누적 경고 횟수 | `3` |
+| `ABUSE_BLOCK_DURATION` | 자동 블록 지속 시간(초) | `3600` |
+| `ABUSE_VIOLATION_WINDOW` | 위반 누적 윈도우(초) | `3600` |
+| `ANALYZE_MAX_TEXT_LENGTH` | `/api/analyze` 텍스트 입력 최대 글자 | `5000` |
 | `SERPER_API_KEY` | 교차 검증용 검색 API | 필수 (검증 활성 시) |
 | `OPENAI_API_KEY` | OpenAI Whisper API | 없으면 로컬 Whisper |
 | `SCAMGUARDIAN_CORS_ORIGINS` | 허용 CORS 오리진 (콤마 구분) | `http://localhost:3000,...` |
@@ -144,6 +155,7 @@ ScamReport (JSON, safety_check 포함)
 | `/admin/browse` | DB 브라우저 — 검색·필터 |
 | `/admin/training` | **v3** — Fine-tuning 세션 (시작·진행률 그래프·활성화) |
 | `/admin/training/about` | **v3** — 모델 역할·파이프라인 위치·학습 효과 설명 |
+| `/admin/platform` | **v3.x** — API key 발급·revoke + observability(p50/p95) + 비용 대시보드 |
 | `/methodology` | 점수 산정 방식 — 합산식·등급·플래그별 정당성·학술 출처 |
 | `/result/[token]` | 카카오 카드의 "자세한 결과 보기" — 1시간 토큰 |
 
@@ -206,6 +218,40 @@ python -m training.train_gliner    --output-dir checkpoints/gli-v1 --epochs 5
 ```
 
 설명 페이지: <http://localhost:3100/admin/training/about>
+
+## 외부 API 호출 보안 — API key + rate limit + abuse guard
+
+`/api/analyze` 와 `/api/analyze-upload` 는 API key 필수:
+
+```bash
+curl -X POST https://your-host/api/analyze \
+  -H "Authorization: Bearer sg_..." \
+  -H "X-User-Id: client-user-123"   # 옵션: per-user 어뷰즈 누적
+  -H "Content-Type: application/json" \
+  -d '{"text": "분석할 텍스트"}'
+```
+
+3중 cap (모두 키별 독립):
+- **RPM** (slid window, in-memory)
+- **월별 호출 수**
+- **월별 USD 비용** (claude+openai+serper+vt 합산)
+
+초과 시 `429` + `Retry-After`. 발급/관리는 `/admin/platform`.
+
+어뷰즈 가드 (`platform_layer/abuse_guard.py`):
+- 길이 cap (`ANALYZE_MAX_TEXT_LENGTH=5000`), 반복/도배/gibberish 차단
+- 짧은 메시지 누적 트래커 — 카카오 user_id 별 3회 경고 후 1시간 자동 블록 + 채팅 종료
+- 첫 메시지는 free pass, 누적 시 Claude Haiku 호출도 skip → 어뷰즈 비용 통로 차단
+
+## 테스트
+
+```bash
+pip install pytest
+pytest                          # 46 passed (5초)
+pytest tests/test_abuse_guard.py  # 모듈 단위
+```
+
+격리된 SQLite + 외부 API 환경변수 자동 mock 처리 (`tests/conftest.py`).
 
 ## 품질 관리
 
