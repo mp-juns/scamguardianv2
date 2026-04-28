@@ -1354,6 +1354,16 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     action_params: dict = body.get("action", {}).get("params", {})
     user_id: str = (user_request.get("user", {}).get("id") or "").strip()
 
+    # ── 어뷰즈 누적 차단 우선 검사 (블록 상태면 다른 처리 모두 skip) ──
+    if user_id:
+        from platform_layer import abuse_guard as _ag
+        blocked, remaining = _ag.block_status(user_id)
+        if blocked:
+            log.warning("→ blocked user %s (남은 %ds)", user_id[:12], remaining)
+            with _jobs_lock:
+                _pending_jobs.pop(user_id, None)   # 채팅 강제 종료
+            return kakao_formatter.format_abuse_blocked(remaining)
+
     # ── 특수 명령: 빈 메시지 = welcome (즉답) ──
     if not utterance:
         log.info("→ welcome 응답 반환 (빈 메시지)")
@@ -1510,6 +1520,29 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
             user_id, source, input_type, background_tasks,
         )
 
+    # ── 어뷰즈 가드 (TEXT) — 길이/반복/gibberish/도배 ──
+    # user_id 가 있으면 위반 누적 → 자동 블록 (3회 경고 후 1시간 차단)
+    if user_id:
+        from platform_layer import abuse_guard as _ag
+        rej = _ag.guard(source, user_id=user_id)
+        if rej is not None:
+            log.warning(
+                "→ abuse guard reject user=%s code=%s (%s)",
+                user_id[:12], rej.code, rej.detail,
+            )
+            if rej.code == "BLOCKED":
+                with _jobs_lock:
+                    _pending_jobs.pop(user_id, None)
+                # remaining_sec=detail 에서 추출
+                remaining = 3600
+                try:
+                    remaining = int(rej.detail.split("=")[-1].split("s")[0])
+                except Exception:
+                    pass
+                return kakao_formatter.format_abuse_blocked(remaining)
+            warns_left = _ag.VIOLATION_WARN_LIMIT - _ag.violation_count(user_id)
+            return kakao_formatter.format_abuse_warning(rej.message, max(0, warns_left))
+
     # ── 텍스트: 의도 분류 → 분기 ──
     # Claude Haiku 가 메시지를 보고 GREETING/HELP/CONTENT/ANALYZE_NO_CONTENT/CHAT 분류
     # (짧고 명확한 인사·사용법은 keyword fast-path 로 즉답)
@@ -1551,13 +1584,16 @@ async def analyze(payload: AnalyzeRequest, request: Request) -> dict:
         payload.use_rag,
     )
     # 어뷰즈 가드 — 텍스트 입력에 한해 외부 API 호출 전 차단
-    # (URL/파일은 STT/Vision 후 transcript 길이로 _run_pipeline 안에서 별도 체크)
+    # user_id 헤더 (X-User-Id) 가 있으면 위반 누적·자동 블록 적용
     if payload.text and not payload.source:
-        from platform_layer.abuse_guard import check as _abuse_check
-        rej = _abuse_check(payload.text, key_id=getattr(request.state, "api_key_id", None))
+        from platform_layer import abuse_guard as _ag
+        key_id = getattr(request.state, "api_key_id", None)
+        user_id = request.headers.get("x-user-id", "").strip() or None
+        rej = _ag.guard(payload.text, key_id=key_id, user_id=user_id)
         if rej is not None:
+            status = 423 if rej.code == "BLOCKED" else 400
             raise HTTPException(
-                status_code=400,
+                status_code=status,
                 detail={"code": rej.code, "message": rej.message, "detail": rej.detail},
             )
     try:
@@ -2026,6 +2062,20 @@ async def admin_cost(days: int = 30) -> dict[str, Any]:
         return await asyncio.to_thread(repository.aggregate_costs, days=days)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/abuse-blocks")
+async def admin_abuse_blocks() -> dict[str, Any]:
+    """현재 일시 차단된 user_id 목록."""
+    from platform_layer import abuse_guard as _ag
+    return {"blocks": _ag.list_blocks()}
+
+
+@app.post("/api/admin/abuse-blocks/{user_id}/unblock")
+async def admin_abuse_unblock(user_id: str) -> dict[str, Any]:
+    from platform_layer import abuse_guard as _ag
+    ok = _ag.unblock(user_id)
+    return {"ok": ok}
 
 
 # ──────────────────────────────────

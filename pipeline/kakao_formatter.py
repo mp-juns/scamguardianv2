@@ -640,6 +640,34 @@ def format_refining_in_progress() -> dict[str, Any]:
     }
 
 
+def format_abuse_warning(message: str, warns_left: int) -> dict[str, Any]:
+    """어뷰즈 가드 경고 — 짧은/도배/gibberish 등. warns_left 표시."""
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [{"simpleText": {"text": f"⚠️ {message}"}}],
+            "quickReplies": quick_replies("idle"),
+        },
+    }
+
+
+def format_abuse_blocked(remaining_sec: int) -> dict[str, Any]:
+    """반복 어뷰즈로 일시 차단됐을 때. 채팅 종료."""
+    minutes = max(1, remaining_sec // 60)
+    text = (
+        "🚫 반복적인 어뷰즈로 일시 차단되었어요.\n"
+        f"약 {minutes}분 후 다시 시도해 주세요.\n"
+        "정상적인 사기 의심 메시지는 길고 구체적일수록 분석 정확도가 높아져요."
+    )
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [{"simpleText": {"text": text}}],
+            "quickReplies": [],   # 차단 상태에선 quick reply 도 제거
+        },
+    }
+
+
 def format_busy() -> dict[str, Any]:
     """이전 분석이 아직 진행 중인데 사용자가 새 영상/URL 을 보냈을 때."""
     return {

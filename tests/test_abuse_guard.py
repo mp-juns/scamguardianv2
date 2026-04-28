@@ -14,10 +14,23 @@ def test_normal_korean_passes():
     assert abuse_guard.check(text) is None
 
 
-def test_too_short_rejected():
+def test_short_greetings_pass():
     from platform_layer import abuse_guard
-    rej = abuse_guard.check("짧음")
+    # "안녕" 정도의 짧은 인사는 허용 — 잠재적으로 사용자가 챗봇·API 시작 메시지로 보냄
+    for greeting in ["안녕", "고마워", "안녕하세요", "도와줘"]:
+        assert abuse_guard.check(greeting) is None, f"{greeting!r} 차단됨"
+
+
+def test_single_char_rejected():
+    from platform_layer import abuse_guard
+    rej = abuse_guard.check("ㅋ")
     assert rej is not None and rej.code == "MIN_LEN"
+
+
+def test_empty_or_whitespace_rejected():
+    from platform_layer import abuse_guard
+    assert abuse_guard.check("").code == "EMPTY"
+    assert abuse_guard.check("   \n\t  ").code == "EMPTY"
 
 
 def test_too_long_rejected(monkeypatch):

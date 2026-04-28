@@ -23,14 +23,21 @@ import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from typing import Any
 
 
 MAX_CHARS = int(os.getenv("ANALYZE_MAX_TEXT_LENGTH", "5000"))
-MIN_CHARS = int(os.getenv("ANALYZE_MIN_TEXT_LENGTH", "10"))
+MIN_CHARS = int(os.getenv("ANALYZE_MIN_TEXT_LENGTH", "2"))   # "안녕" 정도는 허용
+REPETITION_MIN_LEN = 8         # 이 길이 이상에서만 다양성 체크 (짧은 인사 보호)
 REPETITION_TOP3_RATIO = 0.80   # 상위 3 글자 비율
 GIBBERISH_VALID_RATIO = 0.50   # 의미 있는 글자 비율 minimum
 DUP_WINDOW_SEC = 300           # 5분
 DUP_LIMIT = 5                  # 같은 입력 같은 키 5분에 5번 이상 → throttle
+
+# 위반 누적 → 자동 블록 — user_id 가 식별 가능할 때만 적용 (카카오 user.id 등)
+VIOLATION_WINDOW_SEC = int(os.getenv("ABUSE_VIOLATION_WINDOW", "3600"))   # 1시간
+VIOLATION_WARN_LIMIT = int(os.getenv("ABUSE_WARN_LIMIT", "3"))             # 3회까지 경고
+BLOCK_DURATION_SEC = int(os.getenv("ABUSE_BLOCK_DURATION", "3600"))        # 1시간 차단
 
 
 _HANGUL_RE = re.compile(r"[가-힣]")
@@ -46,6 +53,10 @@ class GuardReject:
 
 _dup_lock = threading.Lock()
 _dup_log: dict[str, list[float]] = defaultdict(list)
+
+_violation_lock = threading.Lock()
+_violations: dict[str, list[float]] = defaultdict(list)
+_blocks: dict[str, float] = {}   # user_id → block_until_epoch
 
 
 def _signature(text: str, key_id: str | None) -> str:
@@ -96,9 +107,9 @@ def check(text: str, *, key_id: str | None = None, dedup: bool = True) -> GuardR
             detail=f"length={n}",
         )
 
-    # 반복 / 도배 검출
+    # 반복 / 도배 검출 — 짧은 인사("안녕", "고마워" 등)는 길이 미달로 skip
     no_space = re.sub(r"\s", "", stripped)
-    if no_space:
+    if len(no_space) >= REPETITION_MIN_LEN:
         counter = Counter(no_space)
         if len(counter) <= 3:
             # 거의 한 두 글자만 반복
@@ -134,6 +145,135 @@ def check(text: str, *, key_id: str | None = None, dedup: bool = True) -> GuardR
 
 
 def reset_state() -> None:
-    """테스트용 — duplicate window 초기화."""
+    """테스트용 — duplicate / violation / block 모두 초기화."""
     with _dup_lock:
         _dup_log.clear()
+    with _violation_lock:
+        _violations.clear()
+        _blocks.clear()
+
+
+# ──────────────────────────────────
+# 위반 누적 → 자동 블록
+# ──────────────────────────────────
+def block_status(user_id: str) -> tuple[bool, int]:
+    """현재 user_id 가 블록 상태인지. 반환은 (blocked, remaining_seconds)."""
+    if not user_id:
+        return False, 0
+    now = time.time()
+    with _violation_lock:
+        until = _blocks.get(user_id)
+        if until is None:
+            return False, 0
+        if now >= until:
+            _blocks.pop(user_id, None)
+            return False, 0
+        return True, int(until - now)
+
+
+def violation_count(user_id: str) -> int:
+    """현재 윈도우 내 위반 횟수."""
+    if not user_id:
+        return 0
+    now = time.time()
+    cutoff = now - VIOLATION_WINDOW_SEC
+    with _violation_lock:
+        log = _violations.get(user_id, [])
+        return sum(1 for t in log if t > cutoff)
+
+
+def record_violation(user_id: str) -> dict[str, Any]:
+    """위반 기록. 임계값 초과 시 block 으로 전환.
+
+    Returns:
+        {"count": N, "warns_left": M, "blocked": bool, "block_remaining_sec": int}
+    """
+    if not user_id:
+        return {"count": 0, "warns_left": VIOLATION_WARN_LIMIT, "blocked": False, "block_remaining_sec": 0}
+
+    now = time.time()
+    cutoff = now - VIOLATION_WINDOW_SEC
+    with _violation_lock:
+        log = _violations[user_id]
+        log[:] = [t for t in log if t > cutoff]
+        log.append(now)
+        count = len(log)
+        if count > VIOLATION_WARN_LIMIT:
+            _blocks[user_id] = now + BLOCK_DURATION_SEC
+            return {
+                "count": count,
+                "warns_left": 0,
+                "blocked": True,
+                "block_remaining_sec": BLOCK_DURATION_SEC,
+            }
+    return {
+        "count": count,
+        "warns_left": max(0, VIOLATION_WARN_LIMIT - count),
+        "blocked": False,
+        "block_remaining_sec": 0,
+    }
+
+
+def unblock(user_id: str) -> bool:
+    """어드민 수동 해제."""
+    with _violation_lock:
+        was_blocked = user_id in _blocks
+        _blocks.pop(user_id, None)
+        _violations.pop(user_id, None)
+    return was_blocked
+
+
+def list_blocks() -> list[dict[str, Any]]:
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    with _violation_lock:
+        # 만료 정리
+        expired = [uid for uid, until in _blocks.items() if until <= now]
+        for uid in expired:
+            _blocks.pop(uid, None)
+        for uid, until in _blocks.items():
+            out.append({
+                "user_id": uid,
+                "block_remaining_sec": int(until - now),
+                "violations": len(_violations.get(uid, [])),
+            })
+    return out
+
+
+# ──────────────────────────────────
+# 종합 가드 — 블록 체크 + 위반 기록
+# ──────────────────────────────────
+def guard(text: str, *, key_id: str | None = None, user_id: str | None = None) -> GuardReject | None:
+    """check() 위에 위반 누적·블록 적용.
+
+    user_id 가 주어지면:
+    - 이미 블록 상태면 BLOCKED reject (3회 위반 후 1시간)
+    - check() 가 reject 하면 record_violation 호출
+    """
+    if user_id:
+        blocked, remaining = block_status(user_id)
+        if blocked:
+            return GuardReject(
+                "BLOCKED",
+                "반복적인 어뷰즈로 일시 차단되었어요. 잠시 후 다시 시도해 주세요.",
+                detail=f"remaining_sec={remaining}",
+            )
+
+    rej = check(text, key_id=key_id)
+    if rej is None:
+        return None
+
+    if user_id:
+        info = record_violation(user_id)
+        if info["blocked"]:
+            return GuardReject(
+                "BLOCKED",
+                "어뷰즈 횟수가 누적되어 일시 차단되었어요. 1시간 후 다시 시도해 주세요.",
+                detail=f"count={info['count']} block={info['block_remaining_sec']}s",
+            )
+        # 일반 reject 메시지에 남은 경고 횟수 부착
+        rej.message = (
+            f"{rej.message}\n경고 {info['count']}/{VIOLATION_WARN_LIMIT} — 누적 시 일시 차단됩니다."
+        )
+
+    return rej
