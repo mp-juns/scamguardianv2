@@ -39,6 +39,10 @@ VIOLATION_WINDOW_SEC = int(os.getenv("ABUSE_VIOLATION_WINDOW", "3600"))   # 1시
 VIOLATION_WARN_LIMIT = int(os.getenv("ABUSE_WARN_LIMIT", "3"))             # 3회까지 경고
 BLOCK_DURATION_SEC = int(os.getenv("ABUSE_BLOCK_DURATION", "3600"))        # 1시간 차단
 
+# Soft 트래커 — "안녕" 같이 통과는 시키되 반복되면 위반으로 카운트하는 임계값.
+# 분석 가치가 거의 없는 짧은 메시지(인사·잡담)가 Claude/Haiku 호출을 반복 유발하는 걸 막음.
+SOFT_LEN_THRESHOLD = int(os.getenv("ABUSE_SOFT_THRESHOLD", "10"))
+
 
 _HANGUL_RE = re.compile(r"[가-힣]")
 _LATIN_DIGIT_RE = re.compile(r"[A-Za-z0-9]")
@@ -221,6 +225,27 @@ def unblock(user_id: str) -> bool:
         _blocks.pop(user_id, None)
         _violations.pop(user_id, None)
     return was_blocked
+
+
+def track_short_message(user_id: str, text: str) -> dict[str, Any] | None:
+    """`SOFT_LEN_THRESHOLD` 미만 짧은 메시지 누적 트래커.
+
+    - user_id 없거나 text 가 임계값 이상이면 None (no-op)
+    - 짧은 메시지면 record_violation 호출 → 위반 +1
+    - 임계 초과 시 자동 블록 (record_violation 내부에서 처리)
+
+    호출자는 반환값으로 상태 판단:
+      - None: 트래킹 안 됨 (충분히 긴 메시지 등)
+      - {blocked: True}: 블록됨 → 채팅 종료
+      - {blocked: False, count >= 1}: 응답에 경고 부착 권장
+    """
+    if not user_id or not text:
+        return None
+    if len(text.strip()) > SOFT_LEN_THRESHOLD:
+        return None
+    info = record_violation(user_id)
+    info["soft"] = True
+    return info
 
 
 def list_blocks() -> list[dict[str, Any]]:

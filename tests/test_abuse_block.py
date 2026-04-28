@@ -59,3 +59,31 @@ def test_anonymous_no_block_tracking():
         rej = ag.guard("ㅋ")
         assert rej is not None and rej.code == "MIN_LEN"
     assert ag.list_blocks() == []
+
+
+def test_track_short_message_passes_but_counts():
+    """'안녕' 같은 짧은 인사는 통과하지만 user_id 별로 누적된다."""
+    from platform_layer import abuse_guard as ag
+    user = "kakao_user_short"
+    # 1~3회: count 증가, blocked=False
+    for i in range(1, ag.VIOLATION_WARN_LIMIT + 1):
+        info = ag.track_short_message(user, "안녕")
+        assert info is not None
+        assert info["count"] == i
+        assert info["blocked"] is False, f"{i}회째 아직 블록 X"
+    # 4회째: blocked
+    info = ag.track_short_message(user, "안녕")
+    assert info["blocked"] is True
+    assert ag.block_status(user)[0] is True
+
+
+def test_track_short_message_skips_long_text():
+    from platform_layer import abuse_guard as ag
+    info = ag.track_short_message("u1", "이것은 충분히 긴 메시지로 분석 의도를 보입니다 박상철 본부장")
+    assert info is None  # 임계 이상이면 트래킹 skip
+
+
+def test_track_short_message_skips_no_user():
+    from platform_layer import abuse_guard as ag
+    info = ag.track_short_message("", "안녕")
+    assert info is None

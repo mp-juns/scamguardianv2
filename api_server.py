@@ -347,6 +347,25 @@ _IMAGE_URL_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp)(\?|$)", re.IGNORECASE
 _PDF_URL_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
 
 
+def _wrap_with_soft_warning(response: dict, info: dict | None) -> dict:
+    """짧은 메시지 누적 위반 시 응답 최상단에 경고 simpleText 부착."""
+    if not info or info.get("count", 0) <= 0 or info.get("blocked"):
+        return response
+    from platform_layer import abuse_guard as _ag
+    count = info["count"]
+    limit = _ag.VIOLATION_WARN_LIMIT
+    warn = {
+        "simpleText": {
+            "text": (
+                f"⚠️ 짧은 메시지가 반복되고 있어요 ({count}/{limit}).\n"
+                "분석할 의심 메시지·URL·문서를 보내주세요. 누적 시 일시 차단됩니다."
+            )
+        }
+    }
+    response.setdefault("template", {}).setdefault("outputs", []).insert(0, warn)
+    return response
+
+
 def _classify_url_input(url: str) -> kakao_formatter.InputType:
     """URL 확장자 보고 IMAGE/PDF/URL 구분."""
     InputType = kakao_formatter.InputType
@@ -1355,6 +1374,7 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     user_id: str = (user_request.get("user", {}).get("id") or "").strip()
 
     # ── 어뷰즈 누적 차단 우선 검사 (블록 상태면 다른 처리 모두 skip) ──
+    soft_warn_info: dict | None = None
     if user_id:
         from platform_layer import abuse_guard as _ag
         blocked, remaining = _ag.block_status(user_id)
@@ -1363,6 +1383,21 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
             with _jobs_lock:
                 _pending_jobs.pop(user_id, None)   # 채팅 강제 종료
             return kakao_formatter.format_abuse_blocked(remaining)
+        # 짧은 메시지 누적 트래커 — 통과시키되 반복되면 카운트
+        # action_params 에 파일/이미지 있으면 skip (분석 의도 있는 입력)
+        has_attachment = any(
+            action_params.get(k)
+            for k in ("image", "picture", "photo", "pdf", "document", "video", "video_url", "file", "attachment")
+        )
+        if utterance and not has_attachment:
+            soft_warn_info = _ag.track_short_message(user_id, utterance)
+            if soft_warn_info and soft_warn_info.get("blocked"):
+                log.warning("→ soft block triggered user %s", user_id[:12])
+                with _jobs_lock:
+                    _pending_jobs.pop(user_id, None)
+                return kakao_formatter.format_abuse_blocked(
+                    soft_warn_info.get("block_remaining_sec") or _ag.BLOCK_DURATION_SEC
+                )
 
     # ── 특수 명령: 빈 메시지 = welcome (즉답) ──
     if not utterance:
@@ -1550,13 +1585,17 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     log.info("→ TEXT intent: %s", intent)
 
     if intent == context_chat.INTENT_GREETING:
-        return kakao_formatter.format_welcome()
+        return _wrap_with_soft_warning(kakao_formatter.format_welcome(), soft_warn_info)
     if intent == context_chat.INTENT_HELP:
-        return kakao_formatter.format_help()
+        return _wrap_with_soft_warning(kakao_formatter.format_help(), soft_warn_info)
     if intent == context_chat.INTENT_ANALYZE_NO_CONTENT:
-        return kakao_formatter.format_ask_for_content(reason="analyze")
+        return _wrap_with_soft_warning(
+            kakao_formatter.format_ask_for_content(reason="analyze"), soft_warn_info,
+        )
     if intent == context_chat.INTENT_CHAT:
-        return kakao_formatter.format_ask_for_content(reason="chat")
+        return _wrap_with_soft_warning(
+            kakao_formatter.format_ask_for_content(reason="chat"), soft_warn_info,
+        )
 
     # CONTENT (default) — 본문이 들어왔다고 판단 → 컨텍스트 수집 모드 시작
     if not user_id:
