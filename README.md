@@ -21,9 +21,9 @@
 ```
 모바일 앱 (가상)  ─┐
 카카오 webhook   ─┤
-Next.js 웹 (admin) ─┼─→ FastAPI ─→ pipeline/ (STT, 분류, 추출, 검증, RAG, LLM, 스코어링)
+Next.js 웹 (admin) ─┼─ FastAPI ─ pipeline/ (STT, 분류, 추출, 검증, RAG, LLM, 스코어링)
 CLI 스크립트     ─┤              │
-배치 스크립트    ─┘              └─→ DB (SQLite / Postgres+pgvector)
+배치 스크립트    ─┘              └─ DB (SQLite / Postgres+pgvector)
 ```
 
 Next.js 의 `apps/web/src/app/api/*/route.ts` 들은 모두 `proxyJsonRequest` / `proxyGet` 만 사용하는 thin proxy. 같은 REST 엔드포인트를 모바일·외부 SDK 가 그대로 호출 가능합니다.
