@@ -80,21 +80,26 @@ def _download_youtube_audio(
     return mp3_path
 
 
-def _ensure_audio_nonempty(path: str) -> None:
-    """ffprobe로 오디오 길이를 확인한다. 0이면 에러."""
+def _probe_audio_seconds(path: str) -> float:
+    """ffprobe 로 오디오 길이(초). 측정 실패면 0.0."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=10,
         )
-        duration = float(result.stdout.strip() or "0")
-        if duration < 0.1:
-            raise ValueError(
-                "오디오를 읽지 못했습니다. 오디오 트랙이 없는 영상이거나 파일이 손상됐을 수 있습니다."
-            )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass  # ffprobe 없으면 검증 건너뜀
+        return float(result.stdout.strip() or "0")
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        return 0.0
+
+
+def _ensure_audio_nonempty(path: str) -> None:
+    """ffprobe로 오디오 길이를 확인한다. 0이면 에러."""
+    duration = _probe_audio_seconds(path)
+    if duration > 0 and duration < 0.1:
+        raise ValueError(
+            "오디오를 읽지 못했습니다. 오디오 트랙이 없는 영상이거나 파일이 손상됐을 수 있습니다."
+        )
 
 
 def _transcribe_with_openai_api(
@@ -129,6 +134,15 @@ def _transcribe_with_openai_api(
     elapsed = time.time() - t0
     text = response.text
     preview = text[:150] + "…" if len(text) > 150 else text
+
+    audio_seconds = _probe_audio_seconds(audio_path)
+    if audio_seconds > 0:
+        try:
+            from platform_layer.cost import record_openai_whisper
+            record_openai_whisper(audio_seconds)
+        except Exception:
+            pass
+
     if logger:
         logger(
             f"[STT] OpenAI Whisper API 완료 ({elapsed:.1f}s)\n"

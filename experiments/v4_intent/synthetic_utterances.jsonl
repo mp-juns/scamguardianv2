@@ -1,0 +1,32 @@
+{"id": "ma01", "label": "META_AWARE", "text": "이거 사기 같은데"}
+{"id": "ma02", "label": "META_AWARE", "text": "어 이상한데 진짜 검찰청 맞아요?"}
+{"id": "ma03", "label": "META_AWARE", "text": "잠깐만요 이거 보이스피싱 아니에요?"}
+{"id": "ma04", "label": "META_AWARE", "text": "근데 좀 의심스러운데..."}
+{"id": "ma05", "label": "META_AWARE", "text": "아 뭔가 사기 느낌 나는데"}
+{"id": "ma06", "label": "META_AWARE", "text": "이거 진짜인지 어떻게 확인해요"}
+{"id": "ma07", "label": "META_AWARE", "text": "음 좀 이상한 거 같애"}
+{"id": "ma08", "label": "META_AWARE", "text": "이거 피싱 아닌가? 좀 미심쩍은데"}
+{"id": "si01", "label": "SENSITIVE_INFO", "text": "주민등록번호는 990101에 1234567이요"}
+{"id": "si02", "label": "SENSITIVE_INFO", "text": "OTP 번호 825612 맞아요"}
+{"id": "si03", "label": "SENSITIVE_INFO", "text": "비밀번호는 abcd1234 입니다"}
+{"id": "si04", "label": "SENSITIVE_INFO", "text": "통장 비밀번호 알려드릴게요 0000이요"}
+{"id": "si05", "label": "SENSITIVE_INFO", "text": "공인인증서 비번은 그거에요 영영영영"}
+{"id": "si06", "label": "SENSITIVE_INFO", "text": "내 카드 뒷면 cvc는 348입니다"}
+{"id": "si07", "label": "SENSITIVE_INFO", "text": "보안카드 35번 6번 알려드릴게요"}
+{"id": "si08", "label": "SENSITIVE_INFO", "text": "주민번호 뒷자리 2345671"}
+{"id": "ta01", "label": "TRANSFER_AGREE", "text": "네 지금 이체할게요"}
+{"id": "ta02", "label": "TRANSFER_AGREE", "text": "알겠습니다 바로 보낼게요"}
+{"id": "ta03", "label": "TRANSFER_AGREE", "text": "300만원 송금했어요"}
+{"id": "ta04", "label": "TRANSFER_AGREE", "text": "지금 ATM 가서 이체하면 되죠?"}
+{"id": "ta05", "label": "TRANSFER_AGREE", "text": "계좌번호 다시 불러주세요 입금할게요"}
+{"id": "ta06", "label": "TRANSFER_AGREE", "text": "방금 200만원 보냈습니다 확인해주세요"}
+{"id": "ta07", "label": "TRANSFER_AGREE", "text": "예 송금 완료했습니다"}
+{"id": "ta08", "label": "TRANSFER_AGREE", "text": "지금 바로 입금하라구요? 알겠어요 보낼게요"}
+{"id": "no01", "label": "NORMAL", "text": "여보세요"}
+{"id": "no02", "label": "NORMAL", "text": "아 네 그러시군요"}
+{"id": "no03", "label": "NORMAL", "text": "아니요 저는 그런 거 안 했는데요"}
+{"id": "no04", "label": "NORMAL", "text": "잠깐만요 통화 좀 끊을게요"}
+{"id": "no05", "label": "NORMAL", "text": "아 그래요? 무슨 일이세요?"}
+{"id": "no06", "label": "NORMAL", "text": "오늘 점심에 김치찌개 먹었어"}
+{"id": "no07", "label": "NORMAL", "text": "내일 시간 어때 영화 볼래"}
+{"id": "no08", "label": "NORMAL", "text": "아빠 통화 중이라 이따가 다시 걸게요"}

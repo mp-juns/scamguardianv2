@@ -5,7 +5,9 @@ FastAPI middleware — request_id 주입, API key 검증, rate limit, request lo
 - 분석 엔드포인트(`/api/analyze`, `/api/analyze-upload`) — API key 필수
 - 메서드ology / 결과 토큰 — API key 선택 (있으면 사용량 기록)
 - webhook(`/webhook/kakao`) — 카카오 자체 인증 사용, skip
-- admin (`/api/admin/*`) — 현 단계는 미인증 (별도 작업, TODO 1번)
+- admin (`/api/admin/*`) — 단일 admin token (`SCAMGUARDIAN_ADMIN_TOKEN`) 필수
+  - `X-Admin-Token` 헤더 또는 `Authorization: Bearer admin-<token>` 로 전달
+  - `/api/admin/login` 만 인증 면제 (토큰 검증 자체가 목적)
 
 키 추출 우선순위:
 1. `Authorization: Bearer sg_...`
@@ -14,7 +16,9 @@ FastAPI middleware — request_id 주입, API key 검증, rate limit, request lo
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 import re
 import time
 import uuid
@@ -40,15 +44,44 @@ _OPTIONAL_KEY_PATTERNS = [
     re.compile(r"^/api/result/"),
     re.compile(r"^/api/methodology$"),
 ]
+# admin token 필수
+_REQUIRE_ADMIN_PATTERNS = [
+    re.compile(r"^/api/admin/"),
+]
+# admin 패턴 중 인증 면제 (login/health)
+_ADMIN_PUBLIC_PATTERNS = [
+    re.compile(r"^/api/admin/login$"),
+]
 # 인증 스킵
 _SKIP_PATTERNS = [
     re.compile(r"^/webhook/"),
     re.compile(r"^/health$"),
-    re.compile(r"^/api/admin/"),    # TODO: 별도 인증
     re.compile(r"^/docs"),
     re.compile(r"^/openapi"),
     re.compile(r"^/redoc"),
 ]
+
+
+def _extract_admin_token(request: Request) -> str | None:
+    explicit = request.headers.get("x-admin-token", "").strip()
+    if explicit:
+        return explicit
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer admin-"):
+        return auth.split("admin-", 1)[1].strip() or None
+    return None
+
+
+def _admin_token_valid(provided: str | None) -> bool:
+    expected = (os.getenv("SCAMGUARDIAN_ADMIN_TOKEN") or "").strip()
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(expected, provided)
+
+
+def _admin_auth_disabled() -> bool:
+    """env ADMIN_AUTH_DISABLED 가 true 면 어드민 인증 전체 bypass (개발용)."""
+    return (os.getenv("ADMIN_AUTH_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"})
 
 
 def _extract_key(request: Request) -> str | None:
@@ -62,6 +95,12 @@ def _category(path: str) -> str:
     for pat in _SKIP_PATTERNS:
         if pat.search(path):
             return "skip"
+    for pat in _ADMIN_PUBLIC_PATTERNS:
+        if pat.search(path):
+            return "admin_public"
+    for pat in _REQUIRE_ADMIN_PATTERNS:
+        if pat.search(path):
+            return "admin"
     for pat in _REQUIRE_KEY_PATTERNS:
         if pat.search(path):
             return "require"
@@ -77,6 +116,20 @@ class PlatformMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         path = request.url.path
         category = _category(path)
+
+        if category == "admin" and not _admin_auth_disabled():
+            if not _admin_token_valid(_extract_admin_token(request)):
+                expected = (os.getenv("SCAMGUARDIAN_ADMIN_TOKEN") or "").strip()
+                detail = (
+                    "어드민 토큰이 없거나 잘못되었습니다."
+                    if expected
+                    else "SCAMGUARDIAN_ADMIN_TOKEN 환경변수가 설정되지 않아 어드민 접근이 비활성화되어 있습니다."
+                )
+                return JSONResponse(
+                    {"detail": detail, "code": "admin_unauthorized"},
+                    status_code=401,
+                    headers={"x-request-id": request_id},
+                )
 
         api_key_record = None
         api_key_id = None

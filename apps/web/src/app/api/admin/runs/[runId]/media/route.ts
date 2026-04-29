@@ -1,3 +1,5 @@
+import { adminAuthHeader } from "../../../../_lib/backend";
+
 export const runtime = "nodejs";
 
 const API_BASE_URL =
@@ -11,9 +13,13 @@ export async function GET(request: Request, context: Context) {
   const { runId } = await context.params;
   const targetUrl = `${API_BASE_URL}/api/admin/runs/${encodeURIComponent(runId)}/media`;
 
+  const guard = await adminAuthHeader();
+  if (!guard.ok) return guard.response;
+
   const forwardHeaders = new Headers();
   const range = request.headers.get("range");
   if (range) forwardHeaders.set("range", range);
+  for (const [k, v] of Object.entries(guard.headers)) forwardHeaders.set(k, v);
 
   try {
     const upstream = await fetch(targetUrl, {

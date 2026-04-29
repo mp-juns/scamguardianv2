@@ -54,3 +54,31 @@ def test_url_in_utterance_extracts_only_url():
 def test_pure_url_pdf_in_utterance_routes_to_pdf():
     src, kind = _detect("https://example.com/x.pdf", {})
     assert kind.value == "pdf"
+
+
+def test_custom_param_name_pdf_url_routes_to_pdf():
+    """카카오 오픈빌더에서 표준 키 외 커스텀 이름(예: 'doc1', 'secureimage') 으로 들어와도 인식되어야 한다."""
+    src, kind = _detect("", {"doc1": "https://k.kakaocdn.net/abc.pdf"})
+    assert kind.value == "pdf"
+
+
+def test_custom_param_name_image_url_routes_to_image():
+    src, kind = _detect("", {"secureimage": "https://k.kakaocdn.net/abc.png"})
+    assert kind.value == "image"
+
+
+def test_custom_param_dict_with_pdf_url_routes_to_pdf():
+    src, kind = _detect(
+        "", {"첨부": {"url": "https://k.kakaocdn.net/x.pdf"}}
+    )
+    assert kind.value == "pdf"
+
+
+def test_custom_param_video_extension_routes_to_video():
+    src, kind = _detect("", {"clip": "https://k.kakaocdn.net/x.mp4"})
+    assert kind.value == "video"
+
+
+def test_custom_param_unknown_extension_falls_back_to_file():
+    src, kind = _detect("", {"misc": "https://example.com/something.bin"})
+    assert kind.value == "file"

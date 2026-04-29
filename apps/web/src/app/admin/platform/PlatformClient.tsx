@@ -1,6 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 type ApiKey = {
   id: string;
@@ -47,6 +59,44 @@ type CostResponse = {
   since: string;
 };
 
+type AbuseBlock = {
+  user_id: string;
+  block_remaining_sec: number;
+  violations: number;
+};
+
+type AbuseBlocksResponse = {
+  blocks: AbuseBlock[];
+};
+
+// 프로바이더별 시각 색상 — 4종 + 기타 fallback
+const PROVIDER_COLOR: Record<string, string> = {
+  anthropic: "#a78bfa",      // violet (Claude)
+  openai: "#34d399",         // emerald (Whisper)
+  serper: "#f472b6",         // pink
+  virustotal: "#fbbf24",     // amber
+};
+
+function providerColor(name: string): string {
+  return PROVIDER_COLOR[name.toLowerCase()] ?? "#94a3b8";
+}
+
+function fmtDay(iso: string): string {
+  // "2026-04-29" → "4/29"
+  const parts = iso.split("-");
+  if (parts.length === 3) return `${Number(parts[1])}/${Number(parts[2])}`;
+  return iso;
+}
+
+function fmtRemaining(sec: number): string {
+  if (sec <= 0) return "expired";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m >= 60) return `${Math.floor(m / 60)}h ${m % 60}m`;
+  if (m >= 1) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function fmtMoney(usd: number): string {
   if (usd === 0) return "$0";
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
@@ -63,6 +113,7 @@ export default function PlatformClient() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [obs, setObs] = useState<ObservabilityResponse | null>(null);
   const [cost, setCost] = useState<CostResponse | null>(null);
+  const [blocks, setBlocks] = useState<AbuseBlock[]>([]);
   const [error, setError] = useState("");
   const [issuedPlaintext, setIssuedPlaintext] = useState<string | null>(null);
   const [form, setForm] = useState({ label: "", monthly_quota: 1000, rpm_limit: 30, monthly_usd_quota: 5 });
@@ -70,14 +121,16 @@ export default function PlatformClient() {
 
   const refresh = useCallback(async () => {
     try {
-      const [k, o, c] = await Promise.all([
+      const [k, o, c, b] = await Promise.all([
         fetch("/api/admin/api-keys", { cache: "no-store" }),
         fetch("/api/admin/observability", { cache: "no-store" }),
         fetch("/api/admin/cost", { cache: "no-store" }),
+        fetch("/api/admin/abuse-blocks", { cache: "no-store" }),
       ]);
       if (k.ok) setKeys(((await k.json()) as { keys: ApiKey[] }).keys ?? []);
       if (o.ok) setObs((await o.json()) as ObservabilityResponse);
       if (c.ok) setCost((await c.json()) as CostResponse);
+      if (b.ok) setBlocks(((await b.json()) as AbuseBlocksResponse).blocks ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "load 실패");
     }
@@ -122,6 +175,19 @@ export default function PlatformClient() {
     await refresh();
   }
 
+  async function unblockUser(userId: string) {
+    if (!confirm(`이 사용자(${userId.slice(0, 12)}…) 차단을 해제할까요?`)) return;
+    const r = await fetch(
+      `/api/admin/abuse-blocks/${encodeURIComponent(userId)}/unblock`,
+      { method: "POST" },
+    );
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      setError(d.detail ?? "차단 해제 실패");
+    }
+    await refresh();
+  }
+
   return (
     <div className="space-y-6">
       {error && (
@@ -145,12 +211,129 @@ export default function PlatformClient() {
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {cost.by_provider.map((p) => (
               <div key={p.provider} className="rounded-xl border border-white/10 bg-slate-950/40 p-3">
-                <div className="text-xs uppercase tracking-widest text-slate-400">{p.provider}</div>
+                <div className="flex items-center gap-2">
+                  <span
+                    className="inline-block h-2 w-2 rounded-full"
+                    style={{ backgroundColor: providerColor(p.provider) }}
+                  />
+                  <span className="text-xs uppercase tracking-widest text-slate-400">{p.provider}</span>
+                </div>
                 <div className="mt-1 text-lg font-semibold">{fmtMoney(p.usd)}</div>
                 <div className="text-xs text-slate-500">{p.calls}회 / {p.units.toFixed(0)} units</div>
               </div>
             ))}
           </div>
+
+          {/* 일별 비용 추이 — area chart */}
+          {cost.daily.length > 0 && (
+            <div className="mt-5 rounded-xl border border-white/10 bg-slate-950/40 p-4">
+              <div className="mb-3 flex items-baseline justify-between">
+                <h3 className="text-sm font-semibold text-slate-200">📈 일별 USD 추이</h3>
+                <span className="text-xs text-slate-500">
+                  최근 {cost.daily.length}일 · 평균{" "}
+                  {fmtMoney(cost.total.usd / Math.max(1, cost.daily.length))}/일
+                </span>
+              </div>
+              <ResponsiveContainer width="100%" height={220}>
+                <AreaChart
+                  data={cost.daily.map((d) => ({ ...d, label: fmtDay(d.day) }))}
+                  margin={{ top: 5, right: 8, left: 0, bottom: 5 }}
+                >
+                  <defs>
+                    <linearGradient id="costGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#22d3ee" stopOpacity={0.6} />
+                      <stop offset="100%" stopColor="#22d3ee" stopOpacity={0.05} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis
+                    dataKey="label"
+                    stroke="#64748b"
+                    tick={{ fontSize: 11 }}
+                    axisLine={{ stroke: "#334155" }}
+                  />
+                  <YAxis
+                    stroke="#64748b"
+                    tick={{ fontSize: 11 }}
+                    axisLine={{ stroke: "#334155" }}
+                    tickFormatter={(v: number) => (v < 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(0)}`)}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "#0f172a",
+                      border: "1px solid #334155",
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                    labelStyle={{ color: "#cbd5e1" }}
+                    formatter={(value, name) => {
+                      const n = typeof value === "number" ? value : Number(value ?? 0);
+                      return name === "usd" ? [fmtMoney(n), "USD"] : [`${n}회`, "호출"];
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="usd"
+                    stroke="#22d3ee"
+                    strokeWidth={2}
+                    fill="url(#costGradient)"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* 프로바이더 비교 — horizontal bar */}
+          {cost.by_provider.length > 0 && (
+            <div className="mt-3 rounded-xl border border-white/10 bg-slate-950/40 p-4">
+              <h3 className="mb-3 text-sm font-semibold text-slate-200">🔍 프로바이더 USD 비중</h3>
+              <ResponsiveContainer
+                width="100%"
+                height={Math.max(120, cost.by_provider.length * 38)}
+              >
+                <BarChart
+                  data={cost.by_provider}
+                  layout="vertical"
+                  margin={{ top: 0, right: 16, left: 0, bottom: 0 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={false} />
+                  <XAxis
+                    type="number"
+                    stroke="#64748b"
+                    tick={{ fontSize: 11 }}
+                    axisLine={{ stroke: "#334155" }}
+                    tickFormatter={(v: number) => (v < 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(0)}`)}
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="provider"
+                    stroke="#64748b"
+                    tick={{ fontSize: 12 }}
+                    axisLine={{ stroke: "#334155" }}
+                    width={92}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "#0f172a",
+                      border: "1px solid #334155",
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                    labelStyle={{ color: "#cbd5e1" }}
+                    formatter={(value) => {
+                      const n = typeof value === "number" ? value : Number(value ?? 0);
+                      return [fmtMoney(n), "USD"];
+                    }}
+                  />
+                  <Bar dataKey="usd" radius={[0, 6, 6, 0]}>
+                    {cost.by_provider.map((p) => (
+                      <Cell key={p.provider} fill={providerColor(p.provider)} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
           {cost.by_key.length > 0 && (
             <div className="mt-4 overflow-x-auto rounded-xl border border-white/10">
               <table className="w-full text-sm">
@@ -237,6 +420,56 @@ export default function PlatformClient() {
           </details>
         </section>
       )}
+
+      {/* === 어뷰즈 차단 관리 === */}
+      <section className="rounded-2xl border border-white/10 bg-white/5 p-6">
+        <div className="mb-3 flex items-baseline justify-between">
+          <h2 className="text-lg font-semibold">🛑 어뷰즈 차단</h2>
+          <span className="text-xs text-slate-400">
+            짧은 메시지 누적 자동 차단 (1시간). 테스트 중 잘못 걸린 경우 수동 해제.
+          </span>
+        </div>
+        <div className="overflow-x-auto rounded-xl border border-white/10">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-800/60 text-xs uppercase tracking-wider text-slate-400">
+              <tr>
+                <th className="px-3 py-2 text-left">user_id</th>
+                <th className="px-3 py-2 text-right">위반 누적</th>
+                <th className="px-3 py-2 text-right">남은 시간</th>
+                <th className="px-3 py-2 text-right">액션</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {blocks.length === 0 && (
+                <tr>
+                  <td className="px-3 py-4 text-center text-sm text-slate-500" colSpan={4}>
+                    현재 차단된 사용자가 없습니다.
+                  </td>
+                </tr>
+              )}
+              {blocks.map((b) => (
+                <tr key={b.user_id}>
+                  <td className="px-3 py-2 font-mono text-xs text-slate-200">
+                    {b.user_id}
+                  </td>
+                  <td className="px-3 py-2 text-right font-mono text-xs">{b.violations}</td>
+                  <td className="px-3 py-2 text-right font-mono text-xs text-amber-300">
+                    {fmtRemaining(b.block_remaining_sec)}
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    <button
+                      onClick={() => void unblockUser(b.user_id)}
+                      className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200 hover:bg-emerald-500/20"
+                    >
+                      차단 해제
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       {/* === API key 관리 === */}
       <section className="rounded-2xl border border-white/10 bg-white/5 p-6">

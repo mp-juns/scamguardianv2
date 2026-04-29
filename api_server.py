@@ -248,6 +248,14 @@ def startup() -> None:
     if repository.database_configured():
         repository.init_db()
 
+    # 업로드 retention — 시작 시 1회 sweep + 백그라운드 24h 주기.
+    try:
+        from platform_layer import retention as _retention
+        _retention.sweep()
+        _retention.start_background_sweeper()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("retention sweep init 실패 (무시): %s", exc)
+
     log.info("모델 워밍업 시작 (콜드스타트 방지)...")
     try:
         pipeline = ScamGuardianPipeline()
@@ -389,8 +397,7 @@ def _kakao_detect_input(
     """
     InputType = kakao_formatter.InputType
 
-    # 1) action.params 의 파일/영상/이미지/PDF URL (카카오 파일 전송)
-    #    카카오 오픈빌더 블록의 파라미터 이름 — 모두 동등하게 처리하되 키워드로 우선 분류.
+    # 1) 정해진 키로 들어온 파일/영상/이미지/PDF URL — 카카오 표준 블록 파라미터.
     for key in (
         "image", "picture", "photo",  # 이미지
         "pdf", "document",            # PDF/문서
@@ -419,7 +426,27 @@ def _kakao_detect_input(
             return url, kind
         return url, InputType.FILE
 
-    # 2) utterance 전체 또는 일부가 URL — 둘 다 첫 매칭 URL 만 사용
+    # 2) 표준 키에 매칭 안 된 경우 — action.params 의 *모든* 값을 훑어서 URL 인 것 중 확장자로 분기.
+    #    카카오 오픈빌더에서 커스텀 파라미터 이름(예: "secureimage", "사진", "doc1") 으로 들어온 경우 대응.
+    for _key, val in action_params.items():
+        url = ""
+        if isinstance(val, str) and val.startswith("http"):
+            url = val
+        elif isinstance(val, dict):
+            v = val.get("url", "")
+            if isinstance(v, str) and v.startswith("http"):
+                url = v
+        if not url:
+            continue
+        kind = _classify_url_input(url)
+        if kind in (InputType.IMAGE, InputType.PDF):
+            return url, kind
+        # 영상 확장자 추정
+        if re.search(r"\.(mp4|mov|webm|mkv|avi)(\?|$)", url, re.IGNORECASE):
+            return url, InputType.VIDEO
+        return url, InputType.FILE
+
+    # 3) utterance 전체 또는 일부가 URL — 둘 다 첫 매칭 URL 만 사용
     url_match = _URL_RE.search(utterance)
     if url_match:
         url = url_match.group(0)
@@ -588,6 +615,26 @@ def _is_result_request(text: str) -> bool:
         return True
     return any(p in s for p in _RESULT_REQUEST_SUBSTRINGS)
 
+
+# 시스템 명령어 — 짧지만 분석 의도가 분명하므로 어뷰즈 소프트 트래커에서 제외해야 한다.
+# (결과확인 4자, 사용법 3자 등이 SOFT_LEN_THRESHOLD=10 미만이라 위반으로 잘못 카운트되던 버그 방지)
+_SYSTEM_COMMAND_EXACT = {
+    "사용법", "도움말", "help", "?",
+    "분석 초기화", "초기화", "리셋", "reset",
+}
+
+
+def _is_system_command(text: str) -> bool:
+    """결과확인/사용법/초기화/스킵 같은 시스템 명령어인지 — 어뷰즈 트래커 우회용."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s in _SYSTEM_COMMAND_EXACT:
+        return True
+    if s in _KAKAO_SKIP_PHRASES:
+        return True
+    return _is_result_request(s)
+
 # user_id → 상태 dict (구조는 _new_job_state 참조)
 _pending_jobs: dict[str, dict] = {}
 # 멀티 스레드/태스크에서 _pending_jobs 동시 수정 방지
@@ -667,6 +714,16 @@ def _issue_result_token(
     }
     base = _get_public_base_url()
     url = f"{base}/result/{token}" if base else None
+
+    # 카톡 카드 vs 상세 페이지 점수 불일치 디버깅용 — 토큰별 점수 스냅샷
+    logging.getLogger("token").info(
+        "result_token issued: token=%s run_id=%s risk_level=%s total_score=%s flags=%d",
+        token[:8],
+        (result or {}).get("analysis_run_id"),
+        (result or {}).get("risk_level"),
+        (result or {}).get("total_score"),
+        len((result or {}).get("triggered_flags") or []),
+    )
 
     # 어드민 라벨링 세션이 풀 컨텍스트(대화/사용자정보)를 보도록 DB 에 머지
     run_id = (result or {}).get("analysis_run_id")
@@ -1393,7 +1450,7 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
             action_params.get(k)
             for k in ("image", "picture", "photo", "pdf", "document", "video", "video_url", "file", "attachment")
         )
-        if utterance and not has_attachment:
+        if utterance and not has_attachment and not _is_system_command(utterance):
             soft_warn_info = _ag.track_short_message(user_id, utterance)
             if soft_warn_info and soft_warn_info.get("blocked"):
                 log.warning("→ soft block triggered user %s", user_id[:12])
@@ -2044,8 +2101,27 @@ async def admin_stats() -> dict[str, Any]:
 
 
 # ──────────────────────────────────
-# v3 platform — API key 관리 / observability / cost
+# v3 platform — Admin login / API key 관리 / observability / cost
 # ──────────────────────────────────
+class AdminLoginRequest(BaseModel):
+    token: str
+
+
+@app.post("/api/admin/login")
+async def admin_login(payload: AdminLoginRequest) -> dict[str, Any]:
+    """단일 admin token 검증. 성공 시 호출자(Next.js)가 같은 값을 httpOnly 쿠키로 저장."""
+    import hmac as _hmac
+    expected = (os.getenv("SCAMGUARDIAN_ADMIN_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="SCAMGUARDIAN_ADMIN_TOKEN 이 설정되지 않아 어드민 접근이 비활성화되어 있습니다.",
+        )
+    if not payload.token or not _hmac.compare_digest(expected, payload.token.strip()):
+        raise HTTPException(status_code=401, detail="토큰이 일치하지 않습니다.")
+    return {"ok": True}
+
+
 class CreateApiKeyRequest(BaseModel):
     label: str
     monthly_quota: int = 1000

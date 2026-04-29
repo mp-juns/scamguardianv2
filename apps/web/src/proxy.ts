@@ -1,0 +1,37 @@
+import { NextResponse } from "next/server";
+
+import { auth } from "./auth";
+
+const allowlist = (process.env.ADMIN_EMAILS ?? "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+const DISABLED = ["1", "true", "yes", "on"].includes(
+  (process.env.ADMIN_AUTH_DISABLED ?? "").toLowerCase(),
+);
+
+function isAllowed(email: string | undefined | null) {
+  if (!email) return false;
+  return allowlist.includes(email.toLowerCase());
+}
+
+// Next.js 16 proxy (구 middleware) — /admin/* 는 Auth.js 세션 + email allowlist 통과해야 진입.
+// 미인증이면 /admin/login (signIn 페이지) 으로 리다이렉트.
+// ADMIN_AUTH_DISABLED=true 면 모든 검사 bypass (개발용).
+export default auth((request) => {
+  if (DISABLED) return NextResponse.next();
+  const { pathname, search } = request.nextUrl;
+  if (pathname === "/admin/login") return NextResponse.next();
+  const email = request.auth?.user?.email;
+  if (isAllowed(email)) return NextResponse.next();
+
+  const url = request.nextUrl.clone();
+  url.pathname = "/admin/login";
+  url.searchParams.set("next", pathname + (search || ""));
+  return NextResponse.redirect(url);
+});
+
+export const config = {
+  matcher: ["/admin/:path*"],
+};
