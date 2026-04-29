@@ -353,6 +353,10 @@ _YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
 
 _IMAGE_URL_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp)(\?|$)", re.IGNORECASE)
 _PDF_URL_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
+# 사기범이 링크로 자주 뿌리는 악성 실행파일 확장자 — 다운로드 후 VT 파일 스캔 강제 라우팅
+_EXECUTABLE_URL_RE = re.compile(
+    r"\.(apk|exe|dmg|msi|jar|bat|cmd|scr|app|ipa|deb|rpm)(\?|$)", re.IGNORECASE
+)
 
 
 def _wrap_with_soft_warning(response: dict, info: dict | None) -> dict:
@@ -379,12 +383,15 @@ def _wrap_with_soft_warning(response: dict, info: dict | None) -> dict:
 
 
 def _classify_url_input(url: str) -> kakao_formatter.InputType:
-    """URL 확장자 보고 IMAGE/PDF/URL 구분."""
+    """URL 확장자 보고 IMAGE/PDF/FILE/URL 구분."""
     InputType = kakao_formatter.InputType
     if _IMAGE_URL_RE.search(url):
         return InputType.IMAGE
     if _PDF_URL_RE.search(url):
         return InputType.PDF
+    # APK/EXE/DMG 등 실행 파일 — VT 파일 스캔이 필수. 일반 웹페이지(URL) 스캔이 아니라 다운로드 후 검사로 강제.
+    if _EXECUTABLE_URL_RE.search(url):
+        return InputType.FILE
     return InputType.URL
 
 
@@ -463,6 +470,7 @@ def _kakao_materialize_url(url: str, suffix_hint: str = "") -> str:
     저장 위치: .scamguardian/uploads/kakao/{uuid}{suffix}
     """
     import uuid as _uuid
+    import requests as _requests
     log = logging.getLogger("kakao_dl")
 
     suffix = suffix_hint
@@ -479,7 +487,7 @@ def _kakao_materialize_url(url: str, suffix_hint: str = "") -> str:
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{_uuid.uuid4().hex}{suffix}"
 
-    resp = requests.get(url, stream=True, timeout=30)
+    resp = _requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
     with target.open("wb") as fp:
         for chunk in resp.iter_content(chunk_size=64 * 1024):
@@ -1531,10 +1539,17 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         input_type.value, is_heavy, source[:80],
     )
 
-    # ── v3 Phase 1: 이미지/PDF 는 카카오 CDN URL → 로컬 파일 다운로드 후 vision 라우팅 ──
-    if input_type in (InputType.IMAGE, InputType.PDF) and source.startswith("http"):
+    # ── v3 Phase 1: 이미지/PDF/실행파일 → 로컬 다운로드 후 Phase 0 VT 파일 스캔 강제 ──
+    if input_type in (InputType.IMAGE, InputType.PDF, InputType.FILE) and source.startswith("http"):
         try:
-            suffix_hint = ".pdf" if input_type == InputType.PDF else ""
+            if input_type == InputType.PDF:
+                suffix_hint = ".pdf"
+            elif input_type == InputType.FILE:
+                # URL 끝 확장자 보존 (.apk/.exe 등) — 없으면 .bin
+                m = _EXECUTABLE_URL_RE.search(source)
+                suffix_hint = f".{m.group(1).lower()}" if m else ""
+            else:
+                suffix_hint = ""
             local_path = await asyncio.to_thread(
                 _kakao_materialize_url, source, suffix_hint,
             )

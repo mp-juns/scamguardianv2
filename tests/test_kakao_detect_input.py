@@ -82,3 +82,20 @@ def test_custom_param_video_extension_routes_to_video():
 def test_custom_param_unknown_extension_falls_back_to_file():
     src, kind = _detect("", {"misc": "https://example.com/something.bin"})
     assert kind.value == "file"
+
+
+def test_apk_url_routes_to_file_for_vt_scan():
+    """사기범이 텍스트로 보낸 APK 다운로드 링크 — VT 파일 스캔 강제 라우팅."""
+    src, kind = _detect("이거 깔아줘 https://evil.com/court.apk 부탁해", {})
+    assert kind.value == "file"
+    assert src == "https://evil.com/court.apk"
+
+
+def test_exe_url_routes_to_file():
+    src, kind = _detect("https://evil.com/setup.exe", {})
+    assert kind.value == "file"
+
+
+def test_dmg_url_routes_to_file():
+    src, kind = _detect("https://example.com/installer.dmg", {})
+    assert kind.value == "file"

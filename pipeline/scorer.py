@@ -57,6 +57,7 @@ class ScamReport:
     llm_assessment: dict[str, Any] | None = None
     rag_context: dict[str, Any] | None = None
     safety_check: dict[str, Any] | None = None  # v3 Phase 0 결과
+    sandbox_check: dict[str, Any] | None = None  # v3.5 Phase 0.5 결과 (URL 디토네이션)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +91,7 @@ class ScamReport:
             "llm_assessment": self.llm_assessment,
             "rag_context": self.rag_context,
             "safety_check": self.safety_check,
+            "sandbox_check": self.sandbox_check,
         }
 
     def summary(self) -> str:
@@ -202,6 +204,26 @@ def _scale_llm_flag_delta(delta: int) -> int:
     return scaled
 
 
+def _add_sandbox_flag(
+    triggered: list[FlagDetail],
+    seen: set[str],
+    flag: str,
+    description: str,
+    evidence: list[str],
+) -> None:
+    """Phase 0.5 샌드박스 플래그 추가 헬퍼 (중복 방지)."""
+    if flag in seen:
+        return
+    seen.add(flag)
+    triggered.append(FlagDetail(
+        flag=flag,
+        description=description,
+        score_delta=SCORING_RULES.get(flag, 0),
+        evidence=evidence,
+        source="sandbox",
+    ))
+
+
 def score(
     verification_results: list[VerificationResult],
     classification: ClassificationResult,
@@ -214,6 +236,7 @@ def score(
     scam_type_reason: str = "",
     classifier_original: ClassificationResult | None = None,
     safety_result: Any = None,
+    sandbox_result: Any = None,
 ) -> ScamReport:
     """
     검증 결과를 종합하여 최종 스캠 리포트를 생성한다.
@@ -260,6 +283,66 @@ def score(
                 evidence=evidence,
                 source="safety",
             ))
+
+    # v3.5 Phase 0.5: 샌드박스 디토네이션 자동 플래그
+    if sandbox_result is not None and getattr(sandbox_result, "status", None) is not None:
+        sb_status = getattr(sandbox_result, "status")
+        sb_status_val = sb_status.value if hasattr(sb_status, "value") else str(sb_status)
+        if sb_status_val == "completed":
+            sb_evidence_base = [
+                f"target: {getattr(sandbox_result, 'target_url', '')[:120]}",
+            ]
+            final_url = getattr(sandbox_result, "final_url", None)
+            if final_url and final_url != getattr(sandbox_result, "target_url", None):
+                sb_evidence_base.append(f"final: {final_url[:120]}")
+
+            # password 입력폼이 가장 강한 신호
+            if getattr(sandbox_result, "has_password_field", False):
+                _add_sandbox_flag(
+                    triggered, seen_flags, "sandbox_password_form_detected",
+                    "[Phase 0.5 샌드박스] 격리 환경에서 비밀번호 입력 필드 감지",
+                    sb_evidence_base + [f"민감 필드: {', '.join(getattr(sandbox_result, 'sensitive_form_fields', []))}"],
+                )
+                total += SCORING_RULES.get("sandbox_password_form_detected", 0)
+            elif getattr(sandbox_result, "sensitive_form_fields", []):
+                _add_sandbox_flag(
+                    triggered, seen_flags, "sandbox_sensitive_form_detected",
+                    "[Phase 0.5 샌드박스] 민감 정보 입력 필드 감지",
+                    sb_evidence_base + [f"필드: {', '.join(getattr(sandbox_result, 'sensitive_form_fields', []))}"],
+                )
+                total += SCORING_RULES.get("sandbox_sensitive_form_detected", 0)
+
+            # drive-by download
+            downloads = getattr(sandbox_result, "download_attempts", []) or []
+            if downloads:
+                _add_sandbox_flag(
+                    triggered, seen_flags, "sandbox_auto_download_attempt",
+                    "[Phase 0.5 샌드박스] 자동 다운로드 시도 감지",
+                    sb_evidence_base + [
+                        f"다운로드: {d.get('suggested_filename') or d.get('url', '')[:80]}"
+                        for d in downloads[:3]
+                    ],
+                )
+                total += SCORING_RULES.get("sandbox_auto_download_attempt", 0)
+
+            # 클로킹
+            if getattr(sandbox_result, "cloaking_detected", False):
+                _add_sandbox_flag(
+                    triggered, seen_flags, "sandbox_cloaking_detected",
+                    "[Phase 0.5 샌드박스] 도메인 위장 (클로킹) 감지",
+                    sb_evidence_base,
+                )
+                total += SCORING_RULES.get("sandbox_cloaking_detected", 0)
+
+            # 과도한 리디렉션
+            if getattr(sandbox_result, "excessive_redirects", False):
+                redirect_count = len(getattr(sandbox_result, "redirect_chain", []) or [])
+                _add_sandbox_flag(
+                    triggered, seen_flags, "sandbox_excessive_redirects",
+                    "[Phase 0.5 샌드박스] 과도한 리디렉션",
+                    sb_evidence_base + [f"리디렉션 횟수: {redirect_count}"],
+                )
+                total += SCORING_RULES.get("sandbox_excessive_redirects", 0)
 
     for vr in verification_results:
         if not vr.triggered:
@@ -332,4 +415,5 @@ def score(
         llm_assessment=llm_assessment.to_dict() if llm_assessment is not None else None,
         rag_context=rag_context,
         safety_check=safety_result.to_dict() if safety_result is not None and hasattr(safety_result, "to_dict") else None,
+        sandbox_check=sandbox_result.to_dict() if sandbox_result is not None and hasattr(sandbox_result, "to_dict") else None,
     )

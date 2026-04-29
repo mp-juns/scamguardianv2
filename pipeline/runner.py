@@ -6,11 +6,12 @@ ScamGuardian v2 — 파이프라인 오케스트레이터
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from pipeline import classifier, extractor, llm_assessor, rag, safety, scorer, stt, verifier
+from pipeline import classifier, extractor, llm_assessor, rag, safety, sandbox, scorer, stt, verifier
 from pipeline.config import CLASSIFICATION_THRESHOLD
 from pipeline.config import RAG_TOP_K, SCORING_RULES
 from pipeline.scorer import ScamReport
@@ -195,6 +196,7 @@ class ScamGuardianPipeline:
         self.last_similar_cases = []
         self.last_report = None
         self.last_safety_result: safety.SafetyResult | None = None
+        self.last_sandbox_result: sandbox.SandboxResult | None = None
         pipeline_start = time.time()
         effective_use_rag = use_llm and use_rag
         self._debug(
@@ -270,6 +272,46 @@ class ScamGuardianPipeline:
             self.last_report = report
             self._log_step("전체", pipeline_start)
             return report
+
+        # ════════════════════════════════
+        # Phase 0.5 (v3.5): URL 디토네이션 — 격리 Chromium 으로 의심 URL 직접 navigate
+        # 조건: 입력이 URL + Phase 0 fast-path 트리거 안 됨 + SANDBOX_ENABLED.
+        # ════════════════════════════════
+        sandbox_result: sandbox.SandboxResult | None = None
+        sandbox_enabled = (
+            os.getenv("SANDBOX_ENABLED", "0") == "1"
+            and precomputed_transcript is None
+            and source.startswith(("http://", "https://"))
+        )
+        if sandbox_enabled:
+            phase05_start = time.time()
+            try:
+                print("[Phase 0.5] URL 디토네이션 (격리 Chromium)...")
+                sandbox_result = sandbox.detonate_url(source)
+            except Exception as exc:  # noqa: BLE001 — 샌드박스도 죽으면 안 됨
+                print(f"[Phase 0.5] 디토네이션 실패(무시): {exc}")
+                sandbox_result = None
+            if sandbox_result is not None:
+                self.last_sandbox_result = sandbox_result
+                self._log_step(
+                    "Sandbox",
+                    phase05_start,
+                    {
+                        "status": sandbox_result.status.value,
+                        "redirect_count": len(sandbox_result.redirect_chain),
+                        "has_password_field": sandbox_result.has_password_field,
+                        "downloads": len(sandbox_result.download_attempts),
+                        "duration_ms": sandbox_result.duration_ms,
+                    },
+                )
+                icon = "🚨" if sandbox_result.is_dangerous else "✅"
+                print(
+                    f"      ← {icon} status={sandbox_result.status.value} "
+                    f"final={sandbox_result.final_url[:60] if sandbox_result.final_url else '-'} "
+                    f"pwd_form={sandbox_result.has_password_field} "
+                    f"downloads={len(sandbox_result.download_attempts)} "
+                    f"cloaking={sandbox_result.cloaking_detected}"
+                )
 
         # ════════════════════════════════
         # Phase 1: STT (precomputed_transcript 있으면 스킵)
@@ -449,6 +491,7 @@ class ScamGuardianPipeline:
             scam_type_reason=scam_type_reason,
             classifier_original=classifier_original,
             safety_result=safety_result,
+            sandbox_result=sandbox_result,
         )
 
         total_ms = (time.time() - pipeline_start) * 1000

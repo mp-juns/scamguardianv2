@@ -17,6 +17,19 @@
 - **어뷰즈 가드**: 길이 cap·반복·gibberish 차단 + 짧은 메시지 누적 트래커. 카카오 user_id 별 3회 경고 후 1시간 자동 블록 + 채팅 강제 종료.
 - **테스트** (pytest): 격리된 SQLite + 외부 API mock 0회로 46 passed (`pytest`).
 
+## v3.5 신규 (2026-04-30)
+
+- **Phase 0.5 URL 디토네이션** (`pipeline/sandbox.py`): VT 시그니처가 못 잡는 *zero-day 피싱*을 격리 Chromium 으로 직접 navigate 해서 잡음. 비밀번호 입력폼·민감 입력·자동 다운로드·도메인 클로킹·과도한 리디렉션 5종 자동 플래그 (+15 ~ +60).
+- **Sandbox 서버 분리** (`sandbox_server/`): production 호스트와 *별도 VM/VPS* 에서 도는 FastAPI 디토네이션 서버. Bearer 토큰 인증, screenshot base64 inline 반환, stateless. 같은 호스트 격리(컨테이너 이스케이프 위험)에서 물리 분리(잃을 게 없는 VM)로 격상.
+- **백엔드 자동 분기**: `SANDBOX_BACKEND=auto` — `SANDBOX_REMOTE_URL`+`SANDBOX_REMOTE_TOKEN` 둘 다 있으면 remote, 아니면 local Docker. dev/staging/prod 무코드 변경.
+- **카카오 webhook 멀티모달 실전 검증**: 이미지가 utterance 필드에 CDN URL 박혀서 도착하는 것 확인 (action.params 비어있음). detector fallback (모든 키 훑어 URL 분류) 추가. APK/EXE/DMG 등 실행파일 URL 도 자동 분류해 VT 파일 스캔 강제.
+- **PDF 한계 명시**: 카카오 챗봇 채널은 PDF 첨부를 클라이언트 단에서 차단 — 사용자 안내문 ("캡쳐 이미지 또는 클라우드 링크로 보내주세요") 으로 우회.
+- **Whisper 비용 추적 버그 수정**: `record_openai_whisper()` 함수 정의만 있고 호출되지 않던 버그. 이제 어드민 비용 차트에 OpenAI provider 정상 노출.
+- **어드민 비용 시각화**: `/admin/platform` 에 일별 USD 추이(area chart) + 프로바이더 비중(horizontal bar) 추가.
+- **어드민 어뷰즈 차단 관리 UI**: `/admin/platform` 🛑 섹션 — 차단된 user_id 목록·남은 시간·"차단 해제" 버튼.
+- **결과확인 명령어 어뷰즈 우회 버그 수정**: "결과확인"(4자) 같은 시스템 명령어가 짧은 메시지 트래커에 위반으로 잘못 카운트되던 문제 수정. `_is_system_command` 화이트리스트 도입.
+- **테스트**: 93 passed.
+
 ## API 우선 설계
 
 비즈니스 로직은 모두 FastAPI(`api_server.py`) 엔드포인트에 노출돼 있고, 다른 채널은 그 위 얇은 레이어:

@@ -496,6 +496,16 @@ SCORING_RULES: dict[str, int] = {
     "suspicious_url_signal": 25,        # URL 이 VT 에서 일부 엔진만 의심
 
     # ──────────────────────────────────────────────
+    # v3.5 Phase 0.5: URL 디토네이션 (격리 Chromium 직접 navigate)
+    # VT 시그니처 lookup 이 못 잡는 *zero-day* 피싱 페이지 탐지.
+    # ──────────────────────────────────────────────
+    "sandbox_password_form_detected": 50,    # 격리 환경 navigate 결과 비밀번호 입력폼 발견 → 피싱 강력 신호
+    "sandbox_sensitive_form_detected": 35,   # 주민번호/카드/OTP 등 민감 입력 필드 노출
+    "sandbox_auto_download_attempt": 60,     # 페이지 진입만으로 파일 다운로드 시도 (drive-by)
+    "sandbox_cloaking_detected": 30,         # 최종 도착지가 target 도메인과 다름 (리디렉션 위장)
+    "sandbox_excessive_redirects": 15,       # 3회 초과 리디렉션 (클로킹·트래커)
+
+    # ──────────────────────────────────────────────
     # 노션 다음 단계: BERT 유사도/쿼리 A-B-C 플래그
     # ──────────────────────────────────────────────
     "authority_context_mismatch": 15,   # 화자 프로파일 vs 발화 맥락 의미 불일치
@@ -534,6 +544,11 @@ FLAG_LABELS_KO: dict[str, str] = {
     "phishing_url_confirmed": "피싱 URL 확인",
     "suspicious_file_signal": "의심 파일 신호",
     "suspicious_url_signal": "의심 URL 신호",
+    "sandbox_password_form_detected": "샌드박스: 비밀번호 입력폼 발견",
+    "sandbox_sensitive_form_detected": "샌드박스: 민감 입력 필드 발견",
+    "sandbox_auto_download_attempt": "샌드박스: 자동 다운로드 시도",
+    "sandbox_cloaking_detected": "샌드박스: 도메인 위장 (클로킹)",
+    "sandbox_excessive_redirects": "샌드박스: 과도한 리디렉션",
     "authority_context_mismatch": "발화 맥락 불일치",
     "authority_context_uncertain": "발화 맥락 애매",
     "query_a_confirmed": "신뢰 언론에서 확인됨",
@@ -659,6 +674,26 @@ FLAG_RATIONALE: dict[str, dict[str, str]] = {
     "suspicious_url_signal": {
         "rationale": "URL 이 일부 엔진에서만 의심 — 신생 도메인이거나 평판 낮은 호스팅. 다른 신호와 결합 시 결정적 단서.",
         "source": "VirusTotal URL Scan / APWG 신생 피싱 도메인 통계",
+    },
+    "sandbox_password_form_detected": {
+        "rationale": "격리 헤드리스 Chromium 으로 의심 URL 을 직접 navigate 한 결과 비밀번호 입력 필드(<input type=password>) 발견. 정상 사이트가 검색·뉴스 링크에서 비번을 요구하는 경우는 거의 없음 — zero-day 피싱 페이지의 강력한 직접 증거.",
+        "source": "OWASP Top 10 (A07: Identification & Authentication Failures) / APWG Phishing Activity Trends 2024",
+    },
+    "sandbox_sensitive_form_detected": {
+        "rationale": "주민번호·카드번호·CVC·OTP·계좌 등 민감 정보 입력 필드 검출. 정상 가맹점 결제·인증 외 컨텍스트에서 노출 시 피싱 의심.",
+        "source": "PCI DSS 4.0 / 개인정보보호법 시행령 별표1 (민감정보 정의)",
+    },
+    "sandbox_auto_download_attempt": {
+        "rationale": "사용자 클릭 없이 페이지 진입만으로 다운로드 트리거 — drive-by download 패턴. 악성 APK·exe 배포의 전형.",
+        "source": "Google Safe Browsing Transparency Report / Mavroeidis & Bromander (2017) Cyber Threat Intelligence Model",
+    },
+    "sandbox_cloaking_detected": {
+        "rationale": "사용자에게 보여준 URL 의 호스트와 실제 최종 도착지 호스트가 다름 — 도메인 위장(cloaking) 패턴. 단축 URL 남용·가짜 리디렉션 체인.",
+        "source": "APWG Cloaking Techniques Report / Mavroeidis & Bromander (2017)",
+    },
+    "sandbox_excessive_redirects": {
+        "rationale": "리디렉션 3회 초과 — 추적 회피·트래픽 세탁·국가별 분기 라우팅 의심. 단독 결정적이진 않으나 다른 신호와 결합 시 의미.",
+        "source": "Google Safe Browsing 휴리스틱 / 자체 임계값 설계",
     },
     "authority_context_mismatch": {
         "rationale": "발화자 직업·신원 vs 발화 내용의 SBERT 임베딩 코사인 유사도가 임계 미만 → 사칭 의심. 의미적 일관성 분석 기법.",

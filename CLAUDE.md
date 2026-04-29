@@ -9,10 +9,11 @@ ScamGuardian v3 — 한국어 음성·텍스트·이미지·PDF 사기 탐지 AI
 - **API 우선 설계**: 모든 비즈니스 로직은 FastAPI (`api_server.py`) 에. Next.js 는 thin proxy(`apps/web/src/app/api/_lib/backend.ts`) + UI. 모바일·외부 SDK 는 같은 REST 엔드포인트 직접 호출 가능.
 - **Frontend**: Next.js 16 App Router (`apps/web/`) — Next 16은 기존 버전과 API·컨벤션이 다릅니다. `node_modules/next/dist/docs/`를 먼저 확인하세요.
 - **Backend**: FastAPI (`api_server.py`) — 분석·webhook·라벨링·학습 세션·결과 토큰 페이지 모두 한 서버.
-- **Pipeline**: `pipeline/` — **6 phase** (Phase 0 Safety + Phase 1 STT/Vision + Phase 2~5)
+- **Pipeline**: `pipeline/` — **7 phase** (Phase 0 Safety + Phase 0.5 Sandbox + Phase 1 STT/Vision + Phase 2~5)
 - **Platform layer**: `platform_layer/` — API key·rate limit·cost ledger·observability·abuse_guard middleware
 - **DB**: Postgres(+pgvector) 또는 SQLite, `db/repository.py`가 Facade 역할
 - **v3 신규**: Phase 0 안전성 필터 (VirusTotal), Phase 1 멀티모달 입력 (이미지·PDF vision OCR), Fine-tuning 웹 UI + 자동 swap.
+- **v3.5 신규**: Phase 0.5 — 격리 Chromium 으로 의심 URL 직접 navigate (zero-day 피싱 탐지). 운영은 별도 VM/VPS 분리 (`sandbox_server/`).
 - **v3.x 신규**: API key 시스템(3중 cap), 비용 추적 ledger, 어뷰즈 가드(짧은 메시지 누적 자동 블록), pytest 테스트.
 
 ## 개발 실행 명령
@@ -100,6 +101,13 @@ python scripts/batch_ingest.py --dry-run
 | `ABUSE_VIOLATION_WINDOW` | 위반 누적 윈도우(초) | `3600` |
 | `ANALYZE_MAX_TEXT_LENGTH` | `/api/analyze` 텍스트 최대 글자 | `5000` |
 | `VIRUSTOTAL_RPM` | VT 분당 호출 한도 (free tier) | `4` |
+| `SANDBOX_ENABLED` | **v3.5** Phase 0.5 URL 디토네이션 활성화 | `0` |
+| `SANDBOX_BACKEND` | `auto` / `local` / `remote` — auto 면 REMOTE_URL+TOKEN 둘 다 있을 때 remote | `auto` |
+| `SANDBOX_REMOTE_URL` | **v3.5** 별도 sandbox VM/VPS 주소 (예: `http://172.x.x.x:8001`) | (없음) |
+| `SANDBOX_REMOTE_TOKEN` | **v3.5** sandbox 서버와 공유하는 Bearer 토큰 | (없음) |
+| `SANDBOX_USE_DOCKER` | local 모드에서 Docker 격리 사용 (1) vs subprocess (0) | `0` |
+| `SANDBOX_DOCKER_IMAGE` | 디토네이션 컨테이너 이미지 | `scamguardian/sandbox:latest` |
+| `SANDBOX_TIMEOUT` | 디토네이션 timeout (초) | `30` |
 
 ## 아키텍처
 
@@ -151,20 +159,22 @@ python scripts/batch_ingest.py --dry-run
 
 ### 파이프라인 단계 (`pipeline/runner.py`)
 
-`ScamGuardianPipeline.analyze(source, skip_verification, use_llm, use_rag)` — **6 Phase (Phase 0~5)**:
+`ScamGuardianPipeline.analyze(source, skip_verification, use_llm, use_rag)` — **7 Phase (Phase 0~5, 0.5 포함)**:
 
 ```
-Phase 0: VirusTotal 안전성 검사 (URL·파일만, v3)
-Phase 1: STT / OCR  — Whisper(음성) | Claude vision(이미지·PDF, v3)
-Phase 2: mDeBERTa 분류 (또는 fine-tuned task-specific, v3)
-Phase 3: ┌ LLM 통합 호출 (analyze_unified) ┐  ← ThreadPoolExecutor 병렬
-         ├ GLiNER 엔티티 추출               │
-         └ RAG 유사 사례 검색               ┘
-Phase 4: Serper 교차 검증 (내부 병렬, 세마포어 레이트 리미팅)
-Phase 5: 스코어링
+Phase 0:   VirusTotal 안전성 검사 (URL·파일만, v3)
+Phase 0.5: 격리 Chromium URL 디토네이션 (v3.5, SANDBOX_ENABLED=1 일 때)
+Phase 1:   STT / OCR  — Whisper(음성) | Claude vision(이미지·PDF, v3)
+Phase 2:   mDeBERTa 분류 (또는 fine-tuned task-specific, v3)
+Phase 3:   ┌ LLM 통합 호출 (analyze_unified) ┐  ← ThreadPoolExecutor 병렬
+           ├ GLiNER 엔티티 추출               │
+           └ RAG 유사 사례 검색               ┘
+Phase 4:   Serper 교차 검증 (내부 병렬, 세마포어 레이트 리미팅)
+Phase 5:   스코어링
 ```
 
 0. **안전성** (`safety.py`, v3): URL → VT URL 스캔, 파일 → SHA256 lookup → 미스 시 업로드. 4 req/min 토큰버킷. 악성 확정 시 fast-path: STT/분류 skip + `malware_detected` (80점) 또는 `phishing_url_confirmed` (75점) 단독 트리거 → "매우 위험" 직행.
+0.5. **샌드박스** (`sandbox.py`, v3.5): URL 입력에 한해 격리 Chromium 으로 직접 navigate. 비밀번호 입력폼 / 자동 다운로드 / 클로킹 / 과도한 리디렉션 감지 → 5종 sandbox 플래그. **`SANDBOX_BACKEND=remote`** 면 별도 VM/VPS 의 sandbox 서버에 HTTPS 호출 (production 호스트와 분리).
 1. **STT/OCR** (`stt.py` + `vision.py`): 텍스트 패스스루, YouTube URL → Whisper, 음성 파일 → Whisper, **이미지·PDF → Claude vision OCR + 시각 단서 통합** (v3). `stt.transcribe()` 가 확장자 보고 자동 라우팅.
 2. **분류** (`classifier.py`): zero-shot NLI + 키워드 부스팅 또는 **fine-tuned multi-class** (v3 — `active_models.json` 에 활성 체크포인트 있으면 자동 swap).
 3. **병렬 실행** (Phase 3): 분류 결과를 기반으로 아래 3개를 `ThreadPoolExecutor`로 동시 실행
@@ -180,6 +190,8 @@ Phase 5: 스코어링
 |------|------|----------------|
 | `runner.py` | 전체 파이프라인 오케스트레이터 | `ScamGuardianPipeline.analyze(source, ..., precomputed_transcript, user_context)` |
 | `safety.py` | **v3** Phase 0 — VirusTotal URL/파일 스캔 | `scan_url()`, `scan_file()`, `safety_check()` → `SafetyResult` |
+| `sandbox.py` | **v3.5** Phase 0.5 — URL 디토네이션 (local Docker 또는 remote VM HTTP) | `detonate_url(url)` → `SandboxResult` |
+| `sandbox_detonate.py` | **v3.5** 컨테이너 안 실행 — Playwright Chromium 으로 navigate + JSON output | `detonate(url, output_dir, timeout)` |
 | `vision.py` | **v3** Phase 1 — Claude vision OCR (이미지/PDF) | `transcribe(path)`, `transcribe_image()`, `transcribe_pdf()` → `VisionResult` |
 | `stt.py` | 음성→텍스트 + **확장자 자동 라우팅** (v3 — vision 자동 호출) | `transcribe(source)` → `TranscriptResult` |
 | `classifier.py` | 스캠 유형 분류 (zero-shot 또는 **fine-tuned**, v3) | `classify(text)` → `ClassificationResult` |
@@ -187,7 +199,7 @@ Phase 5: 스코어링
 | `verifier.py` | Serper API 교차검증 | `verify(entities, scam_type)` → `list[VerificationResult]` |
 | `rag.py` | 유사 사례 벡터 검색 | `retrieve_similar_runs(embedding, k)` |
 | `llm_assessor.py` | Claude API 보조 판정 | `analyze_unified(text, scam_type, user_context)` → `UnifiedLLMResult` |
-| `scorer.py` | 플래그 합산 + **safety 자동 플래그** (v3) | `score(verification_results, ..., safety_result)` → `ScamReport` |
+| `scorer.py` | 플래그 합산 + **safety 자동 플래그** (v3) + **sandbox 자동 플래그** (v3.5) | `score(verification_results, ..., safety_result, sandbox_result)` → `ScamReport` |
 | `active_models.py` | **v3** — `.scamguardian/active_models.json` reader (60s TTL 캐시) | `get_active_path(role)`, `invalidate()` |
 | `config.py` | 스캠 유형·플래그·점수·라벨·근거 정의 | `SCORING_RULES`, `FLAG_LABELS_KO`, `FLAG_RATIONALE`, `RISK_LEVELS` |
 | `kakao_formatter.py` | ScamReport → 카카오 응답 JSON (**IMAGE/PDF, safety 카드** v3) | `format_result()`, `format_question()`, `format_welcome()` |
@@ -498,25 +510,88 @@ python scripts/aihub.py download-labels 98 --domain 금융 --dry-run
 - IMAGE / PDF 면 webhook 핸들러가 `_kakao_materialize_url()` 로 카카오 CDN URL → `.scamguardian/uploads/kakao/{uuid}.{ext}` 다운로드 → 로컬 경로로 source 교체
 - 그 후 기존 `_kakao_start_context_collection()` 흐름 그대로 — `stt.transcribe()` 가 vision 자동 라우팅
 - `format_question` / `format_analyzing` / `format_queued` 모두 IMAGE/PDF 메시지 추가
+- **실전 발견** (2026-04-30): 카카오 *챗봇 채널* 은 PDF 첨부 자체 차단 — 이미지는 utterance 필드에 CDN URL 박혀서 도착 (action.params 가 아님). detector fallback (action_params 의 *모든* 키 훑어 URL 분류) 추가. APK/EXE/DMG 등 실행파일 URL 도 InputType.FILE 로 분류해 VT 파일 스캔 강제.
+
+## v3.5 신규 시스템 (2026-04-30)
+
+### Phase 0.5 URL 디토네이션 (`pipeline/sandbox.py`)
+
+VT 시그니처 lookup 의 한계(zero-day 피싱 못 잡음)를 정면 돌파. 의심 URL 을 격리 Chromium 으로 *직접 navigate* 해서 페이지 행동을 관찰.
+
+**감지 항목**:
+- 비밀번호 입력 필드 (`<input type=password>`) — 가장 강한 피싱 신호
+- 민감 정보 필드 (주민번호·OTP·CVC·계좌·카드)
+- 자동 다운로드 시도 (drive-by download)
+- 클로킹 (target 도메인 ≠ 최종 도착지)
+- 과도한 리디렉션 (>3회)
+
+**새 플래그** (`pipeline/config.py`):
+- `sandbox_password_form_detected` (+50)
+- `sandbox_sensitive_form_detected` (+35)
+- `sandbox_auto_download_attempt` (+60)
+- `sandbox_cloaking_detected` (+30)
+- `sandbox_excessive_redirects` (+15)
+
+**백엔드 모드** (`SANDBOX_BACKEND`):
+- `local` — 동일 호스트 Docker 또는 subprocess (개발 전용)
+- `remote` — 별도 VM/VPS 의 sandbox 서버에 HTTPS 호출 (**운영 권장**)
+- `auto` (기본) — REMOTE_URL+TOKEN 둘 다 있으면 remote, 아니면 local
+
+**파일 구조**:
+- `pipeline/sandbox.py` — Python wrapper. local/remote 자동 분기. 원격 응답의 screenshot base64 → 호스트 파일로 저장.
+- `pipeline/sandbox_detonate.py` — 컨테이너 *안에서* 실행되는 Playwright 스크립트. JSON 한 줄 output.
+- `pipeline/sandbox.Dockerfile` — Playwright 공식 이미지 기반. `mcr.microsoft.com/playwright/python:v1.47.0-jammy`. 비특권 user.
+- `sandbox_server/app.py` — 격리 VM 안에서 도는 FastAPI 서버. `/detonate` + `/health`. Bearer 토큰 인증. screenshot base64 inline 반환. stateless (디토네이션 결과물 즉시 삭제).
+- `sandbox_server/README.md` — Multipass VM (Win11 Pro) / 클라우드 VPS 양쪽 배포 가이드 + systemd 서비스 등록.
+
+### 격리 정책 — 왜 분리하나
+
+```
+같은 호스트 = 위험:
+  production server (DB, API 키, 사용자 데이터)
+    ↘ 같은 커널 ↙
+  sandbox container (untrusted URL 직접 실행)
+  → 컨테이너 이스케이프 한 번에 모든 데이터 노출
+
+분리 = 안전:
+  production ←HTTPS+Bearer토큰→ sandbox VM (별도 머신)
+  sandbox 가 완전히 털려도 빈 VM (DB·키·데이터 없음) → 잃을 게 없음
+```
+
+**개발**: 동일 WSL 내 `SANDBOX_BACKEND=local` + `SANDBOX_USE_DOCKER=1`
+**스테이징·운영**: Multipass VM (Win11 Pro Hyper-V) 또는 클라우드 VPS ($5/월) — `SANDBOX_BACKEND=remote`
+
+### 카카오 webhook 이미지·실행파일 (v3.5)
+
+- **이미지**: utterance 필드 안 카카오 CDN URL → detector 자동 인식 → `_kakao_materialize_url` 다운로드 → Phase 0 VT 검사 + Phase 0.5 디토네이션 (URL 인 경우)
+- **APK/EXE/DMG**: detector 가 `_EXECUTABLE_URL_RE` 로 `InputType.FILE` 분류 → 다운로드 → Phase 0 VT 파일 스캔 (URL 페이지 스캔 X)
+- **PDF**: 카카오 챗봇 클라이언트에서 첨부 자체 차단 — 사용자 안내 필요 ("캡쳐 이미지 또는 클라우드 링크")
+
+### Whisper 비용 추적 (v3.5 버그 수정)
+
+`record_openai_whisper()` 가 정의만 있고 호출되지 않던 버그 — `pipeline/stt.py` 에서 `_probe_audio_seconds()` 헬퍼 분리, OpenAI 호출 후 자동 ledger 기록. v4 chunker 도 동일. 이제 어드민 비용 차트에 OpenAI provider 정상 노출.
 
 ## 테스트 (`tests/`)
 
 ```bash
 pip install pytest
-pytest                    # 46 passed (5초 미만)
+pytest                    # 93 passed (8초 미만)
 pytest tests/test_abuse_guard.py -v
+pytest tests/test_sandbox_parser.py -v   # v3.5 sandbox dispatch + scoring
 ```
 
 `tests/conftest.py`:
 - `_isolate_env`: 모든 테스트에 격리된 임시 SQLite path 자동 주입
 - 외부 API key (ANTHROPIC/OPENAI/SERPER/VIRUSTOTAL) 자동 unset — 실수 호출 방지
 
-테스트 모듈 분포:
+테스트 모듈 분포 (총 93):
 - `test_abuse_guard.py` (10) + `test_abuse_block.py` (8)
 - `test_platform_api_keys.py` (5) + `test_platform_usd_cap.py` (3)
 - `test_cost_pricing.py` (4)
 - `test_safety_parser.py` (3) + `test_safety_scoring.py` (4)
-- `test_kakao_detect_input.py` (9)
+- `test_kakao_detect_input.py` (14, custom param + APK URL 포함) + `test_kakao_system_commands.py` (4)
+- `test_sandbox_parser.py` (15, **v3.5** — backend dispatch + scoring + screenshot)
+- `test_v4_whisper_chunker.py` (4)
 
 ## 다음 작업 (TODO)
 
