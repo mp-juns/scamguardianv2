@@ -48,6 +48,18 @@ function isAdminPath(path: string) {
 }
 
 /**
+ * 백엔드 `/api/analyze` 와 `/api/analyze-upload` 는 PlatformMiddleware 가
+ * API key 강제. Next.js 가 internal proxy 로 호출할 때만 자동 첨부.
+ *
+ * env: `SCAMGUARDIAN_INTERNAL_API_KEY=sg_...` (없으면 백엔드가 401 반환)
+ */
+const INTERNAL_API_KEY = (process.env.SCAMGUARDIAN_INTERNAL_API_KEY ?? "").trim();
+
+function isAnalyzePath(path: string) {
+  return path === "/api/analyze" || path === "/api/analyze-upload";
+}
+
+/**
  * 어드민 경로일 때 세션 검증 후 서버 env 의 SCAMGUARDIAN_ADMIN_TOKEN 을
  * X-Admin-Token 헤더로 백엔드에 forward.
  *
@@ -100,6 +112,9 @@ export async function proxyJsonRequest(request: Request, path: string) {
     const guard = await adminAuthHeader();
     if (!guard.ok) return guard.response;
     Object.assign(headers, guard.headers);
+  }
+  if (isAnalyzePath(path) && INTERNAL_API_KEY) {
+    headers["Authorization"] = `Bearer ${INTERNAL_API_KEY}`;
   }
 
   try {

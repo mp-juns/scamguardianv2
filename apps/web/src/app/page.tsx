@@ -12,12 +12,15 @@ type Entity = {
   source?: string;
 };
 
-type TriggeredFlag = {
+// DetectionReport.detected_signals[] schema (Stage 2 reframe — total_score / risk_level 폐기)
+type DetectedSignal = {
   flag: string;
-  description: string;
-  score_delta: number;
-  evidence: string[];
-  source?: string;
+  label_ko: string;
+  rationale?: string;
+  source?: string;             // 출처 기관·논문
+  detection_source?: string;   // rule | llm | safety | sandbox | static_lv1 | static_lv2 | dynamic_lv3
+  evidence?: string[];
+  description?: string;
 };
 
 type LlmSuggestedEntity = {
@@ -61,14 +64,11 @@ type AnalysisReport = {
   is_uncertain: boolean;
   transcript_preview: string;
   transcript_text?: string;
-  total_score: number;
-  risk_level: string;
-  risk_description: string;
-  is_scam?: boolean;
-  agent_verdict?: string;
-  agent_reasoning?: string[];
+  // DetectionReport (Stage 2 reframe) — 점수·등급 X, 검출 신호 list 만
+  detected_signals: DetectedSignal[];
+  summary?: string;
+  disclaimer?: string;
   entities: Entity[];
-  triggered_flags: TriggeredFlag[];
   verification_count: number;
   llm_assessment?: LlmAssessment | null;
   rag_context?: RagContext | null;
@@ -434,12 +434,10 @@ export default function Home() {
         <section className="grid gap-6 lg:grid-cols-[0.9fr_1.1fr]">
           <div className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
             <div className="mb-4 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-semibold text-white">분석 결과</h2>
+              <h2 className="text-xl font-semibold text-white">검출 결과</h2>
               {report ? (
-                <span
-                  className={`rounded-full px-3 py-1 text-sm font-medium ${riskClasses(report.risk_level)}`}
-                >
-                  {report.risk_level}
+                <span className="rounded-full bg-fuchsia-500/20 px-3 py-1 text-sm font-medium text-fuchsia-200">
+                  위험 신호 {(report.detected_signals ?? []).length}개 검출
                 </span>
               ) : null}
             </div>
@@ -458,12 +456,12 @@ export default function Home() {
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-                    <div className="text-sm text-slate-400">총 위험 점수</div>
+                    <div className="text-sm text-slate-400">검출된 위험 신호</div>
                     <div className="mt-2 text-2xl font-semibold text-white">
-                      {report.total_score}점
+                      {(report.detected_signals ?? []).length}개
                     </div>
-                    <div className="mt-2 text-sm text-slate-300">
-                      {report.risk_description}
+                    <div className="mt-2 text-xs text-slate-400">
+                      ScamGuardian 은 검출만 — 판정은 통합 기업 (Identity Boundary)
                     </div>
                   </div>
                 </div>
@@ -543,7 +541,7 @@ export default function Home() {
                           const evidence: TranscriptSpan[] = [];
                           const maxEvidence = 10;
 
-                          for (const flag of report.triggered_flags) {
+                          for (const flag of report.detected_signals ?? []) {
                             for (const ev of flag.evidence ?? []) {
                               const snippet = ev?.trim();
                               if (!snippet) continue;
@@ -641,54 +639,69 @@ export default function Home() {
 
             <div className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
               <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-xl font-semibold text-white">발동 플래그</h2>
+                <h2 className="text-xl font-semibold text-white">검출된 위험 신호</h2>
                 <span className="text-sm text-slate-400">
-                  {report ? `${report.triggered_flags.length}개` : "0개"}
+                  {report ? `${(report.detected_signals ?? []).length}개` : "0개"}
                 </span>
               </div>
 
               <div className="space-y-3">
-                {report?.triggered_flags.length ? (
-                  report.triggered_flags.map((flag, flagIndex) => (
-                    <article
-                      className="rounded-2xl border border-white/10 bg-slate-950/40 p-4"
-                      key={`${flag.flag}-${flagIndex}`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
+                {(report?.detected_signals ?? []).length ? (
+                  (report?.detected_signals ?? []).map((signal, signalIndex) => {
+                    const detSrc = signal.detection_source ?? "rule";
+                    const sourceTag =
+                      detSrc === "llm" ? "🤖 LLM"
+                      : detSrc === "safety" ? "🛡 VirusTotal"
+                      : detSrc === "sandbox" ? "📦 샌드박스"
+                      : detSrc === "static_lv1" ? "🔍 정적 Lv1"
+                      : detSrc === "static_lv2" ? "🔬 정적 Lv2"
+                      : detSrc === "dynamic_lv3" ? "🧪 동적 Lv3"
+                      : "📋 규칙";
+                    return (
+                      <article
+                        className="rounded-2xl border border-white/10 bg-slate-950/40 p-4"
+                        key={`${signal.flag}-${signalIndex}`}
+                      >
+                        <div className="flex flex-wrap items-baseline justify-between gap-2">
                           <div className="text-sm font-semibold text-white">
-                            {flag.flag}
+                            {signal.label_ko ?? signal.flag}
                           </div>
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-[10px] ${sourceBadgeClass(flag.source)}`}
-                          >
-                            {flag.source === "llm" ? "LLM" : "기본"}
+                          <span className="rounded-full bg-slate-700/60 px-2 py-0.5 text-[10px] text-slate-300">
+                            {sourceTag}
                           </span>
                         </div>
-                        <div className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-slate-200">
-                          {scoreDeltaLabel(flag.score_delta)}점
-                        </div>
-                      </div>
-                      <p className="mt-2 text-sm leading-6 text-slate-300">
-                        {flag.description}
-                      </p>
-                      {flag.evidence.length ? (
-                        <div className="mt-3 space-y-2">
-                          {flag.evidence.slice(0, 2).map((evidence, evidenceIndex) => (
-                            <div
-                              className="rounded-xl bg-white/5 px-3 py-2 text-xs leading-6 text-slate-400"
-                              key={`${flag.flag}-${evidenceIndex}-${evidence}`}
-                            >
-                              {evidence}
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </article>
-                  ))
+                        {signal.description ? (
+                          <p className="mt-1 text-xs text-slate-400">
+                            {signal.description}
+                          </p>
+                        ) : null}
+                        {signal.rationale ? (
+                          <div className="mt-3 rounded-xl bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">
+                            <div className="text-slate-200">📖 학술/법적 근거</div>
+                            <p className="mt-1">{signal.rationale}</p>
+                            {signal.source ? (
+                              <p className="mt-2 text-slate-500">출처: {signal.source}</p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {(signal.evidence ?? []).length ? (
+                          <div className="mt-2 space-y-1">
+                            {(signal.evidence ?? []).slice(0, 2).map((ev, eIdx) => (
+                              <div
+                                className="rounded-xl bg-white/5 px-3 py-1.5 text-[11px] leading-5 text-slate-400"
+                                key={`${signal.flag}-ev-${eIdx}`}
+                              >
+                                {ev}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })
                 ) : (
                   <div className="rounded-2xl border border-dashed border-white/10 bg-slate-950/20 px-4 py-8 text-sm text-slate-400">
-                    발동된 플래그가 없으면 이 영역이 비어 있습니다.
+                    검출된 위험 신호가 없습니다.
                   </div>
                 )}
               </div>
