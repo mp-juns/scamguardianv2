@@ -1,0 +1,5 @@
+{"id": "s1_prosecutor", "voice": "ko-KR-InJoonNeural", "scenario": "검찰사칭(권위)", "text": "안녕하십니까 서울중앙지방검찰청 김재호 검사입니다. 본인 명의로 대포통장 개설 사건이 접수되어 긴급 통화 드립니다."}
+{"id": "s2_bank", "voice": "ko-KR-SunHiNeural", "scenario": "금융사칭(친절)", "text": "안녕하세요 고객님 신한은행 보안팀입니다. 본인 명의로 의심 거래가 발생해서요 보안카드 일련번호 확인 부탁드릴게요."}
+{"id": "s3_meta_aware", "voice": "ko-KR-InJoonNeural", "scenario": "사용자 메타인식", "text": "잠깐만요 이거 사기 같은데요. 어느 부서에서 전화하셨다고 하셨죠?"}
+{"id": "s4_transfer_agree", "voice": "ko-KR-SunHiNeural", "scenario": "사용자 송금 동의", "text": "네 알겠어요. 그럼 지금 바로 안전계좌로 이체하면 되는 건가요?"}
+{"id": "s5_normal", "voice": "ko-KR-HyunsuMultilingualNeural", "scenario": "일반 대화 대조군", "text": "오늘 점심은 회사 근처 칼국수집에서 먹기로 했어요. 두 시쯤 회의 끝나고 바로 갈게요."}

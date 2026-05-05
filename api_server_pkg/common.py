@@ -1,0 +1,155 @@
+"""파이프라인 실행 공통 헬퍼.
+
+`_persist_run` / `_run_pipeline` 은 카카오·analyze 둘 다 호출.
+`_options_payload` 는 admin runs/scam-types 응답에 사용.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from db import repository
+from pipeline import rag
+from pipeline.config import SCORING_RULES, get_runtime_scam_taxonomy
+from pipeline.runner import ScamGuardianPipeline
+
+from .models import AnalyzeRequest, ScamTypeCatalogRequest
+
+
+def resolve_source(payload: AnalyzeRequest) -> str:
+    return (payload.text or payload.source or "").strip()
+
+
+def options_payload() -> dict[str, Any]:
+    taxonomy = get_runtime_scam_taxonomy()
+    return {
+        "scam_types": taxonomy["scam_types"],
+        "label_sets": taxonomy["label_sets"],
+        "flags": list(SCORING_RULES.keys()),
+    }
+
+
+def normalize_catalog_payload(payload: ScamTypeCatalogRequest) -> dict[str, Any]:
+    normalized_labels: list[str] = []
+    seen: set[str] = set()
+    for raw_label in payload.labels:
+        label = raw_label.strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        normalized_labels.append(label)
+
+    return {
+        "name": payload.name.strip(),
+        "description": (payload.description or "").strip(),
+        "labels": normalized_labels,
+    }
+
+
+def require_db() -> None:
+    if not repository.database_configured():
+        raise EnvironmentError(
+            "DB 기능을 사용하려면 SCAMGUARDIAN_DATABASE_URL(Postgres) 또는 "
+            "SCAMGUARDIAN_SQLITE_PATH(SQLite)가 설정되어야 합니다."
+        )
+
+
+def persist_run(
+    pipeline: ScamGuardianPipeline,
+    payload: AnalyzeRequest,
+    source: str,
+    report_dict: dict[str, Any],
+    *,
+    user_context: dict[str, Any] | None = None,
+) -> str | None:
+    if not repository.persistence_enabled():
+        return None
+
+    transcript_text = (
+        pipeline.last_transcript_result.text if pipeline.last_transcript_result is not None else source
+    )
+    metadata = {
+        "source_type": (
+            pipeline.last_transcript_result.source_type
+            if pipeline.last_transcript_result is not None
+            else "text"
+        ),
+        "steps": [
+            {
+                "name": step.name,
+                "duration_ms": step.duration_ms,
+                "detail": step.detail,
+            }
+            for step in pipeline.steps
+        ],
+        "rag_context": report_dict.get("rag_context"),
+    }
+    if user_context:
+        metadata["user_context"] = user_context
+
+    run_id = repository.save_analysis_run(
+        input_source=source,
+        whisper_model=payload.whisper_model,
+        skip_verification=payload.skip_verification,
+        use_llm=payload.use_llm,
+        use_rag=payload.use_rag,
+        transcript_text=transcript_text,
+        classification_scanner={
+            "scam_type": report_dict.get("scam_type", ""),
+            "confidence": report_dict.get("classification_confidence", 0.0),
+            "is_uncertain": report_dict.get("is_uncertain", False),
+        },
+        entities_predicted=report_dict.get("entities", []),
+        verification_results=pipeline.last_report.all_verifications if pipeline.last_report else [],
+        triggered_flags_predicted=report_dict.get("triggered_flags", []),
+        total_score_predicted=report_dict.get("total_score", 0),
+        risk_level_predicted=report_dict.get("risk_level", ""),
+        llm_assessment=report_dict.get("llm_assessment"),
+        metadata=metadata,
+    )
+
+    try:
+        embedding = rag.compute_transcript_embedding(transcript_text)
+        repository.save_transcript_embedding(run_id, embedding, rag.embedding_model_name())
+    except Exception:
+        # 분석 결과 저장은 유지하고, 임베딩 저장 실패만 조용히 건너뛴다.
+        pass
+
+    return run_id
+
+
+def run_pipeline(payload: AnalyzeRequest) -> dict:
+    normalized_payload = AnalyzeRequest(
+        source=payload.source,
+        text=payload.text,
+        whisper_model=payload.whisper_model,
+        skip_verification=payload.skip_verification,
+        use_llm=True,
+        use_rag=payload.use_rag,
+    )
+    source = resolve_source(normalized_payload)
+    if not source:
+        raise ValueError("분석할 텍스트 또는 URL을 입력해주세요.")
+
+    pipeline = ScamGuardianPipeline(whisper_model=normalized_payload.whisper_model)
+    report = pipeline.analyze(
+        source,
+        skip_verification=normalized_payload.skip_verification,
+        use_llm=True,
+        use_rag=normalized_payload.use_rag,
+    )
+    transcript_text = pipeline.last_transcript_result.text if pipeline.last_transcript_result else ""
+    from platform_layer.abuse_guard import MAX_CHARS as _MAX_CHARS
+    if transcript_text and len(transcript_text) > _MAX_CHARS:
+        logging.getLogger("abuse_guard").warning(
+            "transcript %d자 cap 초과(>%d)", len(transcript_text), _MAX_CHARS,
+        )
+    report_dict = report.to_dict()
+    report_dict["transcript_text"] = (
+        pipeline.last_transcript_result.text if pipeline.last_transcript_result is not None else ""
+    )
+    run_id = persist_run(pipeline, normalized_payload, source, report_dict)
+    if run_id:
+        report_dict["analysis_run_id"] = run_id
+    return report_dict
