@@ -262,6 +262,12 @@ export default function Home() {
             >
               라벨링 어드민
             </Link>
+            <Link
+              className="rounded-full border border-fuchsia-400/40 px-3 py-1 text-xs text-fuchsia-200 transition hover:bg-fuchsia-500/10"
+              href="/evidence"
+            >
+              📚 EVIDENCE — 학술·법적 근거
+            </Link>
           </div>
 
           <div className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr]">
