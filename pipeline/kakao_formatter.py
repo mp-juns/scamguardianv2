@@ -1,7 +1,9 @@
 """
-ScamGuardian v2 — 카카오 오픈빌더 응답 포맷터
+ScamGuardian — 카카오 오픈빌더 응답 포맷터
 
-ScamReport.to_dict() 결과를 카카오 챗봇 응답 JSON으로 변환한다.
+DetectionReport.to_dict() 결과를 카카오 챗봇 응답 JSON 으로 변환.
+Identity (CLAUDE.md): 점수·등급 표시 안 함 — 검출 신호 list + 학술/법적 근거만.
+
 입력 유형(텍스트/URL/영상)에 따라 다른 카드 레이아웃을 제공하고,
 에러 상황별로 구체적인 안내 메시지를 출력한다.
 https://i.kakao.com/docs/skill-response-format
@@ -89,14 +91,24 @@ _ERROR_MESSAGES: dict[ErrorCode, str] = {
 
 
 # ──────────────────────────────────
-# 위험도별 이모지/텍스트 표현
+# 검출 신호 개수별 아이콘 (점수·등급 X — Identity Boundary)
+# 단순히 "신호 있음/없음" 만 시각화. 판정은 통합 기업 몫.
 # ──────────────────────────────────
-_RISK_ICON: dict[str, str] = {
-    "매우 위험": "🚨",
-    "위험": "⚠️",
-    "주의": "🔶",
-    "안전": "✅",
-}
+
+
+def _detection_icon(signal_count: int) -> str:
+    """검출 신호 개수에 따른 표시 아이콘. 점수·등급 매기기 X."""
+    if signal_count <= 0:
+        return "✅"
+    if signal_count <= 2:
+        return "⚠️"
+    return "🚨"
+
+
+_DISCLAIMER_TEXT = (
+    "ⓘ ScamGuardian 은 사기 판정을 내리지 않습니다. "
+    "위 검출 신호와 근거를 참고하여 신중히 판단해주세요."
+)
 
 _QUICK_REPLY_HELP = {
     "label": "사용법",
@@ -136,10 +148,6 @@ def quick_replies(phase: str = "default") -> list[dict[str, str]]:
     return [_QUICK_REPLY_HELP, _QUICK_REPLY_RESET]
 
 
-def _risk_icon(level: str) -> str:
-    return _RISK_ICON.get(level, "❓")
-
-
 def _entity_lines(entities: list[dict[str, Any]], max_count: int = 6) -> str:
     if not entities:
         return "없음"
@@ -151,18 +159,24 @@ def _entity_lines(entities: list[dict[str, Any]], max_count: int = 6) -> str:
     return "\n".join(lines)
 
 
-def _flag_lines(flags: list[dict[str, Any]], max_count: int = 4) -> str:
-    if not flags:
-        return "없음"
+def _signal_lines(signals: list[dict[str, Any]], max_count: int = 4) -> str:
+    """검출 신호를 한국어 라벨 + (요약된) 학술/법적 근거로 표시. 점수 표기 없음."""
+    if not signals:
+        return "검출된 위험 신호 없음"
     lines = []
-    for f in flags[:max_count]:
-        delta = f.get("score_delta", 0)
-        sign = "+" if delta >= 0 else ""
-        flag_key = f.get("flag", "")
-        label = flag_label_ko(flag_key) if flag_key else "(이름 없음)"
-        lines.append(f"• {label} ({sign}{delta}점)")
-    if len(flags) > max_count:
-        lines.append(f"… 외 {len(flags) - max_count}개")
+    for s in signals[:max_count]:
+        flag_key = s.get("flag", "")
+        label = s.get("label_ko") or (flag_label_ko(flag_key) if flag_key else "(이름 없음)")
+        rationale = (s.get("rationale") or "").strip()
+        # 카드 본문이 너무 길어지지 않도록 근거는 1문장 또는 80자까지만 노출
+        if rationale:
+            short = rationale.split(".", 1)[0].strip()
+            short = (short[:80] + "…") if len(short) > 80 else short
+            lines.append(f"• {label}\n   └ 근거: {short}")
+        else:
+            lines.append(f"• {label}")
+    if len(signals) > max_count:
+        lines.append(f"… 외 {len(signals) - max_count}개")
     return "\n".join(lines)
 
 
@@ -180,31 +194,33 @@ def _build_result_card(
     input_type: InputType = InputType.TEXT,
     result_url: str | None = None,
 ) -> dict[str, Any]:
-    level = report.get("risk_level", "알 수 없음")
-    score = report.get("total_score", 0)
+    """검출 결과 카드 — 점수·등급 X, 검출 신호 list 만 표시."""
     scam_type = report.get("scam_type", "미분류")
     confidence = report.get("classification_confidence", 0)
     entities = report.get("entities", [])
-    flags = report.get("triggered_flags", [])
-    description = report.get("risk_description", "")
+    signals = report.get("detected_signals", [])
+    signal_count = len(signals)
 
-    icon = _risk_icon(level)
+    icon = _detection_icon(signal_count)
     confidence_pct = f"{confidence * 100:.0f}%"
 
     # 입력 유형 표시
     type_labels = {
-        InputType.TEXT: "💬 텍스트 분석",
-        InputType.URL: "🔗 URL/영상 분석",
-        InputType.VIDEO: "🎬 업로드 영상 분석",
-        InputType.FILE: "📎 파일 분석",
-        InputType.IMAGE: "🖼 이미지 분석",
-        InputType.PDF: "📄 PDF 분석",
+        InputType.TEXT: "💬 텍스트 검출",
+        InputType.URL: "🔗 URL/영상 검출",
+        InputType.VIDEO: "🎬 업로드 영상 검출",
+        InputType.FILE: "📎 파일 검출",
+        InputType.IMAGE: "🖼 이미지 검출",
+        InputType.PDF: "📄 PDF 검출",
     }
-    type_label = type_labels.get(input_type, "분석")
+    type_label = type_labels.get(input_type, "검출")
 
-    title = f"{icon} {level}  |  {score}점"
+    if signal_count == 0:
+        title = f"{icon} 검출된 위험 신호 없음"
+    else:
+        title = f"{icon} 위험 신호 {signal_count}개 검출"
 
-    body_parts = [f"[분석 방식] {type_label}"]
+    body_parts = [f"[검출 방식] {type_label}"]
 
     # 입력 본문/전사 미리보기 — TEXT 도 포함하여 일관 표시
     transcript = report.get("transcript_text", "")
@@ -219,9 +235,8 @@ def _build_result_card(
         body_parts.append(f"[AI 요약]\n{_truncate(summary, 200)}")
 
     body_parts.extend([
-        f"[스캠 유형]\n{scam_type} (신뢰도 {confidence_pct})",
-        f"[위험 판정]\n{description}",
-        f"[발동 플래그]\n{_flag_lines(flags)}",
+        f"[추정 유형]\n{scam_type} (분류 신뢰도 {confidence_pct})",
+        f"[검출된 위험 신호 — {signal_count}개]\n{_signal_lines(signals)}",
         f"[추출 엔티티]\n{_entity_lines(entities)}",
     ])
 
@@ -310,15 +325,16 @@ def format_result(
     user_context: dict[str, Any] | None = None,
     result_url: str | None = None,
 ) -> dict[str, Any]:
-    """분석 결과를 카카오 응답 JSON으로 변환한다.
+    """검출 결과를 카카오 응답 JSON 으로 변환.
 
+    Identity (CLAUDE.md): 점수·등급 X, 검출 신호 list 만. 끝에 disclaimer 부착.
     result_url 이 주어지면 카드에 '자세한 결과 보기' webLink 버튼 + 안내 텍스트 추가.
     """
     outputs: list[dict[str, Any]] = []
 
     safety_block = _build_safety_warning_block(report)
     if safety_block:
-        # 위험 신호는 카드보다 먼저 — 사용자 눈에 가장 먼저 들어오도록
+        # VT 다중 엔진 합의 신호는 카드보다 먼저 — 사용자 눈에 가장 먼저 들어오도록
         outputs.append(safety_block)
 
     outputs.append(_build_result_card(report, input_type, result_url=result_url))
@@ -336,6 +352,9 @@ def format_result(
 
     if report.get("is_uncertain"):
         outputs.append(_build_uncertain_text())
+
+    # Identity Boundary disclaimer — 모든 결과 카드 마지막에
+    outputs.append({"simpleText": {"text": _DISCLAIMER_TEXT}})
 
     return {
         "version": "2.0",

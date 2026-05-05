@@ -84,12 +84,10 @@ def issue_result_token(
     url = f"{base}/result/{token}" if base else None
 
     logging.getLogger("token").info(
-        "result_token issued: token=%s run_id=%s risk_level=%s total_score=%s flags=%d",
+        "result_token issued: token=%s run_id=%s detected_signals=%d",
         token[:8],
         (result or {}).get("analysis_run_id"),
-        (result or {}).get("risk_level"),
-        (result or {}).get("total_score"),
-        len((result or {}).get("triggered_flags") or []),
+        len((result or {}).get("detected_signals") or []),
     )
 
     run_id = (result or {}).get("analysis_run_id")
@@ -114,7 +112,35 @@ def issue_result_token(
     return token, url
 
 
-@router.get("/api/result/{token}")
+@router.get(
+    "/api/result/{token}",
+    tags=["Public"],
+    summary="결과 토큰으로 분석 결과 조회",
+    description=(
+        "카카오 챗봇 응답 카드의 '자세히 보기' 링크가 호출하는 엔드포인트. "
+        "결과 발급 시점에 1시간 유효 토큰을 발급(`secrets.token_urlsafe(16)`)하고 "
+        "메모리에 저장한다. 인메모리 저장이라 서버 재시작 시 토큰은 모두 만료.\n\n"
+        "**응답**:\n"
+        "- `result` — `DetectionReport.to_dict()` 전체 (`/api/analyze` 와 동일 schema)\n"
+        "- `user_context` — 사용자가 챗봇과 나눈 Q&A 요약 (있을 때)\n"
+        "- `input_type` — `TEXT|URL|VIDEO|FILE|IMAGE|PDF`\n"
+        "- `chat_history` — 봇/사용자 대화 시간순 전체\n"
+        "- `flag_rationale` — 검출된 신호별 `{rationale, source}` 매핑\n"
+        "- `expires_at` — 토큰 만료 시각 (epoch sec)\n\n"
+        "**인증**: 선택. 토큰 자체가 인증 역할 (URL 알면 누구나 조회).\n\n"
+        "**에러**:\n"
+        "- `404` — 토큰이 존재한 적 없음 또는 서버 재시작\n"
+        "- `410` — 토큰 만료 (1시간 경과)\n\n"
+        "**curl**:\n"
+        "```bash\n"
+        "curl https://api.example.com/api/result/abcd1234efgh5678\n"
+        "```"
+    ),
+    responses={
+        404: {"description": "토큰 없음"},
+        410: {"description": "토큰 만료 — 결과 재요청 필요"},
+    },
+)
 async def get_result_by_token(token: str) -> dict[str, Any]:
     """카카오 카드의 '자세히 보기' 링크 백엔드 — 토큰으로 분석 결과 반환.
 
@@ -128,9 +154,10 @@ async def get_result_by_token(token: str) -> dict[str, Any]:
         state.result_tokens.pop(token, None)
         raise HTTPException(status_code=410, detail="결과 링크가 만료됐어요 (1시간 후 만료).")
     from pipeline.config import flag_rationale
+    # 검출된 신호의 학술/법적 근거 dictionary — 결과 페이지에서 "이 신호는 왜 위험?" 답변용
     flag_info: dict[str, dict[str, str]] = {}
-    for f in (entry["result"].get("triggered_flags") or []):
-        key = (f.get("flag") or "").strip()
+    for s in (entry["result"].get("detected_signals") or []):
+        key = (s.get("flag") or "").strip()
         if key and key not in flag_info:
             info = flag_rationale(key)
             if info:

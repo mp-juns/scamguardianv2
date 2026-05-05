@@ -25,8 +25,25 @@ from .models import ClaimRunRequest, HumanAnnotationRequest, ScamTypeCatalogRequ
 
 router = APIRouter()
 
+# 모든 admin 엔드포인트 공통: SCAMGUARDIAN_ADMIN_TOKEN 필요 (PlatformMiddleware 가 게이팅).
+# 인증 헤더: `X-Admin-Token: <token>` 또는 `Authorization: Bearer admin-<token>`.
+_ADMIN_RESPONSES: dict[int | str, dict] = {
+    401: {"description": "어드민 토큰 누락 또는 무효"},
+    400: {"description": "DB 미설정 (SCAMGUARDIAN_DATABASE_URL 또는 SQLITE_PATH)"},
+    500: {"description": "서버 내부 오류"},
+}
 
-@router.get("/api/admin/runs")
+
+@router.get(
+    "/api/admin/runs",
+    tags=["Admin — Labeling"],
+    summary="라벨링 큐 목록",
+    description=(
+        "라벨링 대기/진행/완료 큐 목록. `claimed_by` 로 누가 작업 중인지 표시.\n\n"
+        "**Query**: `status` (in_progress|done|None), `limit` (기본 50), `offset`."
+    ),
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_list_runs(
     status: str | None = None,
     limit: int = 50,
@@ -47,7 +64,18 @@ async def admin_list_runs(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/api/admin/runs/{run_id}/claim")
+@router.post(
+    "/api/admin/runs/{run_id}/claim",
+    tags=["Admin — Labeling"],
+    summary="run 검수 claim",
+    description=(
+        "검수자 이름으로 run 을 점유한다. `claimed_by` / `claimed_at` 컬럼 갱신. "
+        "TTL 30분 — 다른 검수자가 해당 시간 안에 다시 claim 할 수 없다.\n\n"
+        "**Body**: `{labeler: str}` — 빈 문자열이면 `\"Admin\"` 으로 저장.\n\n"
+        "**409**: 다른 검수자가 이미 점유 중."
+    ),
+    responses={**_ADMIN_RESPONSES, 409: {"description": "다른 검수자가 점유 중"}},
+)
 async def admin_claim_run(run_id: str, payload: ClaimRunRequest) -> dict[str, Any]:
     try:
         require_db()
@@ -62,7 +90,16 @@ async def admin_claim_run(run_id: str, payload: ClaimRunRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/runs/search")
+@router.get(
+    "/api/admin/runs/search",
+    tags=["Admin — Labeling"],
+    summary="run 검색 (필터 다중)",
+    description=(
+        "transcript / scam_type / risk_level / 라벨 여부로 필터링. "
+        "`labeled=true` 면 사람 라벨 있는 것만, `false` 면 미라벨만."
+    ),
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_search_runs(
     q: str | None = None,
     scam_type: str | None = None,
@@ -94,7 +131,13 @@ async def admin_search_runs(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/runs/next")
+@router.get(
+    "/api/admin/runs/next",
+    tags=["Admin — Labeling"],
+    summary="다음 미라벨 run 자동 할당",
+    description="아직 사람 annotation 이 없는 가장 오래된 run 1개. `options` 필드는 분류 라벨/플래그 카탈로그.",
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_next_run() -> dict[str, Any]:
     try:
         require_db()
@@ -106,7 +149,16 @@ async def admin_next_run() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/runs/{run_id}")
+@router.get(
+    "/api/admin/runs/{run_id}",
+    tags=["Admin — Labeling"],
+    summary="run 상세 (라벨링 에디터용)",
+    description=(
+        "분석 run + 사람 annotation + 사용자 챗봇 컨텍스트 전체. "
+        "`metadata.user_context.qa_pairs` (사용자 Q&A) + `metadata.chat_history` (전체 대화) 노출."
+    ),
+    responses={**_ADMIN_RESPONSES, 404: {"description": "run not found"}},
+)
 async def admin_run_detail(run_id: str) -> dict[str, Any]:
     try:
         require_db()
@@ -123,7 +175,17 @@ async def admin_run_detail(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/api/admin/runs/{run_id}/annotations")
+@router.post(
+    "/api/admin/runs/{run_id}/annotations",
+    tags=["Admin — Labeling"],
+    summary="정답 라벨 저장 (upsert)",
+    description=(
+        "검수자의 정답 라벨을 저장. 기존 annotation 있으면 덮어쓰기.\n\n"
+        "**Body** (`HumanAnnotationRequest`): scam_type_gt, entities_gt, triggered_flags_gt, "
+        "transcript_corrected_text(선택), stt_quality(1~5), notes."
+    ),
+    responses={**_ADMIN_RESPONSES, 404: {"description": "run not found"}},
+)
 async def admin_save_annotation(run_id: str, payload: HumanAnnotationRequest) -> dict[str, Any]:
     try:
         require_db()
@@ -180,7 +242,20 @@ def _resolve_admin_media_path(stored_path_str: str) -> Path:
     return candidate
 
 
-@router.get("/api/admin/runs/{run_id}/media")
+@router.get(
+    "/api/admin/runs/{run_id}/media",
+    tags=["Admin — Labeling"],
+    summary="원본 업로드 파일 스트리밍",
+    description=(
+        "라벨링 도중 STT 정확도 검증용으로 원본 음성/영상/이미지 파일을 그대로 반환. "
+        "path traversal 방지 — `.scamguardian/uploads/` 안 파일만 허용."
+    ),
+    responses={
+        **_ADMIN_RESPONSES,
+        400: {"description": "허용되지 않은 경로 (path traversal)"},
+        404: {"description": "media 파일 없음"},
+    },
+)
 async def admin_get_media(run_id: str) -> FileResponse:
     """라벨링용으로 보존된 원본 업로드 파일을 스트리밍한다."""
     try:
@@ -205,7 +280,16 @@ async def admin_get_media(run_id: str) -> FileResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/metrics")
+@router.get(
+    "/api/admin/metrics",
+    tags=["Admin — Labeling"],
+    summary="라벨링 품질 메트릭",
+    description=(
+        "사람 annotation 과 모델 예측 비교 — classification accuracy, entity micro F1, "
+        "flag micro F1, per-labeler 통계, needs_review (재검토 권장 run 목록)."
+    ),
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_metrics(scam_type: str | None = None) -> dict[str, Any]:
     try:
         require_db()
@@ -219,7 +303,16 @@ async def admin_metrics(scam_type: str | None = None) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/api/admin/runs/{run_id}/ai-draft")
+@router.post(
+    "/api/admin/runs/{run_id}/ai-draft",
+    tags=["Admin — Labeling"],
+    summary="Claude 라벨링 초안 생성",
+    description=(
+        "Claude API 로 사람 라벨 *초안* 을 생성한다. 검수자는 초안 확인 후 수정/승인만. "
+        "응답 `draft` 는 `entities/triggered_flags` 에 `source: \"ai-draft\"` 태깅됨."
+    ),
+    responses={**_ADMIN_RESPONSES, 404: {"description": "run not found"}},
+)
 async def admin_ai_draft(run_id: str) -> dict[str, Any]:
     """Claude API로 라벨링 초안을 자동 생성. 검수자는 초안 확인 후 수정/승인만."""
     try:
@@ -252,7 +345,13 @@ async def admin_ai_draft(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/stats")
+@router.get(
+    "/api/admin/stats",
+    tags=["Admin — Labeling"],
+    summary="대시보드 통계",
+    description="총 run 수 / 라벨 진행률 / scam_type 분포 / risk_level 분포 등 대시보드 카운터.",
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_stats() -> dict[str, Any]:
     try:
         require_db()
@@ -264,7 +363,13 @@ async def admin_stats() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/api/admin/scam-types")
+@router.get(
+    "/api/admin/scam-types",
+    tags=["Admin — Labeling"],
+    summary="사용자 정의 스캠 유형 목록",
+    description="DEFAULT_SCAM_TYPES 12종 외 어드민이 추가한 커스텀 분류 카탈로그.",
+    responses=_ADMIN_RESPONSES,
+)
 async def admin_scam_types() -> dict[str, Any]:
     try:
         require_db()
@@ -276,7 +381,16 @@ async def admin_scam_types() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/api/admin/scam-types")
+@router.post(
+    "/api/admin/scam-types",
+    tags=["Admin — Labeling"],
+    summary="사용자 정의 스캠 유형 추가",
+    description=(
+        "런타임 분류 카탈로그에 새 scam_type 추가. 기본 12종과 같은 이름은 거절(400). "
+        "추가 즉시 `get_runtime_scam_taxonomy()` 에 반영되어 분류기·라벨링 UI 가 인식."
+    ),
+    responses={**_ADMIN_RESPONSES, 400: {"description": "이름 중복 또는 유효성 실패"}},
+)
 async def admin_add_scam_type(payload: ScamTypeCatalogRequest) -> dict[str, Any]:
     try:
         require_db()

@@ -69,6 +69,137 @@ ScamGuardian v3 — 한국어 음성·텍스트·이미지·PDF 사기 탐지 AI
 - **v3.5 신규**: Phase 0.5 — 격리 Chromium 으로 의심 URL 직접 navigate (zero-day 피싱 탐지). 운영은 별도 VM/VPS 분리 (`sandbox_server/`).
 - **v3.x 신규**: API key 시스템(3중 cap), 비용 추적 ledger, 어뷰즈 가드(짧은 메시지 누적 자동 블록), pytest 테스트.
 
+## Identity — Detection, not Judgment (Critical Boundary)
+
+ScamGuardian 의 정체성은 **사기 판정 시스템이 아니라 사기 신호 검출 reference implementation** 이다.
+모델은 VirusTotal 과 동일 — 70개 백신의 검출 결과를 *보고만* 하고 "이 파일은 사기다" 라고 *판정하지 않음*.
+판정 logic 은 통합한 기업(통신사·은행·메신저 앱)이 자기 risk tolerance 에 따라 구현.
+
+이전까지 노출하던 점수(15·20·50·80) 와 등급(안전/의심/위험/매우위험) 은 학부 단계에서
+자체 RCT 없이 정당화 불가능 — 따라서 외부 인터페이스에서는 **검출 사실만** 노출하고,
+점수·등급은 통합 기업의 use case 별 logic 영역으로 이관한다.
+
+### What ScamGuardian Does NOT Do
+- ❌ 사기/정상 **판정 (judgment)** — 안 함
+- ❌ **위험 점수** (15·20·50·80 같은 숫자) — 외부 응답 schema 에서 표면 노출 안 함
+- ❌ **위험 등급** (안전/의심/위험/매우위험) — 안 함
+- ❌ 사용자에게 "이거 사기다" 결론 — 안 함
+
+### What ScamGuardian Does
+- ✅ **위험 신호 검출 (detection)** — 함
+- ✅ 각 신호의 **학술/법적 근거** transparent 제공 (`FLAG_RATIONALE` 27종 유지)
+- ✅ 검출 사실만 응답 schema 로 반환 (`detected_signals[]` 형태)
+- ✅ 통합 기업이 자기 use case 에 따라 **판정 logic 직접 구현**
+
+### 카테고리 이름 (Signal Detection API)
+
+지금까지 "사기 검증 API / Verification API" 로 부르던 외부 통합 카테고리는 이제 **"Signal Detection API / 사기 신호 검출 API"** 다.
+
+> 발표 한 줄: **"VirusTotal 이 검출 결과 보고만 하듯, ScamGuardian 은 사기 신호 검출 보고만 합니다 — 판정은 통합 기업이."**
+
+## Forbidden Actions (Identity Boundary)
+
+분석 결과·UI·문서·API 응답 어디서든:
+
+- ❌ **"위험 점수 X점"** 같은 숫자 표현 금지 (현재 행동으로) — 응답 본문, 카드, 챗봇 메시지 모두
+- ❌ **"안전 / 의심 / 위험 / 매우위험"** 같은 등급 매기기 금지 (현재 행동으로)
+- ❌ **"이 콘텐츠는 사기입니다"** 단정 금지 — "검출되었습니다" / "징후가 있습니다" 표현만
+- ✅ **"위험 신호 N개 검출되었습니다, 자세한 근거는 `detected_signals` 참고"** 형식만 사용
+
+> 코드·DB 내부 (예: `pipeline/scorer.py` 의 `total_score`, `pipeline/config.py` 의 `RISK_LEVELS`)
+> 는 *historical* 값으로 일단 보존 — 다음 stage 에서 응답 표면을 deprecate 한다.
+> 새 외부 인터페이스에는 점수·등급 노출 X.
+
+## APK Detection Architecture (3-tier)
+
+한국 보이스피싱 attack chain 의 핵심은 *사이드로딩으로 설치되는 악성 APK* —
+SMS 미끼 → URL 클릭 → APK 다운로드 → 권한 부여 → 통화 가로채기 → 금전 갈취.
+ScamGuardian 이 닿는 자리는 1·2·3 단계 (검출만, 차단 안 함 — 차단은 통합 기업의 책임).
+
+VirusTotal 시그니처 lookup 단독으로는 zero-day APK / polymorphic 변형을 못 잡는다.
+그래서 다음 3 layer 로 보완:
+
+### Tier 1 — VirusTotal 시그니처 매칭 (이미 있음)
+- 70+ 백신 엔진 합의 (다중 출처 검증)
+- 알려진 멀웨어 SHA256 hash lookup
+- **한계**: zero-day, polymorphic, 신규 패밀리 변형 미탐지
+
+### Tier 2 — 정적 분석 Lv 1 (`pipeline/apk_analyzer.analyze_apk_static`)
+- `androguard` 기반 manifest 분석 — `androguard.core.apk.APK`
+- **권한 조합** 검사 — `SEND_SMS` + `READ_SMS` + `BIND_ACCESSIBILITY_SERVICE` 등 4 종 이상 → `apk_dangerous_permissions_combo`
+- **서명 검증** — subject == issuer 휴리스틱 → `apk_self_signed`
+- **패키지명 위장** — 정상 한국 앱 (`com.kakao.talk`, `com.nhn.android.search`, `kr.co.shinhan` 등) typo-squatting → `apk_suspicious_package_name`
+
+### Tier 3 — 심화 정적 분석 Lv 2 (`pipeline/apk_analyzer.analyze_apk_bytecode`)
+- `androguard.misc.AnalyzeAPK` — dex disassemble + xref 분석 (코드 *읽기만*, 실행 X)
+- **의심 API xref**: `SmsManager.sendTextMessage` → `apk_sms_auto_send_code`, `TelephonyManager.listen` → `apk_call_state_listener`, `AccessibilityService` 상속 → `apk_accessibility_abuse`, `DevicePolicyManager.lockNow` → `apk_device_admin_lock`
+- **Hard-coded C&C URL** — IP 직접 / 무료 도메인 (.tk/.ml/.ga/.cf/.gq) / 비표준 포트 → `apk_hardcoded_c2_url`
+- **사칭 키워드 string** — dex string pool 의 검찰·금감원·은행·안전계좌 등 → `apk_impersonation_keywords`
+- **난독화 흔적** — 1-2 글자 클래스명 비율 > 30% + 클래스 50개 이상 → `apk_string_obfuscation`
+
+> ⚠️ **단일 신호로 사기 판정 X** — bytecode 패턴은 false positive 있음 (정상 메신저 앱도 SmsManager 사용 / 정상 앱도 Accessibility 사용 / 뉴스 앱도 일부 키워드). *누적 + 조합* 시점에서만 강한 신호 — 판정은 통합 기업의 자체 logic.
+
+### 알려진 한국 보이스피싱 패밀리 (Tier 2/3 의 reference)
+
+| 패밀리 | 특징 | 출처 |
+|--------|------|------|
+| **SecretCalls / SecretCrow** | 보이스피싱 탐지 앱·보안 서비스로 위장 | S2W TALON 보고서 |
+| **KrBanker** | 한국 은행 앱 (KB·신한·우리·NH 등) UI 사칭 | KISA 분석 보고서 |
+| **MoqHao** | 택배 SMS 위장 (CJ대한통운·한진 등) | KISA·McAfee 합동 추적 |
+
+공통 기술 패턴 (Tier 2/3 신호 design):
+- `SmsManager` 자동 SMS 발송 — 인증번호·OTP 가로채기
+- `TelephonyManager` 통화 상태 감시 — 경찰·금감원 전화 감지
+- `BIND_ACCESSIBILITY_SERVICE` — 다른 앱 화면 가로채기 / 자동 입력
+- `SYSTEM_ALERT_WINDOW` — 가짜 은행 앱 오버레이
+- Hard-coded C&C 서버 URL (보통 동남아 / 중국 ASN)
+- string constants 에 사칭 키워드 ("검찰청", "금융감독원", "보안승급" 등)
+
+### Tier 4 — 동적 분석 Lv 3 (`pipeline/apk_analyzer.analyze_apk_dynamic`, **인터페이스만**)
+
+별도 VM 안 Android 에뮬레이터 stack 에서 APK 를 *실제 실행* 후 behavior 모니터링.
+**현재는 인터페이스 + flag 카탈로그만 박힘** — remote VM 측 서버는 future work
+(v3.5 sandbox VM 패턴과 동일하게 별도 호스트 분리).
+
+**5 종 candidate flag** (status=COMPLETED 일 때만 검출 신호화):
+- `apk_runtime_c2_network_call` — 에뮬레이터 outbound 가 알려진 C&C 도메인·IP 호출
+- `apk_runtime_sms_intercepted` — 가상 SMS 수신 시 자동 가로채기·재전송 동작
+- `apk_runtime_overlay_attack` — 정상 은행 앱 위에 가짜 화면 띄우는 동작
+- `apk_runtime_credential_exfiltration` — 자격증명·민감정보 외부 송신 (Frida hook)
+- `apk_runtime_persistence_install` — 재부팅 시 자동 시작 / DeviceAdmin enable
+
+**환경변수 (모두 옵션, 기본 비활성)**:
+- `APK_DYNAMIC_ENABLED` — `0` (기본) / `1`. 기본 비활성 — 호스트 안전.
+- `APK_DYNAMIC_BACKEND` — `auto` / `local` / `remote`. auto 면 REMOTE_URL+TOKEN 둘 다 있을 때만 remote.
+- `APK_DYNAMIC_REMOTE_URL` / `APK_DYNAMIC_REMOTE_TOKEN` — 별도 VM 주소·인증 토큰
+- `APK_DYNAMIC_TIMEOUT` — emulator run timeout (초, 기본 180)
+
+**HARD BLOCK 정책**: `backend=local` 은 어떤 경우에도 활성화하지 않는다 — 호스트에서
+APK 실행하면 멀웨어 감염 위험. 활성 시 즉시 `status=BLOCKED_LOCAL` 반환. v3.5
+sandbox.py 의 격리 정책과 동일.
+
+> ⚠️ 동적 분석은 정적보다 false positive 적지만 (실제 행동 관찰), Identity Boundary
+> 일관 — 단일 신호로 사기 판정 X. 검출 보고만, 판정은 통합 기업.
+
+### 미구현 / future work
+
+- **Lv 3 remote VM 측 서버** — Android 에뮬레이터 + Frida hook + MobSF 통합 stack.
+  v3.5 sandbox_server/ 와 동일하게 별도 VM/VPS 에 배포. 5-7 주 작업 분량.
+- **Lv 4-5: 멀티-스테이지 / 행위 클러스터링** — 한 번의 실행이 아닌 복수 시나리오
+  (가짜 SMS 수신 / 가상 은행 앱 설치 / 가상 콜백 등) 에서의 일관된 행동 클러스터링.
+  학부 단계 가능 범위 밖 — *호스트 위험 상승* 가능성 + 별도 인프라 필요.
+
+### 검출률에 대한 정직한 표현
+
+학술 문헌 기준 정적 분석 검출률은 **60-80%** (Arzt et al. 2014 FlowDroid, Allix et al.
+2016 AndroZoo, Wei et al. 2018 DeepGini 등 측정값 범위). 정교하게 난독화·packing·
+reflection 다 쓴 APK 는 정적 분석 영역 밖이며, 그건 진짜 동적 분석 (future work) 자리.
+
+ScamGuardian 의 차별화는 **"100% 잡는다"** 가 아니라 **"VirusTotal·시티즌코난 등
+시그니처 솔루션이 zero-day 에 약한 부분을 bytecode 패턴 분석으로 보완하는 reference
+architecture"**. 검출된 신호는 학술/법적 근거와 함께 transparent 하게 보고하고,
+판정은 통합 기업이 자기 risk tolerance 에 따라 한다 (Identity Boundary).
+
 ## 개발 실행 명령
 
 ### Python 백엔드

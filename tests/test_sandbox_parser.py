@@ -105,9 +105,9 @@ def test_sensitive_field_detector():
     assert "OTP" in sensitive
 
 
-def test_scorer_password_form_adds_50():
-    """샌드박스가 비밀번호폼 발견 → +50점 가산 + sandbox_password_form_detected 플래그."""
-    from pipeline import scorer
+def test_signal_detector_password_form_signal():
+    """샌드박스가 비밀번호폼 발견 → sandbox_password_form_detected 신호 검출 (점수 X)."""
+    from pipeline import signal_detector
     from pipeline.classifier import ClassificationResult
     from pipeline.sandbox import SandboxResult, SandboxStatus
 
@@ -119,7 +119,7 @@ def test_scorer_password_form_adds_50():
         sensitive_form_fields=["password"],
     )
     cls = ClassificationResult(scam_type="피싱", confidence=0.7, all_scores={}, is_uncertain=False)
-    report = scorer.score(
+    report = signal_detector.detect(
         verification_results=[],
         classification=cls,
         entities=[],
@@ -127,16 +127,18 @@ def test_scorer_password_form_adds_50():
         transcript="",
         sandbox_result=sb,
     )
-    flag_names = [f.flag for f in report.triggered_flags]
+    flag_names = [s.flag for s in report.detected_signals]
     assert "sandbox_password_form_detected" in flag_names
-    pwd_flag = next(f for f in report.triggered_flags if f.flag == "sandbox_password_form_detected")
-    assert pwd_flag.score_delta == 50
-    assert pwd_flag.source == "sandbox"
-    assert report.total_score >= 50
+    pwd_signal = next(s for s in report.detected_signals if s.flag == "sandbox_password_form_detected")
+    assert pwd_signal.detection_source == "sandbox"
+    assert pwd_signal.rationale, "must carry rationale (학술 근거)"
+    assert pwd_signal.source, "must carry source (출처 기관)"
+    # ✅ 점수 필드 자체가 응답 schema 에 없음을 확인 — Identity Boundary
+    assert not hasattr(pwd_signal, "score_delta")
 
 
-def test_scorer_drive_by_download_adds_60():
-    from pipeline import scorer
+def test_signal_detector_drive_by_download_signal():
+    from pipeline import signal_detector
     from pipeline.classifier import ClassificationResult
     from pipeline.sandbox import SandboxResult, SandboxStatus
 
@@ -146,18 +148,18 @@ def test_scorer_drive_by_download_adds_60():
         download_attempts=[{"suggested_filename": "court.apk", "url": "https://evil.example/file.apk"}],
     )
     cls = ClassificationResult(scam_type="피싱", confidence=0.5, all_scores={}, is_uncertain=False)
-    report = scorer.score(
+    report = signal_detector.detect(
         verification_results=[], classification=cls, entities=[],
         source="https://evil.example/file.apk", transcript="",
         sandbox_result=sb,
     )
-    flag_names = [f.flag for f in report.triggered_flags]
+    flag_names = [s.flag for s in report.detected_signals]
     assert "sandbox_auto_download_attempt" in flag_names
 
 
-def test_scorer_skips_when_sandbox_status_not_completed():
-    """status=error 면 어떤 플래그도 가산되면 안 됨."""
-    from pipeline import scorer
+def test_signal_detector_skips_when_sandbox_status_not_completed():
+    """status=error 면 어떤 신호도 검출되면 안 됨."""
+    from pipeline import signal_detector
     from pipeline.classifier import ClassificationResult
     from pipeline.sandbox import SandboxResult, SandboxStatus
 
@@ -168,13 +170,13 @@ def test_scorer_skips_when_sandbox_status_not_completed():
         download_attempts=[{"suggested_filename": "x.apk"}],
     )
     cls = ClassificationResult(scam_type="기타", confidence=0.3, all_scores={}, is_uncertain=False)
-    report = scorer.score(
+    report = signal_detector.detect(
         verification_results=[], classification=cls, entities=[],
         source="https://x.example", transcript="",
         sandbox_result=sb,
     )
-    sandbox_flags = [f for f in report.triggered_flags if f.source == "sandbox"]
-    assert sandbox_flags == []
+    sandbox_signals = [s for s in report.detected_signals if s.detection_source == "sandbox"]
+    assert sandbox_signals == []
 
 
 def test_backend_resolves_to_local_when_no_remote_env(monkeypatch):
@@ -245,8 +247,8 @@ def test_invalid_url_returns_error_without_calling_backend(monkeypatch):
 
 
 def test_sandbox_result_in_report_dict():
-    """ScamReport.to_dict() 에 sandbox_check 필드 포함."""
-    from pipeline import scorer
+    """DetectionReport.to_dict() 에 sandbox_check 필드 포함."""
+    from pipeline import signal_detector
     from pipeline.classifier import ClassificationResult
     from pipeline.sandbox import SandboxResult, SandboxStatus
 
@@ -257,7 +259,7 @@ def test_sandbox_result_in_report_dict():
         title="Test",
     )
     cls = ClassificationResult(scam_type="기타", confidence=0.5, all_scores={}, is_uncertain=False)
-    report = scorer.score(
+    report = signal_detector.detect(
         verification_results=[], classification=cls, entities=[],
         source="https://x.example", transcript="",
         sandbox_result=sb,
@@ -266,3 +268,9 @@ def test_sandbox_result_in_report_dict():
     assert "sandbox_check" in d
     assert d["sandbox_check"]["target_url"] == "https://x.example"
     assert d["sandbox_check"]["status"] == "completed"
+    # Identity Boundary — 응답 schema 에서 점수·등급 필드 절대 없음
+    assert "total_score" not in d
+    assert "risk_level" not in d
+    assert "is_scam" not in d
+    assert "agent_verdict" not in d
+    assert "detected_signals" in d

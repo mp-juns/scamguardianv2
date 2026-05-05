@@ -11,7 +11,7 @@ from typing import Any
 
 from db import repository
 from pipeline import rag
-from pipeline.config import SCORING_RULES, get_runtime_scam_taxonomy
+from pipeline.config import DETECTED_FLAGS, get_runtime_scam_taxonomy
 from pipeline.runner import ScamGuardianPipeline
 
 from .models import AnalyzeRequest, ScamTypeCatalogRequest
@@ -26,7 +26,7 @@ def options_payload() -> dict[str, Any]:
     return {
         "scam_types": taxonomy["scam_types"],
         "label_sets": taxonomy["label_sets"],
-        "flags": list(SCORING_RULES.keys()),
+        "flags": list(DETECTED_FLAGS),
     }
 
 
@@ -102,9 +102,11 @@ def persist_run(
         },
         entities_predicted=report_dict.get("entities", []),
         verification_results=pipeline.last_report.all_verifications if pipeline.last_report else [],
-        triggered_flags_predicted=report_dict.get("triggered_flags", []),
-        total_score_predicted=report_dict.get("total_score", 0),
-        risk_level_predicted=report_dict.get("risk_level", ""),
+        # 컬럼명은 DB schema 호환을 위해 유지 — 의미는 검출 신호 list 로 재해석.
+        # `total_score_predicted` 는 검출된 신호 *개수* (점수 X), `risk_level_predicted` 는 빈 문자열 (deprecated).
+        triggered_flags_predicted=report_dict.get("detected_signals", []),
+        total_score_predicted=len(report_dict.get("detected_signals") or []),
+        risk_level_predicted="",
         llm_assessment=report_dict.get("llm_assessment"),
         metadata=metadata,
     )

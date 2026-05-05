@@ -140,27 +140,8 @@ export default function StatsPage() {
             )}
           </div>
 
-          {/* 위험도 분포 */}
-          <div className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
-            <h2 className="text-base font-semibold text-gray-800 mb-4">위험도 분포</h2>
-            {stats.risk_level_distribution.length === 0 ? (
-              <p className="text-sm text-gray-400">데이터 없음</p>
-            ) : (
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={stats.risk_level_distribution}>
-                  <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
-                  <Tooltip />
-                  <Bar
-                    dataKey="count"
-                    radius={[4, 4, 0, 0]}
-                    name="건수"
-                    fill="#6366f1"
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </div>
+          {/* (deprecated) 위험도 분포 chart 는 Stage 3 reframe 으로 제거 — ScamGuardian 은 등급 산정 안 함.
+              detection_count 기반 차트는 별도 작업. backend 응답 schema 호환을 위해 type 정의는 유지. */}
 
           {/* 유형별 라벨 완료 */}
           {stats.labeled_by_type.length > 0 && (

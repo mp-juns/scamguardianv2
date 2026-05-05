@@ -13,13 +13,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pipeline.config import (
+    DETECTED_FLAGS,
     LLM_ENTITY_MERGE_THRESHOLD,
     LLM_SCAM_TYPE_OVERRIDE_THRESHOLD,
     OLLAMA_MAX_ENTITY_COUNT as _MAX_ENTITY_COUNT,
     OLLAMA_MAX_TRANSCRIPT_CHARS as _MAX_TRANSCRIPT_CHARS,
     OLLAMA_MAX_TRIGGERED_FLAG_COUNT as _MAX_FLAG_COUNT,
     RAG_MAX_CASES_IN_PROMPT,
-    SCORING_RULES,
     get_runtime_scam_taxonomy,
 )
 from pipeline.extractor import Entity
@@ -182,7 +182,7 @@ def _build_prompt(
     similar_cases: list[dict[str, Any]] | None = None,
 ) -> str:
     allowed_labels = get_runtime_scam_taxonomy()["label_sets"].get(scam_type, [])
-    allowed_flags = list(SCORING_RULES.keys())
+    allowed_flags = list(DETECTED_FLAGS)
 
     entity_lines = [
         {
@@ -336,7 +336,7 @@ def assess(
     raw = _call_claude(prompt, max_tokens=512)
 
     allowed_labels = set(get_runtime_scam_taxonomy()["label_sets"].get(scam_type, []))
-    allowed_flags = set(SCORING_RULES.keys())
+    allowed_flags = set(DETECTED_FLAGS)
     existing_entity_pairs = {(entity.label, entity.text) for entity in entities}
 
     suggested_entities: list[SuggestedEntity] = []
@@ -467,7 +467,7 @@ def _build_unified_prompt(
     scam_types = taxonomy["scam_types"]
     description_lines = [{"description": k, "scam_type": v} for k, v in taxonomy["descriptions"].items()]
     allowed_labels = taxonomy["label_sets"].get(classifier_scam_type, [])
-    allowed_flags = list(SCORING_RULES.keys())
+    allowed_flags = list(DETECTED_FLAGS)
     user_context_block = _format_user_context_block(user_context)
 
     return f"""
@@ -568,7 +568,7 @@ def analyze_unified(
     # ── 엔티티/플래그 제안 파싱 (assess와 동일 로직) ──
     effective_type = suggested_type if scam_type_suggestion else classifier_scam_type
     allowed_labels = set(taxonomy["label_sets"].get(effective_type, []))
-    allowed_flags = set(SCORING_RULES.keys())
+    allowed_flags = set(DETECTED_FLAGS)
 
     suggested_entities: list[SuggestedEntity] = []
     seen_entity_pairs: set[tuple[str, str]] = set()

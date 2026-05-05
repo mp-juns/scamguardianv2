@@ -1,6 +1,9 @@
 """
-ScamGuardian v2 — 파이프라인 오케스트레이터
+ScamGuardian — 파이프라인 오케스트레이터
 전체 분석 흐름을 조율하며 각 단계를 순차 실행한다.
+
+Identity (CLAUDE.md): 점수·등급 산정 안 함. signal_detector 가 검출 신호 list 만 만들고,
+DetectionReport 로 통합 기업에 전달. 통합 기업이 자체 판정 logic 으로 결정.
 """
 
 from __future__ import annotations
@@ -8,13 +11,12 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from pipeline import classifier, extractor, llm_assessor, rag, safety, sandbox, scorer, stt, verifier
-from pipeline.config import CLASSIFICATION_THRESHOLD
-from pipeline.config import RAG_TOP_K, SCORING_RULES
-from pipeline.scorer import ScamReport
+from pipeline import apk_analyzer, classifier, extractor, llm_assessor, rag, safety, sandbox, signal_detector, stt, verifier
+from pipeline.config import CLASSIFICATION_THRESHOLD, RAG_TOP_K
+from pipeline.signal_detector import DetectionReport
 
 
 @dataclass
@@ -44,7 +46,7 @@ class ScamGuardianPipeline:
         self.last_verification_results: list[verifier.VerificationResult] = []
         self.last_llm_assessment: llm_assessor.LLMAssessment | None = None
         self.last_similar_cases: list[dict[str, Any]] = []
-        self.last_report: ScamReport | None = None
+        self.last_report: DetectionReport | None = None
 
     def _debug(self, message: str):
         if self.debug:
@@ -173,19 +175,20 @@ class ScamGuardianPipeline:
         use_rag: bool = False,
         precomputed_transcript: stt.TranscriptResult | None = None,
         user_context: dict[str, Any] | None = None,
-    ) -> ScamReport:
+    ) -> DetectionReport:
         """
-        전체 분석 파이프라인을 실행한다.
+        전체 검출 파이프라인을 실행한다. 점수·등급 산정 없음 — 검출 신호만.
 
         Args:
             source: YouTube URL, 로컬 파일 경로, 또는 텍스트
             skip_verification: True이면 Serper API 검증 단계를 건너뜀 (테스트용)
-            use_llm: True이면 Claude 기반 보조 판정을 추가 수행
+            use_llm: True이면 Claude 기반 보조 검출을 추가 수행
             precomputed_transcript: 외부에서 미리 STT 한 결과. 있으면 Phase 1 스킵.
             user_context: 챗봇 대화로 모은 사용자 제보 dict (Phase 3 LLM 에 prior 로 주입)
 
         Returns:
-            ScamReport 객체
+            DetectionReport — detected_signals[] 형태로 검출 신호 list 만 보고.
+            점수·등급·"사기다" 판정 없음. 통합 기업이 자체 판정 logic 구현.
         """
         self.steps = []
         self.last_transcript_result = None
@@ -197,6 +200,9 @@ class ScamGuardianPipeline:
         self.last_report = None
         self.last_safety_result: safety.SafetyResult | None = None
         self.last_sandbox_result: sandbox.SandboxResult | None = None
+        self.last_apk_static_result: apk_analyzer.APKStaticReport | None = None
+        self.last_apk_bytecode_result: apk_analyzer.APKBytecodeReport | None = None
+        self.last_apk_dynamic_result: apk_analyzer.APKDynamicReport | None = None
         pipeline_start = time.time()
         effective_use_rag = use_llm and use_rag
         self._debug(
@@ -261,7 +267,7 @@ class ScamGuardianPipeline:
                 is_uncertain=True,
             )
             self.last_classification = empty_classification
-            report = scorer.score(
+            report = signal_detector.detect(
                 verification_results=[],
                 classification=empty_classification,
                 entities=[],
@@ -312,6 +318,67 @@ class ScamGuardianPipeline:
                     f"downloads={len(sandbox_result.download_attempts)} "
                     f"cloaking={sandbox_result.cloaking_detected}"
                 )
+
+        # ════════════════════════════════
+        # Phase 0.6 (Stage 2/3): APK 정적 분석 (Lv 1 + Lv 2)
+        # 입력이 APK 파일일 때만. 코드 *읽기만*, 실행 X (정적 분석).
+        # 진짜 동적 분석 (에뮬레이터 behavior 모니터링) 은 future work.
+        # ════════════════════════════════
+        apk_static_result: apk_analyzer.APKStaticReport | None = None
+        apk_bytecode_result: apk_analyzer.APKBytecodeReport | None = None
+        apk_dynamic_result: apk_analyzer.APKDynamicReport | None = None
+        if precomputed_transcript is None and apk_analyzer.is_apk_file(source):
+            phase06_start = time.time()
+            print("[Phase 0.6] APK 정적 분석 (Lv 1 — manifest·권한·서명)...")
+            try:
+                apk_static_result = apk_analyzer.analyze_apk_static(source)
+                self.last_apk_static_result = apk_static_result
+                print(
+                    f"      ← Lv 1: 검출 {len(apk_static_result.detected_flags)}개, "
+                    f"package={apk_static_result.package_name[:40]}, "
+                    f"perms={len(apk_static_result.permissions)}, "
+                    f"self_signed={apk_static_result.is_self_signed}"
+                )
+            except Exception as exc:  # noqa: BLE001 — 분석은 죽으면 안 됨
+                print(f"[Phase 0.6] Lv 1 실패 (무시): {exc}")
+
+            print("[Phase 0.6] APK 심화 정적 분석 (Lv 2 — bytecode 패턴)...")
+            try:
+                apk_bytecode_result = apk_analyzer.analyze_apk_bytecode(source)
+                self.last_apk_bytecode_result = apk_bytecode_result
+                print(
+                    f"      ← Lv 2: 검출 {len(apk_bytecode_result.detected_flags)}개"
+                    + (f" — flags={apk_bytecode_result.detected_flags}"
+                       if apk_bytecode_result.detected_flags else "")
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Phase 0.6] Lv 2 실패 (무시): {exc}")
+
+            # Lv 3 — 동적 분석 (기본 비활성, 격리 VM 만 허용)
+            print("[Phase 0.6] APK 동적 분석 (Lv 3 — 격리 VM 에뮬레이터)...")
+            try:
+                apk_dynamic_result = apk_analyzer.analyze_apk_dynamic(source)
+                self.last_apk_dynamic_result = apk_dynamic_result
+                status_val = apk_dynamic_result.status.value
+                print(
+                    f"      ← Lv 3: status={status_val} "
+                    f"backend={apk_dynamic_result.backend or '-'} "
+                    f"flags={len(apk_dynamic_result.detected_flags)}"
+                    + (f" — {apk_dynamic_result.error[:60]}" if apk_dynamic_result.error else "")
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Phase 0.6] Lv 3 실패 (무시): {exc}")
+
+            self._log_step(
+                "APK",
+                phase06_start,
+                {
+                    "lv1_flags": len((apk_static_result.detected_flags if apk_static_result else []) or []),
+                    "lv2_flags": len((apk_bytecode_result.detected_flags if apk_bytecode_result else []) or []),
+                    "lv3_status": apk_dynamic_result.status.value if apk_dynamic_result else "-",
+                    "lv3_flags": len((apk_dynamic_result.detected_flags if apk_dynamic_result else []) or []),
+                },
+            )
 
         # ════════════════════════════════
         # Phase 1: STT (precomputed_transcript 있으면 스킵)
@@ -459,22 +526,21 @@ class ScamGuardianPipeline:
                 transcript=text,
             )
             triggered = sum(1 for r in verification_results if r.triggered)
-            print(f"      ← {len(verification_results)}건 검증, {triggered}건 플래그 발동")
+            print(f"      ← {len(verification_results)}건 검증, {triggered}건 신호 검출")
             for r in verification_results:
                 if r.triggered:
-                    delta = SCORING_RULES.get(r.flag, 0)
                     reason = r.evidence_snippets[0][:60] if r.evidence_snippets else ""
-                    print(f"         🚩 {r.flag} (+{delta}점) {reason}")
+                    print(f"         🚩 {r.flag} {reason}")
 
         # ════════════════════════════════
-        # Phase 5: 스코어링
+        # Phase 5: 검출 신호 종합 (점수·등급 산정 X)
         # ════════════════════════════════
-        print("[Phase 5] 스캠 스코어 산출 중...")
+        print("[Phase 5] 검출 신호 종합 중...")
         print(
-            f"      → 입력: 검증플래그 {len(verification_results)}개, "
+            f"      → 입력: 검증신호 {len(verification_results)}개, "
             f"엔티티 {len(merged_entities)}개, 분류={classification.scam_type}"
         )
-        report = scorer.score(
+        report = signal_detector.detect(
             verification_results=verification_results,
             classification=classification,
             entities=merged_entities,
@@ -492,14 +558,17 @@ class ScamGuardianPipeline:
             classifier_original=classifier_original,
             safety_result=safety_result,
             sandbox_result=sandbox_result,
+            apk_static_result=apk_static_result,
+            apk_bytecode_result=apk_bytecode_result,
+            apk_dynamic_result=apk_dynamic_result,
         )
 
         total_ms = (time.time() - pipeline_start) * 1000
         self._log_step("전체", pipeline_start)
-        print(f"      ← 위험도: {report.total_score}/100, 판정: {report.risk_level}")
+        print(f"      ← 검출 신호: {len(report.detected_signals)}개")
         print(f"\n{'='*50}")
-        print(f"✅ 분석 완료! (소요시간: {total_ms:.0f}ms)")
-        print(f"   유형: {report.scam_type} | 위험도: {report.total_score}/100 ({report.risk_level})")
+        print(f"✅ 검출 완료! (소요시간: {total_ms:.0f}ms)")
+        print(f"   유형: {report.scam_type} | 검출 신호: {len(report.detected_signals)}개")
         print(f"{'='*50}")
 
         self.last_report = report

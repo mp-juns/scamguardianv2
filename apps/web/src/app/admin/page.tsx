@@ -9,6 +9,7 @@ type RunItem = {
   transcript_preview: string;
   predicted_scam_type: string;
   predicted_confidence: number;
+  // DB 컬럼은 호환을 위해 유지 — 의미는 검출 신호 *개수* (점수 X). risk_level_predicted 는 deprecated (빈 문자열).
   total_score_predicted: number;
   risk_level_predicted: string;
   status: "미완료" | "진행중" | "완료";
@@ -392,7 +393,7 @@ export default function AdminDashboardPage() {
 
                   <div className="flex items-center">
                     <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-slate-300">
-                      {run.risk_level_predicted} {run.total_score_predicted}점
+                      검출 신호 {run.total_score_predicted}개
                     </span>
                   </div>
 

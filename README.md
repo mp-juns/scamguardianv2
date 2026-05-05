@@ -1,9 +1,13 @@
 # ScamGuardian
 
-한국어 음성·텍스트·이미지·문서·URL 에서 사기를 탐지하는 AI 파이프라인.
-카카오톡 챗봇 / 웹 / CLI 어떤 채널이든 같은 코어가 분석.
+ScamGuardian 은 **사기 판정 시스템이 아니라 사기 신호 검출 reference implementation** 입니다.
+VirusTotal 이 70개 백신의 검출 결과를 보고만 하고 "이 파일은 사기다" 판정하지 않는 것과 동일한 모델로,
+ScamGuardian 은 멀티모달 의심 콘텐츠(URL·파일·이미지·PDF·통화 녹음)에서 위험 신호를 검출하고
+각 신호의 학술/법적 근거를 transparent 하게 제공합니다.
+판정 logic 은 통합한 기업(통신사·은행·메신저 앱)이 자기 risk tolerance 에 따라 구현합니다.
 
 > 📖 **상세 아키텍처·시나리오·API·플래그 명세**: [`.scamguardian/README.md`](./.scamguardian/README.md)
+> ⚠️ **Identity Boundary**: 점수·등급은 더 이상 외부에 노출하지 않습니다 — `CLAUDE.md` 의 Forbidden Actions 참조.
 
 ## 빠른 실행
 
@@ -48,7 +52,7 @@ python run_analysis.py --text "투자 설명 텍스트"
 
 ### 테스트
 ```bash
-pytest    # 93 passed
+pytest    # 114 passed
 ```
 
 ## 디렉터리
@@ -76,6 +80,28 @@ scripts/             배치 인제스트·운영 스크립트
 - **결과 공개 페이지**: `/result/[token]` (1시간 TTL)
 
 자세한 내용은 [`.scamguardian/README.md`](./.scamguardian/README.md) 참고.
+
+## APK 검출 (4-tier — 정적 3 + 동적 1 인터페이스)
+
+한국 보이스피싱은 사이드로딩을 통한 악성 APK 설치가 attack chain 의 핵심입니다.
+ScamGuardian 은 의심 APK 를 다음 4 단계로 검출합니다:
+
+1. **VirusTotal 시그니처 매칭** — 70+ 백신 엔진 합의 (알려진 멀웨어). zero-day 는 못 잡음
+2. **정적 분석 Lv 1** — `androguard` manifest·권한 조합·서명 검사 (zero-day 의 권한 패턴 검출)
+3. **심화 정적 분석 Lv 2** — dex bytecode 패턴 매칭 (SecretCalls·KrBanker·MoqHao 등 한국 보이스피싱 패밀리의 기술 시그니처)
+4. **동적 분석 Lv 3** *(인터페이스만 — 격리 VM 필요)* — 별도 Android 에뮬레이터 VM 안에서 실제 실행 후 behavior 모니터링. 기본 비활성 (`APK_DYNAMIC_ENABLED=0`), 로컬 실행은 어떤 경우에도 차단 (호스트 위험).
+
+Lv 3 는 인터페이스 + flag 카탈로그까지 박혔고, 실제 remote VM 측 서버는 v3.5 sandbox_server/
+패턴과 동일하게 별도 호스트에 배포해야 동작합니다 (future work).
+
+학술 기준 정적 분석 검출률은 **60-80%** 이고, **100% 차단을 약속하지 않습니다**.
+검출된 신호와 학술/법적 근거를 transparent 하게 제공하고, 판정·차단은 통합 기업이
+자기 risk tolerance 에 따라 합니다 (Identity Boundary).
+
+> 차별화는 "100% 잡는다" 가 아니라 "VirusTotal·시티즌코난 등 시그니처 솔루션이
+> zero-day 에 약한 부분을 bytecode 패턴 분석으로 보완하는 reference architecture".
+
+자세한 architecture: `CLAUDE.md` 의 *APK Detection Architecture (3-tier)* 섹션.
 
 ## 배포
 

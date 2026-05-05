@@ -12,14 +12,78 @@ from db import repository
 from pipeline.runner import ScamGuardianPipeline
 from platform_layer.middleware import PlatformMiddleware
 
-from . import admin_platform, admin_runs, admin_training, analyze, health, kakao, result_token
+from . import (
+    admin_platform,
+    admin_runs,
+    admin_training,
+    analyze,
+    docs_ui,
+    health,
+    kakao,
+    result_token,
+    v4_stream,
+)
+
+OPENAPI_TAGS = [
+    {
+        "name": "Public",
+        "description": (
+            "외부 통합 클라이언트용 — API key 필요. "
+            "`/api/analyze`, `/api/analyze-upload`, `/api/result/{token}`, `/api/methodology` 4개. "
+            "자세한 통합 가이드: `docs/INTEGRATION_GUIDE.md`."
+        ),
+    },
+    {
+        "name": "Webhook",
+        "description": "카카오 챗봇 등 외부 플랫폼 webhook. 플랫폼 자체 인증 사용 (API key skip).",
+    },
+    {
+        "name": "Admin — Labeling",
+        "description": "라벨링 큐 / annotation / 검수 메트릭. `SCAMGUARDIAN_ADMIN_TOKEN` 필요.",
+    },
+    {
+        "name": "Admin — Platform",
+        "description": "API key 발급·revoke / cost ledger / request log / abuse 차단 관리.",
+    },
+    {
+        "name": "Admin — Training",
+        "description": "fine-tune 세션 — mDeBERTa 분류기 / GLiNER 추출기 도메인 특화 학습.",
+    },
+    {
+        "name": "v4 (draft)",
+        "description": (
+            "**Live Call Guard — design preview only, not implemented.** "
+            "실시간 통화 중 사기 탐지 endpoint 설계 미리보기. 모든 호출 `501 Not Implemented`. "
+            "배경: CLAUDE.md `v4 계획` 섹션."
+        ),
+    },
+    {
+        "name": "Health",
+        "description": "Liveness probe.",
+    },
+]
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="ScamGuardian API",
+        title="ScamGuardian Signal Detection API",
         version="0.1.0",
-        description="ScamGuardian v2 파이프라인을 웹에서 호출하기 위한 API",
+        description=(
+            "**한국어 사기 신호 검출 reference implementation** — 음성·텍스트·이미지·PDF·URL 입력에서 "
+            "위험 신호를 검출하고 각 신호의 학술/법적 근거를 transparent 하게 보고한다.\n\n"
+            "⚠️ **Identity Boundary** (CLAUDE.md): ScamGuardian 은 *사기 판정을 내리지 않는다*. "
+            "VirusTotal 이 70개 백신의 검출 결과를 보고만 하는 모델과 동일. 판정 logic 은 통합한 "
+            "기업(통신사·은행·메신저 앱)이 자기 risk tolerance 에 따라 구현한다.\n\n"
+            "- **Public 4 endpoint** (`Public` 태그) — 외부 통합 시작점, `DetectionReport` 응답\n"
+            "- **Webhook** (`Webhook` 태그) — 카카오 오픈빌더\n"
+            "- **Admin** (3 태그) — 라벨링 / platform / training\n"
+            "- **v4 draft** — Live Call Guard 설계 preview (구현 X)\n\n"
+            "통합 가이드: [`docs/INTEGRATION_GUIDE.md`](https://github.com/example/scamguardian-v2/blob/main/docs/INTEGRATION_GUIDE.md)"
+        ),
+        openapi_tags=OPENAPI_TAGS,
+        # 기본 /docs · /redoc 비활성 — docs_ui.install_custom_docs 가 Pretendard 적용한 커스텀 버전으로 대체.
+        docs_url=None,
+        redoc_url=None,
     )
 
     allowed_origins = [
@@ -49,6 +113,10 @@ def create_app() -> FastAPI:
     app.include_router(admin_runs.router)
     app.include_router(admin_platform.router)
     app.include_router(admin_training.router)
+    app.include_router(v4_stream.router)
+
+    # 커스텀 /docs (Swagger UI) + /redoc — Pretendard 폰트 + 가독성 폴리시.
+    docs_ui.install_custom_docs(app)
 
     @app.on_event("startup")
     def _startup() -> None:

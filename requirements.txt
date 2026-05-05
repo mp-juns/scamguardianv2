@@ -13,3 +13,4 @@ fastapi
 uvicorn[standard]
 psycopg[binary]
 pgvector
+androguard>=4.1.0  # APK 정적 분석 (Stage 2/3 — manifest·권한·서명 + dex bytecode 패턴)

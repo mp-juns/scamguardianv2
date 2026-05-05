@@ -19,12 +19,69 @@ from .models import AnalyzeRequest
 router = APIRouter()
 
 
-@router.post("/api/analyze")
+@router.post(
+    "/api/analyze",
+    tags=["Public"],
+    summary="텍스트·URL 분석 — 위험 신호 검출 (Signal Detection)",
+    description=(
+        "ScamGuardian 의 메인 검출 엔드포인트. 한국어 텍스트 또는 URL/YouTube/음성·영상·이미지·PDF 파일 경로를 받아 "
+        "Phase 0 (안전성) → Phase 0.5 (sandbox) → Phase 1 (STT/OCR) → Phase 2-5 (분류·추출·검증·검출) "
+        "전체 파이프라인을 수행한다.\n\n"
+        "⚠️ **Identity Boundary** (CLAUDE.md): ScamGuardian 은 **사기 판정을 내리지 않는다**. "
+        "검출된 위험 신호 list 와 각 신호의 학술/법적 근거만 transparent 하게 보고한다. "
+        "VirusTotal 이 70개 백신의 검출 결과를 보고만 하는 모델과 동일. "
+        "최종 판정 logic 은 통합 기업이 자체 risk tolerance 에 따라 구현한다.\n\n"
+        "**Request body** (`AnalyzeRequest`):\n"
+        "- `source` *or* `text` — 둘 중 하나는 필수. URL 도 `source` 로 전달\n"
+        "- `whisper_model` — `tiny|base|small|medium|large` (음성 입력 시에만 영향)\n"
+        "- `skip_verification` — true 면 Phase 4 (Serper) 건너뜀, 응답 빨라짐\n"
+        "- `use_llm` — 무시됨 (서버에서 강제 true)\n"
+        "- `use_rag` — 과거 라벨 사례 RAG 검색 여부\n\n"
+        "**응답 핵심 필드** (`DetectionReport`):\n"
+        "- `scam_type` — 분류된 스캠 유형 (검출 컨텍스트, 판정 X)\n"
+        "- `detected_signals` — `[{flag, label_ko, rationale, source, evidence, description, detection_source}]` "
+        "검출된 위험 신호 list. 각 신호마다 학술/법적 근거(`rationale`) 와 출처(`source`) 포함\n"
+        "- `summary` — `\"위험 신호 N개 검출되었습니다. 자세한 근거는 detected_signals 참고.\"`\n"
+        "- `disclaimer` — 통합 기업 판정 logic 안내 문구\n"
+        "- `entities` — `[{label, text, score, source}]` 추출된 엔티티\n"
+        "- `transcript_text` — 본문 (URL/파일 입력 시 STT/OCR 결과)\n"
+        "- `analysis_run_id` — DB 저장된 경우 UUID\n\n"
+        "❌ 응답에 `total_score`, `risk_level`, `is_scam`, `agent_verdict` 등 *판정* 필드는 **없다**.\n\n"
+        "**인증**: API key 필수 (`Authorization: Bearer sg_...` 또는 `X-API-Key`).\n\n"
+        "**에러**:\n"
+        "- `400` — 빈 입력 / 어뷰즈 가드 reject (REPETITIVE / GIBBERISH / DUPLICATE)\n"
+        "- `401` — API key 누락 또는 무효\n"
+        "- `403` — API key revoked\n"
+        "- `423` — 어뷰즈 가드 BLOCKED (위반 누적 차단)\n"
+        "- `429` — RPM 또는 월 USD/호출 cap 초과 (`Retry-After` 헤더)\n"
+        "- `500` — 파이프라인 내부 오류\n\n"
+        "**curl** (텍스트):\n"
+        "```bash\n"
+        "curl -X POST https://api.example.com/api/analyze \\\n"
+        "  -H \"Authorization: Bearer sg_xxx\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        "  -d '{\"text\": \"검찰청입니다. 즉시 300만원 송금하세요.\"}'\n"
+        "```\n\n"
+        "**curl** (YouTube URL):\n"
+        "```bash\n"
+        "curl -X POST https://api.example.com/api/analyze \\\n"
+        "  -H \"Authorization: Bearer sg_xxx\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        "  -d '{\"source\": \"https://youtu.be/abcd1234\"}'\n"
+        "```"
+    ),
+    responses={
+        400: {"description": "빈 입력 / 어뷰즈 reject / 환경 미설정"},
+        401: {"description": "API key 누락 또는 무효"},
+        423: {"description": "어뷰즈 누적 차단 — 1시간 후 재시도"},
+        429: {"description": "Rate limit 초과 — `Retry-After` 헤더 참조"},
+    },
+)
 async def analyze(payload: AnalyzeRequest, request: Request) -> dict:
     log = logging.getLogger("api_analyze")
     source = resolve_source(payload)
     log.info(
-        "/api/analyze 요청:\n"
+        "/api/analyze 요청 (검출 모드):\n"
         "  source: %s\n"
         "  whisper_model: %s, skip_verification: %s, use_llm: true(강제), use_rag: %s",
         source[:100], payload.whisper_model, payload.skip_verification,
@@ -45,10 +102,9 @@ async def analyze(payload: AnalyzeRequest, request: Request) -> dict:
     try:
         result = await asyncio.to_thread(run_pipeline, payload)
         log.info(
-            "/api/analyze 완료: scam_type=%s, risk=%s/100 (%s)",
+            "/api/analyze 완료: scam_type=%s, signals=%d",
             result.get("scam_type", "?"),
-            result.get("total_score", "?"),
-            result.get("risk_level", "?"),
+            len(result.get("detected_signals") or []),
         )
         return result
     except ValueError as exc:
@@ -62,7 +118,42 @@ async def analyze(payload: AnalyzeRequest, request: Request) -> dict:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/api/analyze-upload")
+@router.post(
+    "/api/analyze-upload",
+    tags=["Public"],
+    summary="파일 업로드 검출 (multipart) — Signal Detection",
+    description=(
+        "음성·영상·이미지·PDF 파일을 multipart/form-data 로 업로드받아 위험 신호를 검출한다. "
+        "이미지/PDF 는 Claude vision OCR, 음성/영상은 ffmpeg + Whisper 로 transcript 추출.\n\n"
+        "⚠️ **Identity**: 검출만, 판정 X. 응답 schema 는 `/api/analyze` 와 동일 (`DetectionReport`).\n\n"
+        "**Form fields**:\n"
+        "- `file` — 파일 본문 (필수). 100MB 이하 권장. 지원 확장자: "
+        "`.mp4 .mov .webm .mkv .m4a .mp3 .wav .ogg .aac .jpg .jpeg .png .webp .gif .bmp .pdf`\n"
+        "- `whisper_model` — `tiny|base|small|medium|large` (기본 medium)\n"
+        "- `skip_verification` — 기본 true\n"
+        "- `use_llm` — 무시됨 (강제 true)\n"
+        "- `use_rag` — 기본 false\n\n"
+        "**응답**: `/api/analyze` 와 동일한 `DetectionReport` JSON (`detected_signals[]` + `summary` + `disclaimer`). "
+        "업로드 원본은 라벨링용으로 `.scamguardian/uploads/{run_id}/source.{ext}` 에 보존된다.\n\n"
+        "**인증**: API key 필수.\n\n"
+        "**에러**:\n"
+        "- `400` — 빈 파일 / 코덱 추출 실패 / 어뷰즈 reject\n"
+        "- `401/403/423/429` — `/api/analyze` 와 동일\n"
+        "- `500` — 파이프라인 내부 오류\n\n"
+        "**curl**:\n"
+        "```bash\n"
+        "curl -X POST https://api.example.com/api/analyze-upload \\\n"
+        "  -H \"Authorization: Bearer sg_xxx\" \\\n"
+        "  -F \"file=@suspect_call.m4a\" \\\n"
+        "  -F \"whisper_model=medium\"\n"
+        "```"
+    ),
+    responses={
+        400: {"description": "파일 비어있음 / 코덱 오류 / 어뷰즈 reject"},
+        401: {"description": "API key 누락 또는 무효"},
+        429: {"description": "Rate limit 초과"},
+    },
+)
 async def analyze_upload(
     file: UploadFile = File(...),
     whisper_model: str = Form("medium"),

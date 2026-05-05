@@ -68,6 +68,7 @@ type RunDetailResponse = {
     };
     entities_predicted: EntityItem[];
     triggered_flags_predicted: FlagItem[];
+    // DB 컬럼 호환 유지 — 값은 검출 신호 개수 (Stage 3 reframe), risk_level_predicted 는 deprecated.
     total_score_predicted: number;
     risk_level_predicted: string;
     metadata?: RunMetadata | null;
@@ -765,12 +766,12 @@ export default function AdminRunEditor({ runId }: { runId: string }) {
               </div>
             </div>
             <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-              <div className="text-sm text-slate-400">예측 위험도</div>
+              <div className="text-sm text-slate-400">검출 신호</div>
               <div className="mt-2 text-xl font-semibold text-white">
-                {detail.run.risk_level_predicted}
+                {detail.run.total_score_predicted}개
               </div>
-              <div className="mt-2 text-sm text-slate-300">
-                총점 {detail.run.total_score_predicted}점
+              <div className="mt-2 text-xs text-slate-500">
+                (판정 X — 검출 사실만)
               </div>
             </div>
           </div>

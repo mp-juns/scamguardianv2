@@ -1,4 +1,3 @@
-import Link from "next/link";
 import { notFound } from "next/navigation";
 
 export const dynamic = "force-dynamic";
@@ -10,22 +9,16 @@ type PageProps = {
   params: Promise<{ token: string }>;
 };
 
-type FlagDict = {
+// DetectionReport.detected_signals[] 의 element schema
+type DetectedSignalDict = {
   flag?: string;
-  score_delta?: number;
-  evidence?: Record<string, unknown> | string[];
-  flag_description?: string;
+  label_ko?: string;
+  rationale?: string;
+  source?: string;             // 출처 기관·논문
+  detection_source?: string;   // rule | llm | safety | sandbox
+  evidence?: string[];
   description?: string;
-  source?: string;  // "rule" 또는 "llm"
 };
-
-// 위험도 레벨 구간 (pipeline/config.py:RISK_LEVELS 동기화)
-const RISK_BANDS: Array<{ min: number; max: number; level: string; desc: string }> = [
-  { min: 0, max: 20, level: "안전", desc: "특이사항 없음" },
-  { min: 21, max: 40, level: "주의", desc: "일부 의심 요소" },
-  { min: 41, max: 70, level: "위험", desc: "다수의 스캠 징후" },
-  { min: 71, max: 100, level: "매우 위험", desc: "높은 확률의 스캠" },
-];
 
 type EntityDict = {
   label?: string;
@@ -60,14 +53,14 @@ type ReportDict = {
   scam_type?: string;
   classification_confidence?: number;
   is_uncertain?: boolean;
-  total_score?: number;
-  risk_level?: string;
-  risk_description?: string;
   scam_type_reason?: string;
   scam_type_source?: string;
   transcript_text?: string;
   entities?: EntityDict[];
-  triggered_flags?: FlagDict[];
+  // Identity Boundary (CLAUDE.md): score / risk_level 필드 *없음*. detected_signals 만.
+  detected_signals?: DetectedSignalDict[];
+  summary?: string;
+  disclaimer?: string;
   llm_assessment?: LLMAssessment | null;
   safety_check?: SafetyCheckDict | null;
 };
@@ -93,12 +86,28 @@ type ResultPayload = {
   expires_at: number;
 };
 
-const RISK_COLORS: Record<string, string> = {
-  "매우 위험": "bg-red-700/30 border-red-500 text-red-200",
-  "위험": "bg-orange-700/30 border-orange-500 text-orange-200",
-  "주의": "bg-yellow-700/30 border-yellow-500 text-yellow-200",
-  "안전": "bg-emerald-700/30 border-emerald-500 text-emerald-200",
-};
+// 검출 신호 개수에 따른 색·아이콘. 등급 매기기 X — 단순 시각 변별.
+function detectionStyle(signalCount: number): { color: string; icon: string; title: string } {
+  if (signalCount <= 0) {
+    return {
+      color: "bg-emerald-700/30 border-emerald-500 text-emerald-200",
+      icon: "✅",
+      title: "검출된 위험 신호 없음",
+    };
+  }
+  if (signalCount <= 2) {
+    return {
+      color: "bg-yellow-700/30 border-yellow-500 text-yellow-200",
+      icon: "⚠️",
+      title: `위험 신호 ${signalCount}개 검출`,
+    };
+  }
+  return {
+    color: "bg-orange-700/30 border-orange-500 text-orange-200",
+    icon: "🚨",
+    title: `위험 신호 ${signalCount}개 검출`,
+  };
+}
 
 const INPUT_TYPE_LABEL: Record<string, string> = {
   text: "💬 텍스트",
@@ -157,9 +166,8 @@ export default async function ResultPage({ params }: PageProps) {
   }
 
   const { result, user_context, input_type, chat_history, expires_at } = data;
-  const flagRationale = data.flag_rationale ?? {};
-  const riskLevel = result.risk_level ?? "알 수 없음";
-  const riskColor = RISK_COLORS[riskLevel] ?? "bg-slate-700/30 border-slate-500 text-slate-200";
+  const signals = result.detected_signals ?? [];
+  const detection = detectionStyle(signals.length);
   const inputLabel = INPUT_TYPE_LABEL[input_type] ?? input_type;
   const llm = result.llm_assessment ?? null;
 
@@ -169,9 +177,9 @@ export default async function ResultPage({ params }: PageProps) {
         {/* 헤더 */}
         <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <p className="text-sm text-slate-400">ScamGuardian 분석 결과</p>
+            <p className="text-sm text-slate-400">ScamGuardian 검출 결과</p>
             <h1 className="text-2xl font-bold text-slate-100">
-              {result.scam_type ?? "미분류"}
+              {result.scam_type ?? "미분류"} <span className="text-base text-slate-500">(추정 유형)</span>
             </h1>
           </div>
           <p className="text-xs text-slate-500">{fmtExpires(expires_at)} · {inputLabel}</p>
@@ -227,14 +235,14 @@ export default async function ResultPage({ params }: PageProps) {
           );
         })()}
 
-        {/* 위험도 배지 */}
-        <section className={`rounded-2xl border p-6 shadow-lg ${riskColor}`}>
-          <div className="flex items-baseline gap-4">
-            <span className="text-3xl font-bold">{riskLevel}</span>
-            <span className="text-2xl">{result.total_score ?? 0} / 100점</span>
+        {/* 검출 결과 배지 — 점수·등급 X, 신호 개수만 */}
+        <section className={`rounded-2xl border p-6 shadow-lg ${detection.color}`}>
+          <div className="flex items-baseline gap-3">
+            <span className="text-3xl">{detection.icon}</span>
+            <span className="text-2xl font-bold">{detection.title}</span>
           </div>
-          {result.risk_description && (
-            <p className="mt-2 text-sm opacity-80">{result.risk_description}</p>
+          {result.summary && (
+            <p className="mt-2 text-sm opacity-90">{result.summary}</p>
           )}
           <p className="mt-2 text-xs opacity-70">
             분류 신뢰도: {fmtConfidence(result.classification_confidence)}
@@ -282,143 +290,48 @@ export default async function ResultPage({ params }: PageProps) {
           </section>
         )}
 
-        {/* 점수 산정 방식 */}
-        {(result.triggered_flags?.length ?? 0) > 0 && (() => {
-          const flags = result.triggered_flags ?? [];
-          const total = result.total_score ?? 0;
-          const ruleFlags = flags.filter((f) => (f.source ?? "rule") !== "llm");
-          const llmFlags = flags.filter((f) => f.source === "llm");
-          const ruleSum = ruleFlags.reduce((a, b) => a + (b.score_delta ?? 0), 0);
-          const llmSum = llmFlags.reduce((a, b) => a + (b.score_delta ?? 0), 0);
-          return (
-            <section className="rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                <h2 className="text-lg font-semibold text-slate-100">
-                  📊 점수 산정 방식
-                </h2>
-                <Link
-                  href="/methodology"
-                  className="rounded-full border border-slate-600 px-3 py-1 text-xs text-slate-300 transition hover:border-cyan-400/50 hover:text-cyan-200"
-                >
-                  점수 기준 자세히 보기 →
-                </Link>
-              </div>
-              <p className="mb-4 text-sm text-slate-400">
-                각 플래그의 점수를 합산해 총 위험도를 산출합니다.
-                LLM 보조 제안 플래그는 가중치 0.5 가 적용돼 절반만 반영됩니다 (맹신 방지).
-              </p>
-
-              {/* 합산식 */}
-              <div className="mb-4 rounded bg-slate-950/40 p-4 font-mono text-sm text-slate-200">
-                <div className="space-y-3">
-                  {flags.map((f, idx) => {
-                    const delta = f.score_delta ?? 0;
-                    const sign = delta >= 0 ? "+" : "";
-                    const labelText = f.flag_description ?? f.description ?? f.flag ?? "?";
-                    const isLlm = f.source === "llm";
-                    const info = (f.flag && flagRationale[f.flag]) || null;
-                    return (
-                      <div key={idx} className="border-b border-slate-800 pb-2 last:border-0">
-                        <div className="flex items-center justify-between">
-                          <span className="text-slate-300">
-                            {isLlm ? "🤖 " : ""}
-                            {labelText}
-                            {isLlm ? (
-                              <span className="ml-2 text-xs text-slate-500">
-                                (LLM 가중치 0.5 적용)
-                              </span>
-                            ) : null}
-                          </span>
-                          <span className={delta >= 0 ? "text-red-300" : "text-emerald-300"}>
-                            {sign}
-                            {delta}점
-                          </span>
-                        </div>
-                        {info ? (
-                          <div className="mt-1 ml-2 space-y-0.5 font-sans text-xs text-slate-500">
-                            {info.rationale ? <div>📖 {info.rationale}</div> : null}
-                            {info.source ? (
-                              <div className="text-slate-600">출처: {info.source}</div>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                  <div className="my-2 border-t border-slate-700" />
-                  <div className="flex items-center justify-between text-base font-semibold">
-                    <span className="text-slate-200">합계</span>
-                    <span className="text-slate-100">
-                      {ruleFlags.length > 0 && llmFlags.length > 0
-                        ? `${ruleSum} (규칙) + ${llmSum} (LLM) = ${total}점`
-                        : `${total}점`}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 위험도 등급 테이블 */}
-              <div>
-                <p className="mb-2 text-sm font-medium text-slate-200">위험도 등급 기준</p>
-                <div className="overflow-hidden rounded border border-slate-700">
-                  <table className="w-full text-sm">
-                    <tbody>
-                      {RISK_BANDS.map((band) => {
-                        const inRange = total >= band.min && total <= band.max;
-                        return (
-                          <tr
-                            key={band.level}
-                            className={
-                              inRange
-                                ? "bg-amber-500/10 text-amber-200"
-                                : "text-slate-400"
-                            }
-                          >
-                            <td className="px-3 py-2 font-mono">
-                              {band.min}~{band.max}
-                            </td>
-                            <td className="px-3 py-2 font-semibold">
-                              {band.level}
-                              {inRange ? " ← 현재" : ""}
-                            </td>
-                            <td className="px-3 py-2 text-xs">{band.desc}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </section>
-          );
-        })()}
-
-        {/* 발동 플래그 — 상세 evidence */}
-        {(result.triggered_flags?.length ?? 0) > 0 && (
+        {/* 검출된 위험 신호 상세 — 학술/법적 근거 함께 표시 (점수·등급 X) */}
+        {signals.length > 0 && (
           <section className="rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
             <h2 className="mb-3 text-lg font-semibold text-slate-100">
-              🚩 발동 플래그 상세 ({result.triggered_flags?.length ?? 0}개)
+              🚩 검출된 위험 신호 ({signals.length}개)
             </h2>
+            <p className="mb-4 text-sm text-slate-400">
+              각 신호 옆 학술/법적 근거를 참고하세요. ScamGuardian 은 검출만 하고 사기 여부 판정은 하지 않습니다.
+            </p>
             <ul className="space-y-3">
-              {(result.triggered_flags ?? []).map((f, idx) => {
-                const delta = f.score_delta ?? 0;
-                const sign = delta >= 0 ? "+" : "";
-                const evidenceList: string[] = Array.isArray(f.evidence)
-                  ? (f.evidence as string[])
-                  : f.evidence
-                  ? [JSON.stringify(f.evidence)]
+              {signals.map((s, idx) => {
+                const detSrc = s.detection_source ?? "rule";
+                const sourceTag =
+                  detSrc === "llm" ? "🤖 LLM 보조"
+                  : detSrc === "safety" ? "🛡 VirusTotal"
+                  : detSrc === "sandbox" ? "📦 샌드박스"
+                  : "📋 규칙";
+                const evidenceList: string[] = Array.isArray(s.evidence)
+                  ? s.evidence
                   : [];
                 return (
-                  <li key={idx} className="rounded bg-slate-800/60 p-3 text-sm">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-200">
-                        {f.flag_description ?? f.description ?? f.flag}
+                  <li key={idx} className="rounded bg-slate-800/60 p-4 text-sm">
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <span className="text-base font-semibold text-slate-100">
+                        {s.label_ko ?? s.flag}
                       </span>
-                      <span className={delta >= 0 ? "font-mono text-red-300" : "font-mono text-emerald-300"}>
-                        {sign}
-                        {delta}점
+                      <span className="rounded bg-slate-700/60 px-2 py-0.5 text-xs text-slate-300">
+                        {sourceTag}
                       </span>
                     </div>
+                    {s.description && (
+                      <p className="mt-1 text-xs text-slate-400">{s.description}</p>
+                    )}
+                    {s.rationale && (
+                      <div className="mt-3 rounded bg-slate-950/50 p-3 text-xs leading-relaxed text-slate-300">
+                        <div className="text-slate-200">📖 학술/법적 근거</div>
+                        <p className="mt-1">{s.rationale}</p>
+                        {s.source && (
+                          <p className="mt-2 text-slate-500">출처: {s.source}</p>
+                        )}
+                      </div>
+                    )}
                     {evidenceList.length > 0 && (
                       <ul className="mt-2 space-y-1 text-xs text-slate-400">
                         {evidenceList.slice(0, 3).map((e, eidx) => (
@@ -502,6 +415,13 @@ export default async function ResultPage({ params }: PageProps) {
                 ))}
               </ol>
             </details>
+          </section>
+        )}
+
+        {/* Identity Boundary disclaimer */}
+        {result.disclaimer && (
+          <section className="rounded-2xl border border-slate-700 bg-slate-900/40 p-5 text-sm text-slate-300">
+            <p>ⓘ {result.disclaimer}</p>
           </section>
         )}
 

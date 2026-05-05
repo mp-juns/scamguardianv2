@@ -13,7 +13,7 @@ import os
 import re
 from typing import Any
 
-from pipeline.config import SCORING_RULES, get_runtime_scam_taxonomy
+from pipeline.config import DETECTED_FLAGS, get_runtime_scam_taxonomy
 
 _client = None
 
@@ -39,7 +39,7 @@ def _build_prompt(
     taxonomy = get_runtime_scam_taxonomy()
     scam_types = taxonomy["scam_types"]
     label_sets = taxonomy["label_sets"]
-    allowed_flags = list(SCORING_RULES.keys())
+    allowed_flags = list(DETECTED_FLAGS)
 
     return f"""당신은 한국어 전화/영상 사기 탐지 전문 라벨러입니다.
 아래 전사 텍스트를 분석하고 정확한 라벨링 초안을 JSON으로만 반환하세요.
@@ -190,7 +190,7 @@ def _sanitize(
     taxonomy = get_runtime_scam_taxonomy()
     valid_scam_types = set(taxonomy["scam_types"])
     label_sets = taxonomy["label_sets"]
-    valid_flags = set(SCORING_RULES.keys())
+    valid_flags = set(DETECTED_FLAGS)
 
     scam_type = str(result.get("scam_type", predicted_scam_type)).strip()
     if scam_type not in valid_scam_types:
