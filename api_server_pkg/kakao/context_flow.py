@@ -253,7 +253,12 @@ async def _handle_done_state(
                 state.pending_jobs.pop(user_id, None)
                 return result
         elif refine_started and not refined:
-            return kakao_formatter.format_refining_in_progress()
+            # 이미 with state.jobs_lock 안 — record_poll 호출하면 같은 lock 재획득 시도해
+            # threading.Lock(non-reentrant) 특성상 deadlock. lock-free 버전 사용.
+            elapsed, poll_count, _ = state._record_poll_unsafe(job)
+            return kakao_formatter.format_refining_in_progress(
+                elapsed_sec=elapsed, poll_count=poll_count,
+            )
         elif refined:
             _, url = issue_result_token(
                 result=job["result"],
@@ -332,7 +337,13 @@ async def _kakao_force_skip_context(user_id: str) -> dict[str, Any]:
             stt_done = job["stt_done"]
 
     if already_analyzing:
-        return kakao_formatter.format_still_running()
+        elapsed, poll_count, stt_done_now = state.record_poll(user_id)
+        return kakao_formatter.format_still_running(
+            elapsed_sec=elapsed, poll_count=poll_count, stt_done=stt_done_now,
+        )
 
     state.spawn_bg(_async_maybe_trigger_analyze(user_id))
-    return kakao_formatter.format_context_done_waiting(stt_done=stt_done)
+    elapsed, poll_count, _ = state.record_poll(user_id)
+    return kakao_formatter.format_context_done_waiting(
+        stt_done=stt_done, elapsed_sec=elapsed, poll_count=poll_count,
+    )

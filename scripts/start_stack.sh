@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+export PATH="$HOME/miniconda3/bin:$HOME/anaconda3/bin:$HOME/.nvm/versions/node/$(ls -1 $HOME/.nvm/versions/node 2>/dev/null | tail -n 1)/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+  source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+  source "$HOME/anaconda3/etc/profile.d/conda.sh"
+fi
+
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+  source "$HOME/.nvm/nvm.sh"
+fi
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +45,9 @@ kill_matches() {
 
 echo "[start] stopping previous processes..."
 kill_matches "uvicorn api_server:app"
+kill_matches "next dev"
 kill_matches "next-server"
+kill_matches "npm run dev"
 kill_matches "ollama serve"
 kill_matches "ngrok http"
 kill_port "$BACKEND_PORT"
@@ -54,19 +67,25 @@ PYTHONUNBUFFERED=1 nohup conda run --no-capture-output -n "$CONDA_ENV" python -u
   >"$LOG_DIR/backend.log" 2>&1 &
 
 echo "[start] starting frontend (next dev :$FRONTEND_PORT)..."
-cd "$ROOT_DIR/apps/web"
-SCAMGUARDIAN_API_URL="http://127.0.0.1:${BACKEND_PORT}" \
-nohup npm run dev -- --hostname 0.0.0.0 --port "$FRONTEND_PORT" \
-  >"$LOG_DIR/frontend.log" 2>&1 &
+
+setsid bash -lic "
+  cd '$ROOT_DIR/apps/web' || exit 1
+  export SCAMGUARDIAN_API_URL='http://127.0.0.1:${BACKEND_PORT}'
+  export LANG=C.UTF-8
+  export LC_ALL=C.UTF-8
+
+  if [ -s \"\$HOME/.nvm/nvm.sh\" ]; then
+    source \"\$HOME/.nvm/nvm.sh\"
+  fi
+
+  npm run dev -- --hostname 0.0.0.0 --port '$FRONTEND_PORT'
+" >"$LOG_DIR/frontend.log" 2>&1 < /dev/null &
 
 if [[ "$ENABLE_FUNNEL" == "true" ]] && command -v tailscale >/dev/null 2>&1; then
-  echo "[start] enabling tailscale funnel (backend:$BACKEND_PORT, frontend:$FRONTEND_PORT)..."
-  # funnel은 실패해도 스택 구동을 막지 않는다.
-  nohup tailscale funnel --bg "$BACKEND_PORT" >/dev/null 2>&1 || true
-  nohup tailscale funnel --bg "$FRONTEND_PORT" >/dev/null 2>&1 || true
+  echo "[start] enabling tailscale funnel (frontend:$FRONTEND_PORT)..."
+  tailscale funnel --bg "http://127.0.0.1:${FRONTEND_PORT}" || true
   tailscale funnel status 2>/dev/null || true
 fi
-
 # 카카오 오픈빌더는 .ts.net 도메인을 거부하므로 ngrok 으로 보조 터널 제공
 NGROK_PUBLIC_URL=""
 if [[ "$ENABLE_NGROK" == "true" ]] && [[ -x "$NGROK_BIN" ]]; then

@@ -1,9 +1,7 @@
 import Link from "next/link";
 
-export const dynamic = "force-static";
-
 export const metadata = {
-  title: "Fine-tuning 동작 원리 — ScamGuardian",
+  title: "AI 공부시키기 — 어떻게 동작하나",
 };
 
 type ModelCardProps = {
@@ -33,14 +31,14 @@ function ModelCard({ emoji, title, phase, base, role, inputs, outputs, pains, fi
       <p className="mb-4 text-sm leading-relaxed text-slate-300">{role}</p>
 
       <div className="mb-5 grid gap-3 sm:grid-cols-3 text-sm">
-        <Field label="Base 모델" value={base} mono />
-        <Field label="입력" value={inputs} />
-        <Field label="출력" value={outputs} />
+        <Field label="처음에 데려온 모델" value={base} mono />
+        <Field label="이 모델이 받는 것" value={inputs} />
+        <Field label="이 모델이 내놓는 것" value={outputs} />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="rounded-2xl border border-rose-400/20 bg-rose-500/5 p-4">
-          <div className="mb-2 text-sm font-semibold text-rose-200">😩 지금 한계</div>
+          <div className="mb-2 text-sm font-semibold text-rose-200">😩 공부 안 시켰을 때 아쉬운 점</div>
           <ul className="space-y-1.5 text-sm text-slate-300">
             {pains.map((p, i) => (
               <li key={i} className="flex gap-2">
@@ -51,7 +49,7 @@ function ModelCard({ emoji, title, phase, base, role, inputs, outputs, pains, fi
           </ul>
         </div>
         <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/5 p-4">
-          <div className="mb-2 text-sm font-semibold text-emerald-200">🎯 fine-tune 으로 좋아지는 것</div>
+          <div className="mb-2 text-sm font-semibold text-emerald-200">🎯 공부 시키면 좋아지는 점</div>
           <ul className="space-y-1.5 text-sm text-slate-300">
             {fineTuneEffects.map((p, i) => (
               <li key={i} className="flex gap-2">
@@ -64,7 +62,7 @@ function ModelCard({ emoji, title, phase, base, role, inputs, outputs, pains, fi
       </div>
 
       <div className="mt-4 rounded-xl border border-white/10 bg-slate-950/40 p-3 text-xs text-slate-400">
-        측정 지표 <span className="font-mono text-slate-200">{metricKey}</span> — 학습 전후 비교 권장
+        잘하는지 재는 자: <span className="font-mono text-slate-200">{metricKey}</span>
       </div>
     </section>
   );
@@ -82,12 +80,12 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
 }
 
 const PHASES = [
-  { num: 0, title: "Safety", desc: "VirusTotal — URL·파일 악성 여부 (v3 신규)", model: null },
-  { num: 1, title: "STT / OCR", desc: "Whisper / Claude vision — 음성·이미지·PDF → 텍스트", model: null },
-  { num: 2, title: "분류", desc: "스캠 유형 12종 + 신뢰도 산출", model: "classifier" },
-  { num: 3, title: "추출 / RAG / LLM (병렬)", desc: "엔티티 추출 + 유사 사례 + LLM 통합 보조", model: "gliner" },
-  { num: 4, title: "검증", desc: "Serper API — 추출 엔티티 교차 검증", model: null },
-  { num: 5, title: "스코어링", desc: "플래그 합산 → 0~100 위험 점수", model: null },
+  { num: 0, title: "안전성 검사", desc: "받은 링크·파일이 이미 알려진 악성인지 외부 백신에 조회합니다", model: null },
+  { num: 1, title: "글자로 바꾸기", desc: "음성·이미지·PDF 같은 자료를 글자로 풀어냅니다", model: null },
+  { num: 2, title: "유형 가려내기", desc: "이 글이 어떤 종류의 사기에 가까운지 12가지 중에 골라줍니다", model: "classifier" },
+  { num: 3, title: "단어 뽑기 + 비슷한 사례 찾기", desc: "글에서 중요한 단어·표현을 추출하고, 옛날 비슷한 사례를 찾습니다", model: "gliner" },
+  { num: 4, title: "사실 확인", desc: "뽑아낸 단어들을 구글 검색으로 한 번 더 확인합니다", model: null },
+  { num: 5, title: "신호 정리", desc: "여기까지 모은 위험 신호들을 한 장에 정리해 보고합니다", model: null },
 ];
 
 export default function TrainingAboutPage() {
@@ -97,20 +95,24 @@ export default function TrainingAboutPage() {
         <header className="space-y-2">
           <p className="text-sm text-slate-400">
             <Link href="/admin/training" className="hover:text-slate-200">
-              ← Fine-tuning
+              ← AI 공부시키기 화면으로
             </Link>
           </p>
-          <h1 className="text-3xl font-semibold text-white">📖 Fine-tuning 어떻게 동작하나</h1>
+          <h1 className="text-3xl font-semibold text-white">📖 AI 모델을 공부시킨다는 게 무슨 뜻인가요?</h1>
           <p className="max-w-3xl text-sm leading-relaxed text-slate-400">
-            ScamGuardian 분석 파이프라인은 6단계로 구성됩니다. 그중 <strong className="text-cyan-200">분류기</strong>(Phase 2) 와{" "}
-            <strong className="text-fuchsia-200">GLiNER</strong>(Phase 3) 두 모델이 도메인 데이터로 학습할수록 정확도가 올라가요.
-            학습된 체크포인트를 활성화하면 다음 분석부터 자동으로 swap 됩니다.
+            ScamGuardian 의 분석은 6 단계로 이뤄집니다. 그중 두 단계에는 작은 AI 모델 두 개가 일하고 있어요.
+            처음에는 인터넷에 공개된 <strong className="text-cyan-200">공용 모델</strong>(누군가 미리 만들어 둔 신입 같은 존재) 을 그대로 가져다 씁니다.
+            여기에 우리 사기 자료로 연습을 시키면 점점 한국 사기 말투에 익숙해지고 실수가 줄어듭니다 — 그 연습이 바로 <strong className="text-fuchsia-200">"공부시키기"</strong>예요.
+            연습이 끝나면 <strong className="text-white">[적용]</strong> 버튼 한 번으로 다음 분석부터 새 모델이 자동으로 일하게 됩니다.
           </p>
         </header>
 
         {/* 파이프라인 다이어그램 */}
         <section className="rounded-3xl border border-white/10 bg-white/5 p-6">
-          <h2 className="mb-4 text-lg font-semibold text-white">🧭 파이프라인 안에서 어디에 쓰이나</h2>
+          <h2 className="mb-4 text-lg font-semibold text-white">🧭 6 단계 중 어디에 쓰이나요?</h2>
+          <p className="mb-4 text-sm text-slate-400">
+            아래 6 단계 중 <span className="text-cyan-200">2 번</span> 과 <span className="text-fuchsia-200">3 번</span> 자리에서 일하는 모델이 공부 대상입니다.
+          </p>
           <div className="space-y-2">
             {PHASES.map((p) => {
               const highlight =
@@ -126,18 +128,18 @@ export default function TrainingAboutPage() {
                   </div>
                   <div className="flex-1">
                     <div className="text-sm font-semibold text-white">
-                      Phase {p.num} · {p.title}
+                      {p.num} 단계 · {p.title}
                     </div>
                     <div className="text-xs text-slate-400">{p.desc}</div>
                   </div>
                   {p.model === "classifier" && (
                     <span className="rounded-full border border-cyan-400/40 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-200">
-                      🎯 classifier
+                      🎯 유형 가려내기 모델
                     </span>
                   )}
                   {p.model === "gliner" && (
                     <span className="rounded-full border border-fuchsia-400/40 bg-fuchsia-500/10 px-3 py-1 text-xs text-fuchsia-200">
-                      🔖 gliner
+                      🔖 단어 뽑기 모델
                     </span>
                   )}
                 </div>
@@ -149,94 +151,93 @@ export default function TrainingAboutPage() {
         {/* 각 모델 상세 */}
         <ModelCard
           emoji="🎯"
-          title="classifier — 스캠 유형 분류기"
-          phase="Phase 2"
-          base="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+          title="유형 가려내기 모델"
+          phase="2 단계"
+          base="공용 다국어 글 분류 모델"
           role={
-            "텍스트 한 덩어리를 보고 12개 스캠 유형(투자 사기·기관 사칭·메신저 피싱·로맨스 스캠 등) 중 어느 것에 가까운지 + 신뢰도(0~1)를 산출합니다. 분석 결과 카드 상단에 노출되는 '스캠 유형: 투자 사기 (신뢰도 92%)' 가 바로 이 모델의 출력이에요."
+            "받은 글이 12 가지 사기 유형(예: 투자 권유 사기, 검찰청·금감원 사칭, 메신저 가족 사칭, 로맨스, 택배 사칭 등) 중 어느 쪽에 가까운지 골라주는 모델입니다. 결과 카드 위쪽에 보이는 '유형: 투자 사기' 한 줄이 바로 이 모델이 답한 결과예요."
           }
-          inputs="STT/OCR 결과 텍스트 (최대 2000자)"
-          outputs="scam_type + confidence + 12개 유형별 점수"
+          inputs="글자로 풀어쓴 본문 (최대 약 2,000 자)"
+          outputs="가장 가까운 사기 유형 + 12 가지 유형별 가까움 정도"
           pains={[
-            "Zero-shot NLI 라 한국어 보이스피싱 발화 톤(반말·생략·강세)을 모름",
-            "신뢰도가 자주 0.3~0.5 → LLM 오버라이드(`LLM_SCAM_TYPE_OVERRIDE_THRESHOLD=0.7`) 자주 발동",
-            "키워드 부스팅 의존 — '투자' 단어만 있어도 투자 사기로 잘못 분기되는 false positive",
-            "새 스캠 유형 추가하려면 prompt 수정해야 함",
+            "원래 인터넷 일반 글로만 공부한 모델이라 한국 보이스피싱 특유의 말투(반말 명령·생략·압박체) 를 잘 모릅니다",
+            "자기 답에 자신이 없어서 어정쩡한 점수만 내는 일이 잦아요 (= 헷갈려 함)",
+            "그래서 매번 추가로 비싼 외부 AI 한테 한 번 더 물어보게 되고 — 시간·비용이 더 듭니다",
+            "단순히 '투자' 단어만 봐도 투자 사기로 단정하는 헛다리 짚기가 종종 일어납니다",
           ]}
           fineTuneEffects={[
-            "분류 정확도 ~70% → 90%+ 도달 가능 (도메인 데이터 충분 시)",
-            "신뢰도가 높아져 LLM 오버라이드 호출 빈도 ↓ → Claude API 비용·지연 ↓",
-            "키워드 부스팅 의존도 ↓ → false positive 감소",
-            "새 라벨 추가만으로 학습 가능 (prompt 수정 불필요)",
+            "한국 사기 자료로 직접 연습시키면 정답 맞히는 비율이 크게 올라갑니다 (대략 70 % → 90 % 수준 기대)",
+            "자기 답에 자신을 갖게 되면서 외부 AI 한테 다시 물어보는 일이 줄어 — 분석 시간·비용 모두 절감",
+            "키워드 한 개만 보고 단정하던 헛다리 짚기가 줄어듭니다",
+            "새로운 사기 유형을 추가하고 싶을 때, 자료만 모이면 바로 추가 학습이 가능합니다",
           ]}
-          metricKey="macro_f1, accuracy, llm_override_rate"
+          metricKey="정답 맞힌 비율 · 외부 AI 한테 다시 물어본 비율"
         />
 
         <ModelCard
           emoji="🔖"
-          title="gliner — 스캠 엔티티 추출기"
-          phase="Phase 3 (병렬)"
-          base="taeminlee/gliner_ko"
+          title="단어 뽑기 모델"
+          phase="3 단계 (다른 작업과 동시 진행)"
+          base="공용 한국어 단어 추출 모델"
           role={
-            "텍스트에서 스캠 유형별 의미 라벨(예: 투자 사기 → '수익 퍼센트', '보장 발화', '계좌번호', '긴급성 표현') 에 해당하는 단어·구를 잘라냅니다. Serper 검증·LLM 보조·결과 카드의 '추출 엔티티' 섹션이 모두 이 출력을 사용해요. 27개 라벨이 정의돼 있습니다."
+            "받은 글에서 중요한 단어·표현을 잘라주는 모델입니다. 예: '연 30 %' → 수익률 약속, '검찰청' → 기관 사칭, '안전계좌로 이체' → 송금 압박. 잘라낸 단어들은 다음 단계 사실 확인(구글 검색) 과 결과 카드의 '뽑아낸 단어' 칸에 사용됩니다. 모두 27 가지 의미 분류가 있어요."
           }
-          inputs="텍스트 + 스캠 유형별 허용 라벨 리스트"
-          outputs="[{text: '연 30%', label: '수익 퍼센트', score: 0.9}, ...]"
+          inputs="글 본문 + 어떤 종류의 단어를 찾아야 하는지 알려주는 목록"
+          outputs="뽑아낸 단어 한 개씩과 의미 라벨 (예: '연 30 %' = 수익률 약속)"
           pains={[
-            "범용 한국어 NER 이라 추상 라벨('긴박감 표현', '권위 사칭') 거의 못 잡음",
-            "precision 낮음 → 검증 단계에서 노이즈 엔티티 다량 발생",
-            "recall 낮음 → 결정적 단서(긴급성, 사칭 표지) 누락",
-            "부족분을 LLM 으로 메우느라 비용 추가",
+            "원래 일반 한국어 (뉴스·소설·SNS 등) 로만 공부한 모델이라 사기 특유의 추상 표현(예: '긴박감을 조성하는 어휘', '권위를 사칭하는 호칭') 을 거의 못 잡습니다",
+            "정작 중요한 단어는 놓치고 별로 안 중요한 단어를 뽑는 경우가 잦아요",
+            "이걸 메우려고 외부 AI 를 또 부르게 됩니다 — 비용 추가",
           ]}
           fineTuneEffects={[
-            "엔티티 micro F1 ~50% → 80%+ — 도메인 라벨 구조에 맞는 모델로 변신",
-            "검증할 만한 엔티티만 잘 뽑힘 → Serper API 호출 수 ↓ + 검증 시간 단축",
-            "LLM 엔티티 병합 컷오프(`LLM_ENTITY_MERGE_THRESHOLD=0.7`) 통과율 ↓ → LLM 결과 더 깐깐하게 받음",
-            "신규 라벨 추가 후 데이터만 모이면 즉시 학습",
+            "사기 자료로 연습시키면 사기 단서에만 집중하게 되고, 잘 잡는 비율이 크게 오릅니다 (대략 50 % → 80 % 기대)",
+            "검색해 볼 만한 단어만 깔끔하게 뽑혀 — 뒤이은 사실 확인 단계의 검색 횟수도 줄어듭니다",
+            "외부 AI 에게 의존하는 비율도 자연스럽게 떨어집니다",
+            "새 분류 라벨을 만든 뒤 자료만 채우면 즉시 추가 학습이 가능합니다",
           ]}
-          metricKey="entity micro F1, serper_calls_per_case, llm_entity_acceptance_rate"
+          metricKey="중요한 단어를 잘 잡은 비율 · 검색 횟수 · 외부 AI 의존도"
         />
 
         {/* before / after 직관 표 */}
         <section className="rounded-3xl border border-white/10 bg-white/5 p-6">
-          <h2 className="mb-4 text-lg font-semibold text-white">📊 학습 전 vs 학습 후 (예상치)</h2>
+          <h2 className="mb-4 text-lg font-semibold text-white">📊 공부 전 vs 공부 후 (예상치)</h2>
           <p className="mb-3 text-sm text-slate-400">
-            라벨당 50건+ 데이터 기준의 일반적 기댓값. 실제 결과는 데이터 품질·도메인 적합도에 따라 다릅니다.
+            한 분류당 50 건 이상 자료가 모였을 때를 가정한 일반적인 기댓값입니다. 실제 결과는 자료의 양과 질에 따라 달라집니다.
           </p>
           <div className="overflow-x-auto rounded-2xl border border-white/10">
             <table className="w-full text-sm">
               <thead className="bg-slate-800/60 text-xs uppercase tracking-wider text-slate-400">
                 <tr>
-                  <th className="px-3 py-2 text-left">모델 / 지표</th>
-                  <th className="px-3 py-2 text-right">학습 전</th>
-                  <th className="px-3 py-2 text-right">학습 후</th>
-                  <th className="px-3 py-2 text-left">파이프라인 영향</th>
+                  <th className="px-3 py-2 text-left">무엇을 재나</th>
+                  <th className="px-3 py-2 text-right">공부 전</th>
+                  <th className="px-3 py-2 text-right">공부 후</th>
+                  <th className="px-3 py-2 text-left">전체에 미치는 효과</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
                 <tr>
-                  <td className="px-3 py-3 text-slate-200">classifier · macro F1</td>
-                  <td className="px-3 py-3 text-right font-mono text-rose-300">~0.65</td>
-                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~0.90</td>
-                  <td className="px-3 py-3 text-xs text-slate-400">잘못 분류된 케이스 줄어들고, 자신 있게 답해서 LLM 안 부름</td>
+                  <td className="px-3 py-3 text-slate-200">유형 가려내기 · 정답 맞히기</td>
+                  <td className="px-3 py-3 text-right font-mono text-rose-300">~ 65 %</td>
+                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~ 90 %</td>
+                  <td className="px-3 py-3 text-xs text-slate-400">잘못 분류되는 일이 줄어듭니다</td>
                 </tr>
                 <tr>
-                  <td className="px-3 py-3 text-slate-200">classifier · LLM override 호출률</td>
-                  <td className="px-3 py-3 text-right font-mono text-rose-300">~40%</td>
-                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~10%</td>
-                  <td className="px-3 py-3 text-xs text-slate-400">분석당 Claude API 비용·지연 직접 절감</td>
+                  <td className="px-3 py-3 text-slate-200">유형 가려내기 · 외부 AI 다시 부른 비율</td>
+                  <td className="px-3 py-3 text-right font-mono text-rose-300">~ 40 %</td>
+                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~ 10 %</td>
+                  <td className="px-3 py-3 text-xs text-slate-400">분석 한 번당 비용·대기 시간이 줄어듭니다</td>
                 </tr>
                 <tr>
-                  <td className="px-3 py-3 text-slate-200">gliner · entity micro F1</td>
-                  <td className="px-3 py-3 text-right font-mono text-rose-300">~0.50</td>
-                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~0.80</td>
-                  <td className="px-3 py-3 text-xs text-slate-400">검증 노이즈 줄어 Serper 호출 수도 ~30% 감소 기대</td>
+                  <td className="px-3 py-3 text-slate-200">단어 뽑기 · 잘 잡은 비율</td>
+                  <td className="px-3 py-3 text-right font-mono text-rose-300">~ 50 %</td>
+                  <td className="px-3 py-3 text-right font-mono text-emerald-300">~ 80 %</td>
+                  <td className="px-3 py-3 text-xs text-slate-400">엉뚱한 단어가 빠지면서 다음 검색 단계도 빨라집니다</td>
                 </tr>
                 <tr>
-                  <td className="px-3 py-3 text-slate-200">gliner · 추출 엔티티 평균 수</td>
-                  <td className="px-3 py-3 text-right font-mono text-slate-300">10~15</td>
-                  <td className="px-3 py-3 text-right font-mono text-slate-300">8~12</td>
-                  <td className="px-3 py-3 text-xs text-slate-400">노이즈 ↓ — 적게 뽑되 정확도 ↑</td>
+                  <td className="px-3 py-3 text-slate-200">단어 뽑기 · 한 글에서 평균 뽑는 단어 수</td>
+                  <td className="px-3 py-3 text-right font-mono text-slate-300">10 ~ 15 개</td>
+                  <td className="px-3 py-3 text-right font-mono text-slate-300">8 ~ 12 개</td>
+                  <td className="px-3 py-3 text-xs text-slate-400">덜 뽑는 대신 정확한 것만 뽑힙니다</td>
                 </tr>
               </tbody>
             </table>
@@ -245,71 +246,70 @@ export default function TrainingAboutPage() {
 
         {/* 권장 학습 분량 */}
         <section className="rounded-3xl border border-white/10 bg-white/5 p-6">
-          <h2 className="mb-4 text-lg font-semibold text-white">📦 권장 학습 분량</h2>
+          <h2 className="mb-4 text-lg font-semibold text-white">📦 자료가 얼마나 있어야 공부시킬 수 있나요?</h2>
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="rounded-2xl border border-cyan-400/20 bg-cyan-500/5 p-4">
-              <div className="text-sm font-semibold text-cyan-200">classifier</div>
+              <div className="text-sm font-semibold text-cyan-200">🎯 유형 가려내기 모델</div>
               <ul className="mt-2 space-y-1 text-sm text-slate-300">
-                <li>최소: 라벨당 5건</li>
-                <li>권장: 라벨당 50건+</li>
-                <li>총 700건 (12라벨 × 50 + negative)</li>
+                <li>최소: 한 종류당 5 건</li>
+                <li>권장: 한 종류당 50 건 이상</li>
+                <li>합계: 약 700 건 (12 종류 × 50 건 + 정상 사례)</li>
               </ul>
             </div>
             <div className="rounded-2xl border border-fuchsia-400/20 bg-fuchsia-500/5 p-4">
-              <div className="text-sm font-semibold text-fuchsia-200">gliner</div>
+              <div className="text-sm font-semibold text-fuchsia-200">🔖 단어 뽑기 모델</div>
               <ul className="mt-2 space-y-1 text-sm text-slate-300">
-                <li>최소: 라벨당 30 mention</li>
-                <li>권장: 라벨당 200 mention+</li>
-                <li>한 문서에 평균 10~30 mention</li>
+                <li>최소: 한 의미 라벨당 30 번 등장</li>
+                <li>권장: 한 라벨당 200 번 이상 등장</li>
+                <li>한 글에 평균 10 ~ 30 개의 라벨이 등장합니다</li>
               </ul>
             </div>
           </div>
           <p className="mt-4 text-xs text-slate-400">
-            데이터 부족 시: 사람 라벨링 큐(<code className="rounded bg-slate-950/40 px-1">/admin</code>) 진행, AI Hub 정상 콜센터 데이터로 negative 보강, Claude 합성으로 희귀 유형(코인·로맨스·납치협박) 채우기.
+            자료가 부족할 때는 (1) 사람이 직접 정답을 매기는 화면(<code className="rounded bg-slate-950/40 px-1">/admin</code>)을 활용하거나,
+            (2) 정상 콜센터 통화 자료를 추가해 "정상 사례" 를 보강하거나,
+            (3) AI 에게 합성 사례를 만들게 해 드물게 보이는 사기 종류(예: 코인·로맨스·납치 협박) 를 채우는 방법이 있습니다.
           </p>
         </section>
 
         {/* swap 흐름 */}
         <section className="rounded-3xl border border-white/10 bg-white/5 p-6">
-          <h2 className="mb-4 text-lg font-semibold text-white">🔄 학습 후 활성화는 어떻게 적용되나</h2>
+          <h2 className="mb-4 text-lg font-semibold text-white">🔄 공부가 끝나면 어떻게 적용되나요?</h2>
           <ol className="space-y-3 text-sm text-slate-300">
             <li className="rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3">
               <span className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 font-mono text-xs text-cyan-200">1</span>
-              세션 완료 후 <strong className="text-white">[파이프라인 적용]</strong> 클릭
+              공부 세션이 끝나면 <strong className="text-white">[적용]</strong> 버튼을 누릅니다
             </li>
             <li className="rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3">
               <span className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 font-mono text-xs text-cyan-200">2</span>
-              <code className="rounded bg-black/40 px-1 font-mono text-xs">.scamguardian/active_models.json</code> 에 체크포인트 경로 기록
+              "지금부터는 새 모델 사용" 이라는 메모가 시스템에 기록됩니다
             </li>
             <li className="rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3">
               <span className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 font-mono text-xs text-cyan-200">3</span>
-              <code className="rounded bg-black/40 px-1 font-mono text-xs">pipeline/active_models.py</code> 캐시 즉시 무효화
-            </li>
-            <li className="rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3">
-              <span className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 font-mono text-xs text-cyan-200">4</span>
-              다음 분석 호출 시 classifier 는 <strong>task-specific 모드</strong>로 (zero-shot 아님), gliner 는 새 path 로 재로드
+              다음 분석부터 자동으로 새 모델이 일을 시작합니다 (서버 다시 시작 안 해도 됩니다)
             </li>
             <li className="rounded-2xl border border-emerald-400/20 bg-emerald-500/5 px-4 py-3">
               <span className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/30 font-mono text-xs text-emerald-200">✓</span>
-              체크포인트가 무효(경로 사라짐 등)면 자동으로 base 모델로 fallback — 안전장치
+              만약 새 모델 파일이 사라지거나 망가져도, 시스템이 자동으로 원래 공용 모델로 되돌아갑니다 — 분석이 멈추지 않습니다
             </li>
           </ol>
         </section>
 
         {/* 학습 데이터 소스 */}
         <section className="rounded-3xl border border-white/10 bg-white/5 p-6">
-          <h2 className="mb-4 text-lg font-semibold text-white">🗂 학습 데이터는 어디서 오나</h2>
+          <h2 className="mb-4 text-lg font-semibold text-white">🗂 공부에 쓰는 자료는 어디서 나오나요?</h2>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-              <div className="text-sm font-semibold text-white">사람 라벨링 (DB)</div>
+              <div className="text-sm font-semibold text-white">사람이 직접 매긴 정답</div>
               <p className="mt-1 text-xs text-slate-400">
-                <code className="rounded bg-black/40 px-1">human_annotations</code> 테이블 — Admin UI 에서 매긴 정답이 자동으로 학습 입력으로 들어옵니다.
+                관리자 화면에서 검수자가 매긴 정답이 그대로 공부 자료로 들어갑니다. 즉, 라벨링을 많이 할수록 모델이 더 똑똑해지는 구조입니다.
               </p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-              <div className="text-sm font-semibold text-white">외부 JSONL (선택)</div>
+              <div className="text-sm font-semibold text-white">외부에서 가져온 자료 (선택 사항)</div>
               <p className="mt-1 text-xs text-slate-400">
-                AI Hub 데이터를 <code className="rounded bg-black/40 px-1">scripts/ingest_aihub.py</code> 로 변환한 JSONL 을 폼의 <span className="text-slate-200">extra JSONL</span> 필드에 경로 입력. 정상 콜센터 = negative, 합성 데이터 = 롱테일 보강.
+                예를 들어 정부의 공공 데이터(AI Hub) 의 정상 콜센터 통화 자료를 받아 "정상 사례" 로 추가하면, 모델이 정상 vs 사기 차이를 더 잘 구분합니다.
+                또는 AI 가 만든 합성 사례로 드문 사기 유형을 채울 수도 있습니다.
               </p>
             </div>
           </div>
@@ -317,7 +317,7 @@ export default function TrainingAboutPage() {
 
         <footer className="pt-2 text-center text-xs text-slate-500">
           <Link href="/admin/training" className="hover:text-slate-300">
-            ← Fine-tuning 으로 돌아가기
+            ← AI 공부시키기 화면으로 돌아가기
           </Link>
         </footer>
       </div>

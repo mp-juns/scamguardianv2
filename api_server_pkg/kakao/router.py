@@ -12,7 +12,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import logging.handlers
+import secrets
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Request
@@ -37,6 +41,80 @@ from .detect import _EXECUTABLE_URL_RE, _kakao_detect_input, _kakao_materialize_
 from .tasks import _cleanup_expired_jobs, _kakao_callback_task
 
 router = APIRouter()
+
+_KAKAO_RAW_LOG_PATH = Path(".scamguardian") / "logs" / "kakao_raw.jsonl"
+_kakao_raw_logger: logging.Logger | None = None
+
+
+def _get_kakao_raw_logger() -> logging.Logger:
+    global _kakao_raw_logger
+    if _kakao_raw_logger is not None:
+        return _kakao_raw_logger
+    logger = logging.getLogger("kakao_raw")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        _KAKAO_RAW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            _KAKAO_RAW_LOG_PATH,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    _kakao_raw_logger = logger
+    return logger
+
+
+def _dump_kakao_in(
+    request: Request,
+    raw_bytes: bytes,
+    body: dict | None,
+    parse_error: bool,
+    req_id: str,
+) -> None:
+    try:
+        record: dict = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "req_id": req_id,
+            "direction": "in",
+            "client": request.client.host if request.client else None,
+            "headers": {
+                k: v
+                for k, v in request.headers.items()
+                if k.lower()
+                in (
+                    "user-agent",
+                    "content-type",
+                    "x-forwarded-for",
+                    "x-forwarded-proto",
+                    "x-real-ip",
+                    "host",
+                )
+            },
+            "parse_error": parse_error,
+        }
+        if parse_error or body is None:
+            record["raw"] = raw_bytes.decode("utf-8", errors="replace")
+        else:
+            record["body"] = body
+        _get_kakao_raw_logger().info(json.dumps(record, ensure_ascii=False))
+    except Exception:
+        logging.getLogger("kakao_webhook").exception("kakao_raw in 기록 실패")
+
+
+def _dump_kakao_out(response: dict, req_id: str) -> None:
+    try:
+        record = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "req_id": req_id,
+            "direction": "out",
+            "body": response,
+        }
+        _get_kakao_raw_logger().info(json.dumps(record, ensure_ascii=False))
+    except Exception:
+        logging.getLogger("kakao_webhook").exception("kakao_raw out 기록 실패")
 
 
 @router.post(
@@ -71,14 +149,28 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
       - URL/영상 + callback 없음 → 컨텍스트 수집 + 병렬 STT 시작
       - 텍스트 → 즉시 동기 분석
     """
-    log = logging.getLogger("kakao_webhook")
     EC = kakao_formatter.ErrorCode
-    InputType = kakao_formatter.InputType
 
+    req_id = secrets.token_hex(6)
+    raw_bytes = await request.body()
     try:
         body = await request.json()
     except Exception:
-        return kakao_formatter.format_error(EC.PARSE_ERROR)
+        _dump_kakao_in(request, raw_bytes, body=None, parse_error=True, req_id=req_id)
+        resp = kakao_formatter.format_error(EC.PARSE_ERROR)
+        _dump_kakao_out(resp, req_id=req_id)
+        return resp
+
+    _dump_kakao_in(request, raw_bytes, body=body, parse_error=False, req_id=req_id)
+    response = await _kakao_webhook_impl(body, background_tasks)
+    _dump_kakao_out(response, req_id=req_id)
+    return response
+
+
+async def _kakao_webhook_impl(body: dict, background_tasks: BackgroundTasks) -> dict:
+    log = logging.getLogger("kakao_webhook")
+    EC = kakao_formatter.ErrorCode
+    InputType = kakao_formatter.InputType
 
     log.info(
         "kakao webhook 수신:\n"
@@ -162,7 +254,10 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         if job.get("phase") == "collecting_context":
             log.info("→ 결과확인 = 컨텍스트 강제 종료 신호로 해석")
             return await _kakao_force_skip_context(user_id)
-        return kakao_formatter.format_still_running()
+        elapsed, poll_count, stt_done = state.record_poll(user_id)
+        return kakao_formatter.format_still_running(
+            elapsed_sec=elapsed, poll_count=poll_count, stt_done=stt_done,
+        )
 
     if utterance in _KAKAO_SKIP_PHRASES and user_id:
         log.info("→ 스킵 신호 수신: user=%s", user_id[:12])
@@ -232,7 +327,10 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks) -> 
             if phase == "collecting_context":
                 log.info("→ 컨텍스트 답변 처리: user=%s", user_id[:12])
                 return await _kakao_handle_context_answer(user_id, utterance)
-            return kakao_formatter.format_still_running()
+            elapsed, poll_count, stt_done = state.record_poll(user_id)
+            return kakao_formatter.format_still_running(
+                elapsed_sec=elapsed, poll_count=poll_count, stt_done=stt_done,
+            )
 
     # ── callbackUrl 있으면: 단발 callback 모드 ──
     if callback_url:

@@ -212,41 +212,42 @@ class ScamGuardianPipeline:
 
         # ════════════════════════════════
         # Phase 0 (v3): 안전성 필터 — URL/파일이면 VirusTotal 스캔
+        # VT 는 source 자체(URL·바이너리)를 보는 것이지 transcript 와 무관하므로
+        # precomputed_transcript 유무와 관계없이 URL/파일 입력이면 항상 돈다.
         # ════════════════════════════════
         safety_result: safety.SafetyResult | None = None
-        if precomputed_transcript is None:
-            phase0_start = time.time()
-            try:
-                if stt._is_youtube_url(source) or source.startswith(("http://", "https://")):
-                    print("[Phase 0] URL 안전성 검사 중 (VirusTotal)...")
-                    safety_result = safety.scan_url(source)
-                else:
-                    src_path = source if source else None
-                    if src_path and len(src_path) < 1024 and "/" in src_path:
-                        from pathlib import Path as _Path
-                        if _Path(src_path).exists() and _Path(src_path).is_file():
-                            print("[Phase 0] 파일 안전성 검사 중 (VirusTotal)...")
-                            safety_result = safety.scan_file(src_path)
-            except Exception as exc:  # noqa: BLE001 — 안전성은 죽으면 안 됨
-                print(f"[Phase 0] 검사 실패(무시): {exc}")
-                safety_result = None
-            if safety_result is not None:
-                self.last_safety_result = safety_result
-                self._log_step(
-                    "Safety",
-                    phase0_start,
-                    {
-                        "threat_level": safety_result.threat_level.value,
-                        "detections": safety_result.detections,
-                        "total_engines": safety_result.total_engines,
-                    },
-                )
-                level = safety_result.threat_level.value
-                icon = "🚨" if level == "malicious" else ("⚠️" if level == "suspicious" else "✅")
-                print(
-                    f"      ← {icon} {level} | 탐지 {safety_result.detections}/{safety_result.total_engines} | "
-                    f"카테고리: {', '.join(safety_result.threat_categories[:3]) or '없음'}"
-                )
+        phase0_start = time.time()
+        try:
+            if stt._is_youtube_url(source) or source.startswith(("http://", "https://")):
+                print("[Phase 0] URL 안전성 검사 중 (VirusTotal)...")
+                safety_result = safety.scan_url(source)
+            else:
+                src_path = source if source else None
+                if src_path and len(src_path) < 1024 and "/" in src_path:
+                    from pathlib import Path as _Path
+                    if _Path(src_path).exists() and _Path(src_path).is_file():
+                        print("[Phase 0] 파일 안전성 검사 중 (VirusTotal)...")
+                        safety_result = safety.scan_file(src_path)
+        except Exception as exc:  # noqa: BLE001 — 안전성은 죽으면 안 됨
+            print(f"[Phase 0] 검사 실패(무시): {exc}")
+            safety_result = None
+        if safety_result is not None:
+            self.last_safety_result = safety_result
+            self._log_step(
+                "Safety",
+                phase0_start,
+                {
+                    "threat_level": safety_result.threat_level.value,
+                    "detections": safety_result.detections,
+                    "total_engines": safety_result.total_engines,
+                },
+            )
+            level = safety_result.threat_level.value
+            icon = "🚨" if level == "malicious" else ("⚠️" if level == "suspicious" else "✅")
+            print(
+                f"      ← {icon} {level} | 탐지 {safety_result.detections}/{safety_result.total_engines} | "
+                f"카테고리: {', '.join(safety_result.threat_categories[:3]) or '없음'}"
+            )
 
         # 악성 파일 확정 시 fast-path: STT/분류기가 바이너리에서 죽거나 노이즈 분류하지 않게
         # 즉시 safety 결과만으로 보고서 생성. policy (b) 의 "분석은 진행" 은 텍스트
@@ -282,11 +283,11 @@ class ScamGuardianPipeline:
         # ════════════════════════════════
         # Phase 0.5 (v3.5): URL 디토네이션 — 격리 Chromium 으로 의심 URL 직접 navigate
         # 조건: 입력이 URL + Phase 0 fast-path 트리거 안 됨 + SANDBOX_ENABLED.
+        # 디토네이션도 source 자체를 보는 작업이라 precomputed_transcript 와 무관.
         # ════════════════════════════════
         sandbox_result: sandbox.SandboxResult | None = None
         sandbox_enabled = (
             os.getenv("SANDBOX_ENABLED", "0") == "1"
-            and precomputed_transcript is None
             and source.startswith(("http://", "https://"))
         )
         if sandbox_enabled:

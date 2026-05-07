@@ -20,6 +20,21 @@ from pipeline import kakao_formatter
 
 _URL_RE = re.compile(r"https?://\S+")
 _YOUTUBE_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/")
+# STT 가능한 영상 호스트 화이트리스트 — yt-dlp 가 안정적으로 음성 추출하는 사이트만.
+# 일반 URL 은 아래 목록에 없으면 InputType.URL 로 떨어져 STT 시도 안 함.
+_VIDEO_HOST_RE = re.compile(
+    r"https?://([a-z0-9-]+\.)*("
+    r"youtube\.com|youtu\.be|"
+    r"vimeo\.com|"
+    r"twitch\.tv|"
+    r"tiktok\.com|"
+    r"dailymotion\.com|"
+    r"tv\.naver\.com|"
+    r"tv\.kakao\.com|"
+    r"facebook\.com/watch|fb\.watch"
+    r")/",
+    re.IGNORECASE,
+)
 _IMAGE_URL_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp)(\?|$)", re.IGNORECASE)
 _PDF_URL_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
 # 사기범이 링크로 자주 뿌리는 악성 실행파일 확장자 — 다운로드 후 VT 파일 스캔 강제 라우팅
@@ -30,8 +45,15 @@ _VIDEO_URL_RE = re.compile(r"\.(mp4|mov|webm|mkv|avi)(\?|$)", re.IGNORECASE)
 
 
 def _classify_url_input(url: str) -> kakao_formatter.InputType:
-    """URL 확장자 보고 IMAGE/PDF/FILE/URL 구분."""
+    """URL 확장자/호스트 보고 VIDEO/IMAGE/PDF/FILE/URL 구분.
+
+    InputType.VIDEO 는 STT 시도 가능한 영상 호스트(YouTube 등) 또는 영상 확장자 직링크에만 부여.
+    그 외 일반 웹 URL 은 InputType.URL — STT skip, Phase 0 VT 만 거쳐 텍스트 분석.
+    """
     InputType = kakao_formatter.InputType
+    # 영상 호스트 화이트리스트 또는 영상 확장자 직링크 → VIDEO
+    if _VIDEO_HOST_RE.search(url) or _VIDEO_URL_RE.search(url):
+        return InputType.VIDEO
     if _IMAGE_URL_RE.search(url):
         return InputType.IMAGE
     if _PDF_URL_RE.search(url):
@@ -39,6 +61,7 @@ def _classify_url_input(url: str) -> kakao_formatter.InputType:
     # APK/EXE/DMG 등 실행 파일 — VT 파일 스캔이 필수. 일반 웹페이지(URL) 스캔이 아니라 다운로드 후 검사로 강제.
     if _EXECUTABLE_URL_RE.search(url):
         return InputType.FILE
+    # 일반 웹 URL — STT 안 함, Phase 0 VT + URL 텍스트 분석으로 진행
     return InputType.URL
 
 

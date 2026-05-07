@@ -207,8 +207,8 @@ def _build_result_card(
     # 입력 유형 표시
     type_labels = {
         InputType.TEXT: "💬 텍스트 검출",
-        InputType.URL: "🔗 URL/영상 검출",
-        InputType.VIDEO: "🎬 업로드 영상 검출",
+        InputType.URL: "🔗 링크 검출",
+        InputType.VIDEO: "🎬 영상 검출",
         InputType.FILE: "📎 파일 검출",
         InputType.IMAGE: "🖼 이미지 검출",
         InputType.PDF: "📄 PDF 검출",
@@ -225,7 +225,8 @@ def _build_result_card(
     # 입력 본문/전사 미리보기 — TEXT 도 포함하여 일관 표시
     transcript = report.get("transcript_text", "")
     if transcript:
-        label = "음성 전사" if input_type in (InputType.URL, InputType.VIDEO, InputType.FILE) else "입력 본문"
+        # VIDEO/FILE 만 음성 전사. URL 은 링크 자체 또는 페이지 텍스트라 "입력 본문" 으로 통일.
+        label = "음성 전사" if input_type in (InputType.VIDEO, InputType.FILE) else "입력 본문"
         body_parts.append(f"[{label}]\n{_truncate(transcript, 150)}")
 
     # LLM 한 줄 요약이 있으면 우선 노출 — 사용자가 핵심 빠르게 파악 가능
@@ -389,8 +390,8 @@ def format_analyzing(input_type: InputType = InputType.TEXT) -> dict[str, Any]:
     """분석 시작 안내 (callback 초기 응답 텍스트)."""
     msgs = {
         InputType.TEXT: "🔍 텍스트를 분석 중입니다...",
-        InputType.URL: "🔍 영상 다운로드 및 분석 중입니다...\n음성 인식(STT) 후 사기 여부를 판별합니다.",
-        InputType.VIDEO: "🎬 업로드된 영상을 분석 중입니다...\n음성 인식(STT) 후 사기 여부를 판별합니다.",
+        InputType.URL: "🔗 링크 안전성 검사 중입니다...\nVirusTotal 조회 후 페이지 내용을 분석합니다.",
+        InputType.VIDEO: "🎬 영상을 분석 중입니다...\n음성 인식(STT) 후 사기 여부를 판별합니다.",
         InputType.FILE: "📎 파일을 분석 중입니다...",
         InputType.IMAGE: "🖼 이미지를 분석 중입니다...\nOCR + 시각 단서를 같이 봅니다.",
         InputType.PDF: "📄 PDF를 분석 중입니다...\n페이지별로 OCR + 시각 단서를 추출합니다.",
@@ -401,7 +402,7 @@ def format_analyzing(input_type: InputType = InputType.TEXT) -> dict[str, Any]:
 def format_queued(input_type: InputType = InputType.URL) -> dict[str, Any]:
     """폴링 모드: 분석 시작 안내 (콜백 없을 때 즉시 응답)."""
     msgs = {
-        InputType.URL: "🔍 영상 분석을 시작했습니다.\n음성 인식(STT) 후 사기 여부를 판별합니다.\n\n완료되면 '결과확인'을 입력해 주세요.",
+        InputType.URL: "🔗 링크 분석을 시작했습니다.\nVirusTotal 검사 + 페이지 내용 분석.\n완료되면 '결과확인'을 입력해 주세요.",
         InputType.VIDEO: "🎬 영상 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
         InputType.FILE: "📎 파일 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
         InputType.TEXT: "🔍 분석을 시작했습니다.\n완료되면 '결과확인'을 입력해 주세요.",
@@ -419,18 +420,68 @@ def format_queued(input_type: InputType = InputType.URL) -> dict[str, Any]:
     }
 
 
-def format_still_running() -> dict[str, Any]:
-    """폴링 모드: 아직 분석 중일 때 응답."""
+def _humanize_duration(sec: int) -> str:
+    """경과 초 → 사용자에게 보여줄 한국어 표현."""
+    if sec < 10:
+        return "방금 시작"
+    if sec < 60:
+        return f"{sec}초째"
+    minutes = sec // 60
+    rem = sec % 60
+    if rem < 10:
+        return f"{minutes}분째"
+    return f"{minutes}분 {rem}초째"
+
+
+def _polling_progress_lines(stage: str, elapsed_sec: int, poll_count: int) -> str:
+    """polling 진행 상황을 사용자가 헷갈리지 않게 단계별 텍스트로 변환.
+
+    stage:
+        "stt"        — 음성 인식 중
+        "analyzing"  — 분석 중 (STT 끝났고 본 분석 진행)
+        "refining"   — 사용자 답변 반영 최종 정리 중
+    """
+    elapsed_label = _humanize_duration(elapsed_sec)
+    if stage == "stt":
+        head = "⏳ 음성 인식 진행 중이에요"
+        if poll_count <= 1:
+            tail = "유튜브 영상은 보통 1~3분 걸려요. 끝나면 결과를 정리해드릴게요."
+        else:
+            tail = (
+                f"({elapsed_label}) — 유튜브는 다운로드 + 받아쓰기까지 1~3분 걸려요.\n"
+                "곧 끝납니다, 30초만 더 기다려주세요."
+            )
+    elif stage == "refining":
+        head = "📊 알려주신 정보 반영해서 마지막 정리 중이에요"
+        if poll_count <= 1:
+            tail = "5~10초 정도면 끝나요. 잠시 후 다시 '결과확인' 눌러주세요."
+        else:
+            tail = (
+                f"({elapsed_label}) — 거의 다 됐어요. 한 번만 더 기다려주세요."
+            )
+    else:  # "analyzing"
+        head = "🔍 받아쓰기는 끝났고 본 분석을 마무리하는 중이에요"
+        if poll_count <= 1:
+            tail = "보통 10~20초 걸려요. 끝나면 결과 카드 보여드릴게요."
+        else:
+            tail = (
+                f"({elapsed_label}) — 곧 끝나요. 30초만 더 기다려주세요."
+            )
+    return f"{head}\n{tail}"
+
+
+def format_still_running(
+    elapsed_sec: int = 0,
+    poll_count: int = 1,
+    stt_done: bool = True,
+) -> dict[str, Any]:
+    """폴링 모드: 아직 분석 중일 때 응답. 매 호출마다 경과 시간 다르게 표시."""
+    stage = "analyzing" if stt_done else "stt"
+    text = _polling_progress_lines(stage, elapsed_sec, poll_count)
     return {
         "version": "2.0",
         "template": {
-            "outputs": [
-                {
-                    "simpleText": {
-                        "text": "⏳ 아직 분석 중입니다.\n잠시 후 다시 '결과확인'을 입력해 주세요."
-                    }
-                }
-            ],
+            "outputs": [{"simpleText": {"text": text}}],
             "quickReplies": quick_replies("polling"),
         },
     }
@@ -566,14 +617,18 @@ def format_question(
         if input_type in (InputType.URL, InputType.VIDEO, InputType.FILE, InputType.IMAGE, InputType.PDF):
             # 영상/URL/이미지/PDF: vision/STT + 1차 분석이 백그라운드로 돌고 있고, 채팅으로 정보 수집
             kind = {
-                InputType.URL: "🔗 영상",
+                InputType.URL: "🔗 링크",
                 InputType.VIDEO: "🎬 영상",
                 InputType.FILE: "📎 파일",
                 InputType.IMAGE: "🖼 이미지",
                 InputType.PDF: "📄 PDF",
-            }.get(input_type, "영상")
-            # 이미지/PDF 는 vision OCR 라 더 빠름
-            duration = "10초 정도" if input_type in (InputType.IMAGE, InputType.PDF) else "1~3분"
+            }.get(input_type, "콘텐츠")
+            # 이미지/PDF/URL 은 다운로드/OCR/VT 만 — 더 빠름
+            duration = (
+                "10초 정도"
+                if input_type in (InputType.IMAGE, InputType.PDF, InputType.URL)
+                else "1~3분"
+            )
             intro = (
                 f"{kind} 받았어요! 🔍 분석을 시작했어요 ({duration} 걸려요).\n"
                 "그 동안 분석 정확도를 높일 정보 몇 가지 여쭤볼게요.\n"
@@ -598,18 +653,21 @@ def format_question(
     }
 
 
-def format_context_done_waiting(stt_done: bool) -> dict[str, Any]:
-    """컨텍스트 수집이 끝났고 분석을 기다리는 중일 때 안내."""
-    if stt_done:
-        text = (
-            "📝 알려주신 내용 잘 받았어요.\n"
-            "분석을 마무리하는 중입니다. 잠시 후 '결과확인'을 눌러주세요."
-        )
+def format_context_done_waiting(
+    stt_done: bool,
+    elapsed_sec: int = 0,
+    poll_count: int = 1,
+) -> dict[str, Any]:
+    """컨텍스트 수집이 끝났고 분석을 기다리는 중일 때 안내.
+
+    poll_count 가 2 이상이면 ack 인사 빼고 진행 단계만 표시 — 같은 메시지 도배 방지.
+    """
+    stage = "analyzing" if stt_done else "stt"
+    progress = _polling_progress_lines(stage, elapsed_sec, poll_count)
+    if poll_count <= 1:
+        text = f"📝 알려주신 내용 잘 받았어요.\n\n{progress}"
     else:
-        text = (
-            "📝 알려주신 내용 잘 받았어요.\n"
-            "음성 인식이 끝나는 대로 분석을 마무리할게요. 잠시 후 '결과확인'을 눌러주세요."
-        )
+        text = progress
     return {
         "version": "2.0",
         "template": {
@@ -644,16 +702,16 @@ def format_result_ready_announce(has_refine: bool) -> dict[str, Any]:
     }
 
 
-def format_refining_in_progress() -> dict[str, Any]:
+def format_refining_in_progress(
+    elapsed_sec: int = 0,
+    poll_count: int = 1,
+) -> dict[str, Any]:
     """최종 합본 분석 진행 중 폴링 응답."""
+    text = _polling_progress_lines("refining", elapsed_sec, poll_count)
     return {
         "version": "2.0",
         "template": {
-            "outputs": [{
-                "simpleText": {
-                    "text": "📊 알려주신 정보 반영해서 최종 결과 정리 중이에요.\n잠시 후 다시 '결과확인'을 입력해 주세요."
-                }
-            }],
+            "outputs": [{"simpleText": {"text": text}}],
             "quickReplies": quick_replies("polling"),
         },
     }

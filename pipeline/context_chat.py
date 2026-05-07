@@ -195,10 +195,14 @@ def _static_first_question(input_type: str) -> NextAction:
     type_lower = (input_type or "").lower()
     if type_lower == "text":
         msg = "이 메시지 어떻게 받으셨어요? (예: 카톡, 문자, 이메일 등)"
-    elif type_lower in ("url", "video"):
+    elif type_lower == "video":
         msg = "이 영상 어디서 보거나 받으셨어요?"
+    elif type_lower == "url":
+        msg = "이 링크 어디서 받으셨어요? 누가 보냈나요?"
     elif type_lower == "file":
         msg = "이 파일 어떻게 받으셨어요? 누가 보냈나요?"
+    elif type_lower in ("image", "pdf"):
+        msg = "이거 어디서 받으셨어요? 누가 보냈나요?"
     else:
         msg = "처음 어디서 받으셨는지 알려주실 수 있을까요?"
     return NextAction(action="ASK", message=msg, reasoning="static_first_question")
